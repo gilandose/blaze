@@ -160,6 +160,13 @@ Measured on the reference workload (15M events, 30M node space, 3000 scopes,
   snapshot with periodic full compaction, removing both the stall and the
   rewrite. That, or shard workers by node-id range.
 
+## Next phase
+
+Implementation-ready designs for the next phase — delta snapshots, dense id
+interning, the disk-backed routing base, and analytics enrichment — live in
+[docs/design/](docs/design/README.md), sized against the target production
+profile (~2B tracked nodes, ~3k events/s peak).
+
 ## Extension points
 
 - **gRPC** (`src/grpc`): a tonic `BlazeService` over the same `AppState` as
