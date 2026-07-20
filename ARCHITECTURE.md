@@ -45,6 +45,38 @@ Naive designs fail at this cardinality:
 
 ### Layered DSU with merge notifications (`src/core/scoped.rs`)
 
+```mermaid
+flowchart TB
+    GE["global edge (u,v)"] -->|"union(u,v)"| G
+    SE["scope edge (u,v) @ scope 7"] -->|"union(find_g(u), find_g(v))"| O7
+    SE -.->|"register both roots"| R
+
+    subgraph forest ["ScopedForest"]
+        G["<b>Global DSU</b><br/>globally-visible edges only<br/>root = lowest graph id"]
+        R["<b>Registry</b><br/>global root → {scopes holding<br/>overlay state on it}"]
+        subgraph overlays ["sparse per-scope overlays (~3000)"]
+            O7["<b>overlay 7</b><br/>elements = global roots<br/>as of insert time"]
+            O2999["overlay 2999"]
+        end
+    end
+
+    G -->|"merge absorbs root B into A"| R
+    R -->|"fix-up overlay.union(B,A)<br/>ONLY scopes registered on B<br/>never a 3000-way broadcast"| O7
+
+    subgraph query ["query path (lock-free, read-only)"]
+        X["node x"] -->|"global.find_ro"| GR["global root g"]
+        GR -->|"overlay(s).find_ro(g)<br/>miss ⇒ g itself"| ROOT["scope_root =<br/>lowest graph id in<br/>scope s's component"]
+    end
+    G -.-> GR
+    O7 -.-> ROOT
+```
+
+Reading the diagram: writes enter at the top (global edges touch one
+structure; scope edges touch one overlay plus two registry entries), the
+registry turns global merges into targeted fix-ups instead of broadcasts,
+and queries compose the two layers left-to-right with the overlay lookup
+falling back to the global root on a miss.
+
 - **Global DSU**: holds globally-visible edges only.
 - **Scope overlay DSU** (sparse, per scope): elements are node ids that were
   *global roots when the scope edge arrived*. A scope edge `(u,v)` unions
