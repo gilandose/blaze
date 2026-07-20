@@ -124,6 +124,120 @@ model, including across snapshot/hydrate cycles.
   microseconds — the read-your-own-stream guarantee is eventual within a
   tick, which is the right trade for a streaming engine.
 
+## Data model
+
+### Event model (`src/core/types.rs`)
+
+```rust
+EdgeEvent {
+    src: u64,                 // graph/node id
+    dst: u64,
+    visibility: Global        // every scope sees it
+              | Scoped([u32]) // listed scopes only; [] or containing 0
+                              // normalizes to Global; sorted + deduped
+    event_time_ms: i64,
+    props: Option<String>,    // opaque JSON, carried end to end
+}
+```
+
+Scope ids are `u32` with `0 = GLOBAL_SCOPE`. Node ids are sparse `u64`;
+nothing is paid for ids that never appear in an edge.
+
+### In-memory state
+
+```mermaid
+classDiagram
+    class ScopedForest {
+        global: Dsu
+        overlays: DashMap~ScopeId, Dsu~
+        registry: DashMap~NodeId, HashSet~ScopeId~~
+        union_lock: Mutex
+        apply(EdgeEvent)
+        scope_root(scope, node) NodeId
+        snapshot() ForestSnapshot
+        hydrate(ForestSnapshot)
+    }
+    class Dsu {
+        parents: DashMap~NodeId, NodeId~
+        find(x) NodeId
+        find_ro(x) NodeId
+        union(u, v) Option~Merge~
+    }
+    class EdgeBuffer {
+        active: ArrowBuilders
+        sealed: Vec~Segment~
+        append(offset, EdgeEvent)
+        seal_active() Segment
+        drop_committed(watermark)
+    }
+    class Segment {
+        batch: RecordBatch
+        min_offset: u64
+        max_offset: u64
+    }
+    ScopedForest *-- Dsu : global + per-scope
+    EdgeBuffer *-- Segment
+```
+
+Key representation choices: a node absent from `parents` is a root (or a
+never-seen singleton — identical semantics); overlay elements are node ids
+that were global roots at insert time; the registry is the merge-notification
+index. `ForestSnapshot` is the neutral exchange form:
+`{ global: Vec<(node, root)>, scopes: Vec<(scope_id, Vec<(node, root)>)> }`
+with every pair fully resolved (depth 1) at capture time.
+
+### Warehouse layout (object storage)
+
+```text
+<table_prefix>/                          e.g. graph/edges/
+├── data/part-<seq12>-<uuid>.parquet     edge rows (immutable)
+├── puffin/dsu-<seq12>.puffin            routing sidecar (immutable)
+└── metadata/snap-<seq12>.json           atomic commit point (put-if-absent)
+```
+
+### Edge Parquet schema (one row per event × visible scope)
+
+| column | type | notes |
+|---|---|---|
+| `offset` | u64 | stream position; replay/dedupe key |
+| `src`, `dst` | u64 | edge endpoints |
+| `scope_id` | u32 | 0 = global; rows sorted by `(scope_id, src)` for pruning |
+| `event_time` | timestamp(ms) | event time |
+| `props` | utf8, nullable | opaque JSON |
+
+zstd-compressed, one row group per sealed segment.
+
+### Puffin sidecar (`src/storage/puffin.rs`, `codec.rs`)
+
+```text
+container:  "PFA1" | blob₀ … blobₙ | "PFA1" | footer JSON | len:u32 LE | flags:u32 | "PFA1"
+blob types: blaze-global-dsu-v1                  (one)
+            blaze-scope-dsu-v1 {scope-id: "N"}   (one per active scope)
+payload:    count:u64 LE, then count × (node:u64 LE, root:u64 LE)
+            sorted by node — binary-searchable in place / via mmap
+```
+
+Roots in the payload are canonical (lowest graph id in the component as of
+this snapshot). Unknown blob types are ignored on read — the forward-compat
+hook the delta design (docs/design/001) extends with `*-delta-v1` types.
+
+### Snapshot metadata (`metadata/snap-*.json`)
+
+```json
+{
+  "sequence": 42,               // dense, monotonically increasing
+  "committed_at_ms": 1753000000000,
+  "watermark": 379601,          // highest event offset covered (inclusive)
+  "data_files": [ { "path", "rows", "bytes", "min_offset", "max_offset" } ],
+  "puffin_path": "graph/edges/puffin/dsu-000000000042.puffin",
+  "committer": "worker-pod-abc"
+}
+```
+
+The watermark is the contract tying the three artifacts together: data
+files cover offsets ≤ watermark, the Puffin routing map reflects exactly
+those events, and followers prune buffered segments ≤ watermark.
+
 ## Ingest and buffering (`src/ingest`)
 
 Events are exploded to one Arrow row per visible scope
