@@ -10,6 +10,7 @@ use tracing::info;
 
 use blaze::api::{AppState, router};
 use blaze::core::ScopedForest;
+use blaze::grpc::GrpcService;
 use blaze::ha::{LeaderElector, StaticElector};
 use blaze::ingest::{EdgeBuffer, Pipeline, SimulatorConfig, run_simulator};
 use blaze::storage::{Flusher, SnapshotCatalog, hydrate_from_catalog};
@@ -17,9 +18,13 @@ use blaze::storage::{Flusher, SnapshotCatalog, hydrate_from_catalog};
 #[derive(Parser, Debug)]
 #[command(name = "blaze", about = "Multi-tenant streaming graph engine")]
 struct Args {
-    /// API listen address.
+    /// REST API listen address.
     #[arg(long, default_value = "0.0.0.0:8080")]
     listen: String,
+
+    /// gRPC listen address.
+    #[arg(long, default_value = "0.0.0.0:50051")]
+    grpc_listen: String,
 
     /// Warehouse URI: file:///abs/path, s3://bucket/prefix, or memory://
     #[arg(long, default_value = "file://./blaze-warehouse")]
@@ -198,13 +203,23 @@ async fn main() -> anyhow::Result<()> {
         worker_id,
         started_at: Instant::now(),
     };
+    // gRPC serving layer over the same shared state, on its own port and task.
+    let grpc_addr = args.grpc_listen.parse()?;
+    let grpc_server = tonic::transport::Server::builder()
+        .add_service(GrpcService::new(state.clone()).into_server())
+        .serve(grpc_addr);
+    info!(grpc_listen = %args.grpc_listen, "gRPC listening");
+    let mut grpc_handle = tokio::spawn(grpc_server);
+
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(listen = %args.listen, "API listening");
     let server = axum::serve(listener, router(state));
 
     tokio::select! {
         res = server => res?,
+        res = &mut grpc_handle => res??,
         _ = tokio::signal::ctrl_c() => {
+            grpc_handle.abort();
             info!("shutting down: attempting final flush");
             flush_handle.abort();
             pipeline_handle.abort();

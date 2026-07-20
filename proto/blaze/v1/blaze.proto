@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+// gRPC surface for the blaze streaming graph engine. The RPCs mirror the REST
+// API in src/api one-for-one and are served from the same shared, lock-free
+// state; scopes are addressed as uint32 with 0 meaning the global scope.
+package blaze.v1;
+
+service BlazeService {
+  // Component representative ("routing target") of a node in a scope's view.
+  rpc GetComponent(GetComponentRequest) returns (GetComponentResponse);
+
+  // Connectivity of two nodes as a scope sees them (global backbone plus the
+  // scope's own private edges).
+  rpc CheckConnected(CheckConnectedRequest) returns (CheckConnectedResponse);
+
+  // Forest / buffer / ingest counters, matching GET /v1/stats.
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+
+  // Inject an edge event into the same ingest pipeline as the firehose. An
+  // empty scopes list (or one containing scope 0) means global visibility.
+  rpc InjectEdge(InjectEdgeRequest) returns (InjectEdgeResponse);
+}
+
+message GetComponentRequest {
+  uint32 scope = 1;
+  uint64 node = 2;
+}
+
+message GetComponentResponse {
+  uint32 scope = 1;
+  uint64 node = 2;
+  uint64 root = 3;
+}
+
+message CheckConnectedRequest {
+  uint32 scope = 1;
+  uint64 u = 2;
+  uint64 v = 3;
+}
+
+message CheckConnectedResponse {
+  uint32 scope = 1;
+  uint64 u = 2;
+  uint64 v = 3;
+  bool connected = 4;
+}
+
+message GetStatsRequest {}
+
+message GetStatsResponse {
+  string worker_id = 1;
+  bool leader = 2;
+  ForestStats forest = 3;
+  BufferStats buffer = 4;
+  uint64 events_ingested = 5;
+}
+
+message ForestStats {
+  uint64 events_applied = 1;
+  uint64 global_merges = 2;
+  uint64 global_links = 3;
+  uint64 scope_links = 4;
+  uint64 active_scopes = 5;
+  uint64 merge_fixups = 6;
+}
+
+message BufferStats {
+  uint64 active_rows = 1;
+  uint64 sealed_rows = 2;
+  uint64 sealed_segments = 3;
+  uint64 sealed_bytes = 4;
+}
+
+message InjectEdgeRequest {
+  uint64 src = 1;
+  uint64 dst = 2;
+  // Empty (or containing 0) means global visibility.
+  repeated uint32 scopes = 3;
+  optional string props = 4;
+}
+
+message InjectEdgeResponse {
+  bool accepted = 1;
+}

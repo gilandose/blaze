@@ -9,6 +9,8 @@
 //!   firehose, sealing offset-tagged Arrow segments per flush tick.
 //! - **Real-time API** ([`api`]): embedded Axum service answering component
 //!   lookups and connectivity checks from shared memory.
+//! - **gRPC** ([`grpc`]): a tonic front end over the same shared state,
+//!   mirroring the REST query and edge-injection semantics.
 //! - **Persistence** ([`storage`]): micro-batch flushes to object storage —
 //!   Parquet data files plus a Puffin sidecar carrying the DSU routing maps,
 //!   made visible by an atomic snapshot-catalog commit.
@@ -17,6 +19,7 @@
 
 pub mod api;
 pub mod core;
+pub mod grpc;
 pub mod ha;
 pub mod ingest;
 pub mod storage;

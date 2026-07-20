@@ -128,8 +128,11 @@ the last line of defense even if two workers briefly both believe they lead.
 
 ## Extension points
 
-- **gRPC**: the API layer is a plain `axum::Router`; a tonic service over
-  the same `AppState` can be served on a second port.
+- **gRPC** (`src/grpc`): a tonic `BlazeService` over the same `AppState` as
+  the Axum API, served on a second port (`--grpc-listen`). The query RPCs stay
+  lock-free (`forest.scope_root` / `forest.connected`) and `InjectEdge` feeds
+  the same ingest channel as `POST /v1/edges`. The proto is compiled in
+  `build.rs` with the pure-Rust `protox` compiler, so no `protoc` is needed.
 - **Log sources**: implement a consumer feeding the pipeline channel with
   log-native offsets.
 - **Iceberg REST catalog**: replace `SnapshotCatalog` commit/latest.

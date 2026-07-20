@@ -76,6 +76,15 @@ observe each committed watermark and discard their duplicate buffers.
 | `GET /v1/scopes/{scope}/connected?u=&v=` | connectivity check in `scope`'s view |
 | `POST /v1/edges` | inject an edge event (`{"src", "dst", "scopes": [..], "props"}`; empty scopes = global) |
 
+### gRPC
+
+A tonic `BlazeService` (default `0.0.0.0:50051`, `--grpc-listen`) serves the
+same semantics over the same shared, lock-free state: `GetComponent`,
+`CheckConnected`, `GetStats`, and `InjectEdge` (scopes as `uint32`, 0 =
+global). The proto lives in [`proto/blaze/v1/blaze.proto`](proto/blaze/v1/blaze.proto)
+and is compiled at build time with the pure-Rust `protox` codegen — no
+`protoc` binary required.
+
 ## Development
 
 ```bash
