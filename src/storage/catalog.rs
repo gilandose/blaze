@@ -16,6 +16,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataFileMeta {
@@ -49,11 +50,20 @@ pub enum CommitOutcome {
 pub struct SnapshotCatalog {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
+    /// Highest sequence this process has observed as committed (0 = none
+    /// yet). Sequences are dense, so `latest()` can probe forward from here
+    /// with cheap HEADs instead of listing the whole metadata/ prefix —
+    /// which would grow linearly with snapshot history on S3.
+    cached_seq: AtomicU64,
 }
 
 impl SnapshotCatalog {
     pub fn new(store: Arc<dyn ObjectStore>, prefix: Path) -> Self {
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            cached_seq: AtomicU64::new(0),
+        }
     }
 
     fn snap_path(&self, sequence: u64) -> Path {
@@ -64,30 +74,49 @@ impl SnapshotCatalog {
             .join(format!("snap-{sequence:012}.json"))
     }
 
-    /// Latest committed snapshot, if any.
+    /// Latest committed snapshot, if any. First call (or an empty catalog)
+    /// scans the metadata/ prefix; afterwards it probes forward from the
+    /// cached sequence — normally zero or one HEAD per tick.
     pub async fn latest(&self) -> anyhow::Result<Option<SnapshotMeta>> {
+        let mut seq = self.cached_seq.load(Ordering::Acquire);
+        if seq == 0 {
+            seq = self.scan_latest_seq().await?;
+            if seq == 0 {
+                return Ok(None);
+            }
+        }
+        while self.exists(seq + 1).await? {
+            seq += 1;
+        }
+        self.cached_seq.fetch_max(seq, Ordering::AcqRel);
+        let bytes = self.store.get(&self.snap_path(seq)).await?.bytes().await?;
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    async fn exists(&self, sequence: u64) -> anyhow::Result<bool> {
+        match self.store.head(&self.snap_path(sequence)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Full listing fallback for a cold catalog view.
+    async fn scan_latest_seq(&self) -> anyhow::Result<u64> {
         let prefix = self.prefix.clone().join("metadata");
-        let mut newest: Option<Path> = None;
+        let mut newest = 0u64;
         let mut stream = self.store.list(Some(&prefix));
         while let Some(meta) = stream.try_next().await? {
             let name = meta.location.filename().unwrap_or_default();
-            if name.starts_with("snap-")
-                && name.ends_with(".json")
-                && newest
-                    .as_ref()
-                    .map(|p| meta.location.as_ref() > p.as_ref())
-                    .unwrap_or(true)
+            if let Some(seq) = name
+                .strip_prefix("snap-")
+                .and_then(|r| r.strip_suffix(".json"))
+                .and_then(|r| r.parse::<u64>().ok())
             {
-                newest = Some(meta.location);
+                newest = newest.max(seq);
             }
         }
-        match newest {
-            None => Ok(None),
-            Some(path) => {
-                let bytes = self.store.get(&path).await?.bytes().await?;
-                Ok(Some(serde_json::from_slice(&bytes)?))
-            }
-        }
+        Ok(newest)
     }
 
     /// Atomically publish a snapshot. Fails with `Conflict` if some other
@@ -100,7 +129,11 @@ impl SnapshotCatalog {
             ..Default::default()
         };
         match self.store.put_opts(&path, payload, opts).await {
-            Ok(_) => Ok(CommitOutcome::Committed),
+            Ok(_) => {
+                self.cached_seq
+                    .fetch_max(snapshot.sequence, Ordering::AcqRel);
+                Ok(CommitOutcome::Committed)
+            }
             Err(object_store::Error::AlreadyExists { .. }) => Ok(CommitOutcome::Conflict),
             Err(e) => Err(e.into()),
         }

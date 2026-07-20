@@ -17,13 +17,16 @@ use super::buffer::EdgeBuffer;
 
 #[derive(Debug, Default)]
 pub struct PipelineStats {
-    /// Next offset to assign; also the exclusive upper bound of ingested data.
-    pub next_offset: AtomicU64,
+    /// Highest offset assigned so far (starts at the recovery watermark, so
+    /// this is the stream position, not an events-since-boot count).
+    pub last_offset: AtomicU64,
 }
 
 impl PipelineStats {
-    pub fn events_ingested(&self) -> u64 {
-        self.next_offset.load(Ordering::Relaxed)
+    /// Current stream position: the last assigned offset, which equals the
+    /// recovery watermark until the first event arrives.
+    pub fn last_offset(&self) -> u64 {
+        self.last_offset.load(Ordering::Relaxed)
     }
 }
 
@@ -38,7 +41,7 @@ impl Pipeline {
     /// (the committed watermark on recovery; 0 for a fresh worker).
     pub fn new(forest: Arc<ScopedForest>, buffer: Arc<EdgeBuffer>, start_offset: u64) -> Self {
         let stats = Arc::new(PipelineStats {
-            next_offset: AtomicU64::new(start_offset),
+            last_offset: AtomicU64::new(start_offset),
         });
         Self {
             forest,
@@ -53,7 +56,7 @@ impl Pipeline {
         let mut batch = Vec::with_capacity(256);
         while rx.recv_many(&mut batch, 256).await > 0 {
             for event in batch.drain(..) {
-                let offset = self.stats.next_offset.fetch_add(1, Ordering::Relaxed) + 1;
+                let offset = self.stats.last_offset.fetch_add(1, Ordering::Relaxed) + 1;
                 self.forest.apply(&event);
                 self.buffer.append(offset, &event);
             }
@@ -95,7 +98,7 @@ mod tests {
         handle.await.unwrap();
 
         assert!(forest.connected(0, 500, 105));
-        assert_eq!(pipeline.stats.events_ingested(), 101);
+        assert_eq!(pipeline.stats.last_offset(), 101);
         let seg = buffer.seal_active().unwrap();
         // Offsets resume after the recovery watermark.
         assert_eq!((seg.min_offset, seg.max_offset), (101, 101));

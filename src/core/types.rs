@@ -23,11 +23,21 @@ pub enum Visibility {
 }
 
 impl Visibility {
-    /// A scope list containing `GLOBAL_SCOPE` is equivalent to global visibility.
+    /// Canonicalize visibility: an empty scope list or one containing
+    /// `GLOBAL_SCOPE` means global (matching the API contract), and scope ids
+    /// are sorted + deduplicated so repeated ids cannot produce duplicate
+    /// rows or unions downstream.
     pub fn normalize(self) -> Visibility {
         match self {
-            Visibility::Scoped(s) if s.contains(&GLOBAL_SCOPE) => Visibility::Global,
-            other => other,
+            Visibility::Scoped(s) if s.is_empty() || s.contains(&GLOBAL_SCOPE) => {
+                Visibility::Global
+            }
+            Visibility::Scoped(mut s) => {
+                s.sort_unstable();
+                s.dedup();
+                Visibility::Scoped(s)
+            }
+            global => global,
         }
     }
 }

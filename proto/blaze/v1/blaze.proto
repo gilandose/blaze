@@ -52,7 +52,8 @@ message GetStatsResponse {
   bool leader = 2;
   ForestStats forest = 3;
   BufferStats buffer = 4;
-  uint64 events_ingested = 5;
+  // Last assigned stream offset (resumes from the committed watermark).
+  uint64 last_offset = 5;
 }
 
 message ForestStats {

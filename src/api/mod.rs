@@ -76,7 +76,7 @@ async fn stats(State(s): State<AppState>) -> Json<serde_json::Value> {
         "leader": s.elector.is_leader(),
         "forest": s.forest.stats(),
         "buffer": s.buffer.stats(),
-        "events_ingested": s.pipeline_stats.events_ingested(),
+        "last_offset": s.pipeline_stats.last_offset(),
     }))
 }
 
@@ -135,11 +135,10 @@ async fn inject_edge(
     State(s): State<AppState>,
     Json(body): Json<InjectEdge>,
 ) -> Result<StatusCode, ApiError> {
-    let visibility = if body.scopes.is_empty() {
-        Visibility::Global
-    } else {
-        Visibility::Scoped(body.scopes.into_iter().collect())
-    };
+    // normalize() folds empty lists and lists containing scope 0 into
+    // Global, and dedups repeated ids — the event enters the pipeline
+    // canonical.
+    let visibility = Visibility::Scoped(body.scopes.into_iter().collect()).normalize();
     let event = EdgeEvent {
         src: body.src,
         dst: body.dst,

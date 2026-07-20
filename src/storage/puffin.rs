@@ -102,6 +102,10 @@ pub fn write(blobs: &[Blob], file_properties: BTreeMap<String, String>) -> Bytes
         properties: file_properties,
     };
     let payload = serde_json::to_vec(&footer).expect("footer metadata serializes");
+    assert!(
+        u32::try_from(payload.len()).is_ok(),
+        "puffin footer payload exceeds u32 size field"
+    );
 
     out.put_slice(&MAGIC);
     out.put_slice(&payload);
@@ -143,8 +147,11 @@ pub fn read(data: &[u8]) -> Result<Vec<Blob>, PuffinError> {
         .into_iter()
         .map(|meta| {
             let start = meta.offset as usize;
-            let end = start + meta.length as usize;
-            if end > n {
+            let end = start.saturating_add(meta.length as usize);
+            // Blobs must live strictly in the blob area between the leading
+            // magic and the footer marker — a range aliasing the footer bytes
+            // is a corrupt or malicious file.
+            if start < MAGIC.len() || end > magic_start {
                 return Err(PuffinError::BlobOutOfBounds {
                     offset: meta.offset,
                     length: meta.length,

@@ -92,7 +92,7 @@ impl BlazeService for GrpcService {
                 sealed_segments: buffer.sealed_segments as u64,
                 sealed_bytes: buffer.sealed_bytes as u64,
             }),
-            events_ingested: self.state.pipeline_stats.events_ingested(),
+            last_offset: self.state.pipeline_stats.last_offset(),
         }))
     }
 
@@ -101,13 +101,9 @@ impl BlazeService for GrpcService {
         request: Request<pb::InjectEdgeRequest>,
     ) -> Result<Response<pb::InjectEdgeResponse>, Status> {
         let req = request.into_inner();
-        // Empty scopes (or a list resolving to global) means global visibility,
-        // exactly as the REST handler and `Visibility::normalize` treat it.
-        let visibility = if req.scopes.is_empty() {
-            Visibility::Global
-        } else {
-            Visibility::Scoped(req.scopes.into_iter().collect())
-        };
+        // normalize() folds empty lists and lists containing scope 0 into
+        // Global and dedups repeated ids — identical to the REST handler.
+        let visibility = Visibility::Scoped(req.scopes.into_iter().collect()).normalize();
         let event = EdgeEvent {
             src: req.src,
             dst: req.dst,
