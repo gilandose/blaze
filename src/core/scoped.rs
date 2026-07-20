@@ -24,8 +24,19 @@
 //! `scope_root(s, x) = overlay(s).find(global.find(x))`, falling back to the
 //! global root when the scope has no overlay state for it.
 //!
+//! # Canonical representatives: lowest graph id wins
+//!
+//! Both layers union by *minimum id* (see [`Dsu`]), so `scope_root` is the
+//! smallest graph id in the component as seen by that scope — deterministic
+//! and monotonically non-increasing as merges happen. This holds through the
+//! overlay: a global root is the min of its global component, overlay
+//! elements are (possibly historical) global roots, and every fix-up inserts
+//! the new, lower global root as an overlay element — so the overlay class
+//! min is exactly the min graph id of the scope component.
+//!
 //! Unions (from the single ingest pipeline) are serialized behind one mutex;
-//! finds — the sub-millisecond API path — never take it.
+//! finds — the sub-millisecond API path — never take it and use the
+//! read-only `find_ro` walk so query load cannot contend with the writer.
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -105,14 +116,16 @@ impl ScopedForest {
         }
     }
 
-    /// Component representative of `node` as seen by `scope`. Lock-free.
+    /// Component representative of `node` as seen by `scope`: the lowest
+    /// graph id in that component. Read-only walk — never contends with the
+    /// ingest writer.
     pub fn scope_root(&self, scope: ScopeId, node: NodeId) -> NodeId {
-        let g = self.global.find(node);
+        let g = self.global.find_ro(node);
         if scope == GLOBAL_SCOPE {
             return g;
         }
         match self.overlays.get(&scope) {
-            Some(overlay) => overlay.find(g),
+            Some(overlay) => overlay.find_ro(g),
             None => g,
         }
     }
@@ -316,6 +329,38 @@ mod tests {
             }
             false
         }
+
+        /// Lowest node id in `u`'s component as seen by `scope` — the value
+        /// `scope_root` must return under lowest-graph-id-wins semantics.
+        fn component_min(&self, scope: ScopeId, u: NodeId) -> NodeId {
+            let mut adj: std::collections::HashMap<NodeId, Vec<NodeId>> =
+                std::collections::HashMap::new();
+            let add = |a: NodeId, b: NodeId, adj: &mut std::collections::HashMap<_, Vec<_>>| {
+                adj.entry(a).or_default().push(b);
+                adj.entry(b).or_default().push(a);
+            };
+            for &(a, b) in &self.global_edges {
+                add(a, b, &mut adj);
+            }
+            for &(s, a, b) in &self.scope_edges {
+                if s == scope {
+                    add(a, b, &mut adj);
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![u];
+            seen.insert(u);
+            let mut min = u;
+            while let Some(x) = stack.pop() {
+                min = min.min(x);
+                for &n in adj.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    if seen.insert(n) {
+                        stack.push(n);
+                    }
+                }
+            }
+            min
+        }
     }
 
     #[test]
@@ -363,6 +408,13 @@ mod tests {
                         model.connected(s, a, b),
                         "round {round}: scope {s} connectivity({a},{b}) diverged"
                     );
+                    // Canonical representative: lowest graph id in the
+                    // component wins, in every scope's view.
+                    assert_eq!(
+                        f.scope_root(s, a),
+                        model.component_min(s, a),
+                        "round {round}: scope {s} root({a}) is not the component min"
+                    );
                 }
             }
 
@@ -379,6 +431,7 @@ mod tests {
                     f2.connected(GLOBAL_SCOPE, a, b),
                     model.connected(GLOBAL_SCOPE, a, b)
                 );
+                assert_eq!(f2.scope_root(s, a), model.component_min(s, a));
             }
 
             // And hydrated forests must keep absorbing new global merges

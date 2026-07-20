@@ -84,8 +84,9 @@ async fn stats(State(s): State<AppState>) -> Json<serde_json::Value> {
 struct ComponentResponse {
     scope: ScopeId,
     node: NodeId,
-    /// Current component representative — the "routing target" (Graph 500 ->
-    /// Graph 105).
+    /// The component's canonical id: the lowest graph id it contains, so the
+    /// routing target is deterministic (Graph 500 -> Graph 105) and only ever
+    /// decreases as merges land.
     root: NodeId,
 }
 

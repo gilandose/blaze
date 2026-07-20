@@ -29,6 +29,7 @@ message GetComponentRequest {
 message GetComponentResponse {
   uint32 scope = 1;
   uint64 node = 2;
+  // Canonical component id: the lowest graph id in the component.
   uint64 root = 3;
 }
 

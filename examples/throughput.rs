@@ -102,12 +102,17 @@ fn main() {
         acc
     );
 
-    // --- Query path: 8 threads, with concurrent ingest of fresh events ---
+    // --- Query path: query threads on all-but-one core, with concurrent
+    // ingest of fresh events (the deployment guidance: leave the single
+    // writer a core instead of oversubscribing) ---
+    let query_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1) as u64)
+        .unwrap_or(3);
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
     let more = make_events(500_000);
     std::thread::scope(|scope| {
-        for tid in 0..8u64 {
+        for tid in 0..query_threads {
             let forest = forest.clone();
             let stop = stop.clone();
             let total = total.clone();
@@ -135,7 +140,7 @@ fn main() {
         let ingest_secs = t.elapsed().as_secs_f64();
         stop.store(true, Ordering::Relaxed);
         println!(
-            "Ingest w/ 8 query threads: {:>10.0} events/s",
+            "Ingest w/ {query_threads} query threads: {:>10.0} events/s",
             more.len() as f64 / ingest_secs
         );
         // Threads joined at scope exit; measure wall time for query rate.
@@ -144,7 +149,7 @@ fn main() {
     });
     let stats = forest.stats();
     println!(
-        "Queries (8 threads, concurrent ingest): ~{:.1}M conn-checks total",
+        "Queries ({query_threads} threads, concurrent ingest): ~{:.1}M conn-checks total",
         total.load(Ordering::Relaxed) as f64 / 1e6
     );
     println!(

@@ -55,12 +55,21 @@ Naive designs fail at this cardinality:
   two overlay elements now denote the same global component — and `B`'s
   registrations migrate to `A`.
 
-Query composition (lock-free):
+Query composition (lock-free, read-only):
 
 ```text
-scope_root(s, x) = overlay(s).find(global.find(x))   // falls back to global root
+scope_root(s, x) = overlay(s).find_ro(global.find_ro(x))   // falls back to global root
 connected(s, u, v) = scope_root(s, u) == scope_root(s, v)
 ```
+
+**Canonical roots — lowest graph id wins.** Both layers union by minimum id,
+so `scope_root` returns the smallest graph id in the component as seen by
+that scope: deterministic, and only ever decreasing as merges land (trending
+toward stable ids for long-lived graphs). The property survives the overlay
+because every global fix-up inserts the new, lower global root as an overlay
+element, keeping the overlay class min equal to the true component min. The
+randomized test asserts `scope_root == BFS component minimum` on every
+check.
 
 Cost model: a global merge pays only for scopes that actually reference the
 absorbed root (typically zero or a handful, never a 3000-way broadcast);
@@ -73,9 +82,12 @@ model, including across snapshot/hydrate cycles.
 - All **unions** (global, scoped, fix-ups) serialize behind one mutex —
   mutation rate is bounded by ingest, and a mutex uncontended by queries
   costs nanoseconds.
-- All **finds** are lock-free DashMap walks with path-halving; halving
-  writes are safe under races because a parent pointer is only ever replaced
-  by another ancestor.
+- **Write-path finds** compress via path-halving; halving writes are safe
+  under races because a parent pointer is only ever replaced by another
+  ancestor. **Query-path finds** (`find_ro`) are read-only walks — taking
+  only shard read locks so query load cannot starve the single writer — with
+  one repair write if a walk exceeds a depth threshold, capping pathological
+  chains.
 - Queries racing a multi-step union may observe pre-fix-up state for
   microseconds — the read-your-own-stream guarantee is eventual within a
   tick, which is the right trade for a streaming engine.

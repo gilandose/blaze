@@ -72,7 +72,7 @@ observe each committed watermark and discard their duplicate buffers.
 |---|---|
 | `GET /v1/health` | liveness + leadership |
 | `GET /v1/stats` | forest/buffer/ingest counters |
-| `GET /v1/scopes/{scope}/components/{node}` | component representative for `node` in `scope` (`global` or numeric id) |
+| `GET /v1/scopes/{scope}/components/{node}` | canonical component id for `node` in `scope` — the lowest graph id in the component (`global` or numeric scope id) |
 | `GET /v1/scopes/{scope}/connected?u=&v=` | connectivity check in `scope`'s view |
 | `POST /v1/edges` | inject an edge event (`{"src", "dst", "scopes": [..], "props"}`; empty scopes = global) |
 
