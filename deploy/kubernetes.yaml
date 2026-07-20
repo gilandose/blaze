@@ -1,0 +1,155 @@
+# blaze EKS manifests
+#
+# Before applying, substitute:
+#   - BUCKET            -> the S3 bucket (and optional prefix) the fleet
+#                          should treat as its warehouse, e.g.
+#                          "my-blaze-bucket/graph" for
+#                          s3://my-blaze-bucket/graph. Used in the
+#                          Deployment's --warehouse flag below.
+#   - <IMAGE>            -> the pushed image reference, e.g.
+#                          123456789012.dkr.ecr.us-east-1.amazonaws.com/blaze:latest
+#   - <AWS_ROLE_ARN>     -> the IAM role ARN to associate with the
+#                          ServiceAccount via IRSA (IAM Roles for Service
+#                          Accounts). That role needs S3 read/write on
+#                          BUCKET; blaze itself takes no AWS credentials as
+#                          flags or env vars -- object_store's S3 client
+#                          picks them up from the environment, and IRSA is
+#                          what populates that environment inside EKS pods.
+#
+# Apply with:
+#   kubectl apply -f deploy/kubernetes.yaml
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: blaze
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blaze
+  namespace: blaze
+  annotations:
+    # IRSA: the EKS pod identity webhook injects AWS_ROLE_ARN /
+    # AWS_WEB_IDENTITY_TOKEN_FILE env vars into pods using this
+    # ServiceAccount, which object_store's AmazonS3Builder::from_env()
+    # picks up automatically -- no S3 credentials are passed on the
+    # blaze command line.
+    eks.amazonaws.com/role-arn: "<AWS_ROLE_ARN>"
+
+---
+# The Lease election in src/ha/kube_lease.rs does a plain GET on the named
+# Lease (creating it if absent, replacing it to renew/take over), so the
+# elector only ever needs get/create/update on coordination.k8s.io leases
+# in this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blaze-lease-elector
+  namespace: blaze
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blaze-lease-elector
+  namespace: blaze
+subjects:
+  - kind: ServiceAccount
+    name: blaze
+    namespace: blaze
+roleRef:
+  kind: Role
+  name: blaze-lease-elector
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blaze
+  namespace: blaze
+  labels:
+    app: blaze
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: blaze
+  template:
+    metadata:
+      labels:
+        app: blaze
+    spec:
+      serviceAccountName: blaze
+      containers:
+        - name: blaze
+          image: <IMAGE>
+          args:
+            - "--election"
+            - "k8s"
+            - "--k8s-namespace"
+            - "blaze"
+            - "--warehouse"
+            - "s3://BUCKET/prefix"
+            - "--flush-interval-secs"
+            - "60"
+          env:
+            # worker_id in src/main.rs falls back to
+            # "$HOSTNAME-$PID" and is also used as the Lease
+            # holder identity -- the binary is invoked directly (no
+            # shell), so this must be supplied explicitly rather than
+            # relying on the container's OS-level hostname.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 50051
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blaze
+  namespace: blaze
+  labels:
+    app: blaze
+spec:
+  type: ClusterIP
+  selector:
+    app: blaze
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 50051
+      targetPort: 50051
