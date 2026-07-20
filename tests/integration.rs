@@ -262,3 +262,141 @@ async fn api_edge_injection_feeds_pipeline() {
         Visibility::Scoped(smallvec![42u32, 43u32])
     );
 }
+
+/// Reference model for the incremental-cycles test: per-scope BFS over
+/// (global ∪ scope) edges, with the component-minimum as the canonical root.
+struct RefModel {
+    global_edges: Vec<(u64, u64)>,
+    scope_edges: Vec<(u32, u64, u64)>,
+}
+
+impl RefModel {
+    fn component(&self, scope: u32, u: u64) -> std::collections::HashSet<u64> {
+        let mut adj: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+        let mut add = |a: u64, b: u64, adj: &mut std::collections::HashMap<u64, Vec<u64>>| {
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        };
+        for &(a, b) in &self.global_edges {
+            add(a, b, &mut adj);
+        }
+        for &(s, a, b) in &self.scope_edges {
+            if s == scope {
+                add(a, b, &mut adj);
+            }
+        }
+        let mut seen = std::collections::HashSet::from([u]);
+        let mut stack = vec![u];
+        while let Some(x) = stack.pop() {
+            for &n in adj.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if seen.insert(n) {
+                    stack.push(n);
+                }
+            }
+        }
+        seen
+    }
+
+    fn connected(&self, scope: u32, u: u64, v: u64) -> bool {
+        u == v || self.component(scope, u).contains(&v)
+    }
+
+    fn component_min(&self, scope: u32, u: u64) -> u64 {
+        self.component(scope, u).into_iter().min().unwrap()
+    }
+}
+
+/// Randomized state must survive REPEATED flush -> Puffin bytes -> cold-start
+/// hydration cycles: each cycle's snapshot is taken from a forest that was
+/// itself hydrated the cycle before, sequences increment, watermarks advance,
+/// and every answer keeps matching the BFS reference model.
+#[tokio::test]
+async fn incremental_puffin_cycles_stay_correct() {
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    const NODES: u64 = 80;
+    const SCOPES: [u32; 3] = [1, 2, 3];
+    const CYCLES: usize = 3;
+    const EVENTS_PER_CYCLE: usize = 150;
+
+    let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut model = RefModel {
+        global_edges: vec![],
+        scope_edges: vec![],
+    };
+
+    let mut forest = Arc::new(ScopedForest::new());
+    let mut offset = 0u64;
+    let mut last_sequence = 0u64;
+    let mut last_watermark = 0u64;
+
+    for cycle in 0..CYCLES {
+        // Each cycle uses a fresh buffer/flusher bound to the current forest
+        // (which, after cycle 0, is a hydrated cold-start instance).
+        let buffer = Arc::new(EdgeBuffer::new());
+        let (flusher, catalog) = make_flusher(
+            store.clone(),
+            forest.clone(),
+            buffer.clone(),
+            true,
+            &format!("leader-cycle-{cycle}"),
+        );
+
+        for _ in 0..EVENTS_PER_CYCLE {
+            let u = rng.random_range(0..NODES);
+            let v = rng.random_range(0..NODES);
+            let event = if rng.random_range(0..100) < 30 {
+                model.global_edges.push((u, v));
+                global_edge(u, v)
+            } else {
+                let s = SCOPES[rng.random_range(0..SCOPES.len())];
+                model.scope_edges.push((s, u, v));
+                scoped_edge(u, v, &[s])
+            };
+            offset += 1;
+            forest.apply(&event);
+            buffer.append(offset, &event);
+        }
+
+        flusher.tick().await.unwrap();
+        let snap = catalog.latest().await.unwrap().unwrap();
+        assert_eq!(snap.sequence, last_sequence + 1, "sequence must increment");
+        assert!(snap.watermark > last_watermark, "watermark must advance");
+        assert_eq!(snap.watermark, offset);
+        last_sequence = snap.sequence;
+        last_watermark = snap.watermark;
+
+        // Cold start strictly from the committed Puffin bytes.
+        let fresh = Arc::new(ScopedForest::new());
+        let watermark = hydrate_from_catalog(&fresh, &store, &catalog)
+            .await
+            .unwrap();
+        assert_eq!(watermark, offset);
+
+        for _ in 0..250 {
+            let a = rng.random_range(0..NODES);
+            let b = rng.random_range(0..NODES);
+            let s = if rng.random_range(0..4) == 0 {
+                GLOBAL_SCOPE
+            } else {
+                SCOPES[rng.random_range(0..SCOPES.len())]
+            };
+            assert_eq!(
+                fresh.connected(s, a, b),
+                model.connected(s, a, b),
+                "cycle {cycle}: hydrated connectivity diverged in scope {s} ({a},{b})"
+            );
+            assert_eq!(
+                fresh.scope_root(s, a),
+                model.component_min(s, a),
+                "cycle {cycle}: hydrated root({a}) in scope {s} is not the component min"
+            );
+        }
+
+        // Next cycle continues on the HYDRATED forest, so cycle N+1's
+        // snapshot proves a snapshot-of-a-hydrated-forest is faithful.
+        forest = fresh;
+    }
+}

@@ -138,6 +138,28 @@ duration, with expired-lease takeover and `resourceVersion` CAS so two
 candidates cannot both win. Failover safety: the catalog's put-if-absent is
 the last line of defense even if two workers briefly both believe they lead.
 
+## Capacity planning (measured)
+
+Memory is paid per *tracked link* — a global merge or a scope-overlay union —
+never per id: the node space is sparse `u64` and untouched nodes are free.
+Measured on the reference workload (15M events, 30M node space, 3000 scopes,
+15% global):
+
+- **~200 bytes per tracked link** (DashMap parents + overlay + registry):
+  15M links = ~3 GB resident. A 64 GB worker sustains ~250M links; the
+  registry's per-root scope sets are the first thing to slim if more is
+  needed.
+- **Full snapshot cost is the practical per-worker ceiling**, not memory:
+  15M links snapshot in ~3.5s *holding the union lock* (ingest stalls),
+  encode in ~2.2s off-lock, and produce a ~256 MB Puffin payload. Cost is
+  linear, so ~50M links ≈ 12s stall per flush tick — the comfortable
+  envelope with 60s full snapshots is **tens of millions of tracked links
+  per worker**.
+- Beyond that, the format is ready for **delta snapshots**: Puffin blobs are
+  sequence-numbered, so a flush can write only pairs changed since the last
+  snapshot with periodic full compaction, removing both the stall and the
+  rewrite. That, or shard workers by node-id range.
+
 ## Extension points
 
 - **gRPC** (`src/grpc`): a tonic `BlazeService` over the same `AppState` as
