@@ -273,7 +273,7 @@ struct RefModel {
 impl RefModel {
     fn component(&self, scope: u32, u: u64) -> std::collections::HashSet<u64> {
         let mut adj: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
-        let mut add = |a: u64, b: u64, adj: &mut std::collections::HashMap<u64, Vec<u64>>| {
+        let add = |a: u64, b: u64, adj: &mut std::collections::HashMap<u64, Vec<u64>>| {
             adj.entry(a).or_default().push(b);
             adj.entry(b).or_default().push(a);
         };
