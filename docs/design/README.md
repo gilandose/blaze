@@ -28,8 +28,10 @@ Two consequences of this profile shape everything below:
 | [002](002-dense-interning.md) | Dense id interning | memory (200→~45 B/link) | designed |
 | [003](003-disk-backed-base.md) | Disk-backed routing base (LSM) | memory + cold start | designed |
 | [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed |
+| [005](005-union-tier.md) | Union tier (`all` view) & shared/global naming | semantics gap | designed |
 
-Recommended implementation order: **001 and 002 together** (they touch the
+Recommended implementation order: **001 and 002 together** (fold in 005's
+rename and union tier — same files) (they touch the
 same core and are jointly required to fit 2B links on sane hardware), then
 003, then 004. Cost impact at the target profile: current design would need
 ~1 TB-RAM instances (~$9.5k/mo for 3 replicas); after 001+002, 128–256 GB
