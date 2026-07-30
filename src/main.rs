@@ -45,6 +45,12 @@ struct Args {
     #[arg(long, default_value = "./blaze-data")]
     data_dir: String,
 
+    /// Fold the memtable into a fresh on-disk base once it holds this many
+    /// links (--routing-base disk only). Lower keeps heap smaller at the cost
+    /// of rewriting the base more often; the fold stalls ingest while it runs.
+    #[arg(long, default_value_t = blaze::storage::DEFAULT_FOLD_AFTER_LINKS)]
+    fold_after_links: u64,
+
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
     flush_interval_secs: u64,
@@ -149,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Committed routing state: either hydrated into the heap, or mmap'd from
     // a local cache of the latest Puffin snapshot.
+    let base_dir = (args.routing_base == "disk").then(|| std::path::PathBuf::from(&args.data_dir));
     let (forest, watermark) = match args.routing_base.as_str() {
         "ram" => {
             let forest = Arc::new(ScopedForest::new());
@@ -156,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
             (forest, watermark)
         }
         "disk" => {
-            let dir = std::path::PathBuf::from(&args.data_dir);
+            let dir = base_dir.clone().expect("set for disk mode");
             match open_base_from_catalog(&store, &catalog, &dir).await? {
                 Some((base, watermark)) => (Arc::new(ScopedForest::with_base(base)), watermark),
                 None => {
@@ -214,6 +221,8 @@ async fn main() -> anyhow::Result<()> {
         elector: elector.clone(),
         table_prefix,
         worker_id: worker_id.clone(),
+        base_dir,
+        fold_after_links: args.fold_after_links,
     });
     let flush_handle = tokio::spawn(
         flusher

@@ -103,8 +103,34 @@ impl Warehouse {
         }
     }
 
-    /// Flush a forest's state as a committed snapshot (leader path).
+    /// Flush a forest's state as a committed snapshot (leader path), never
+    /// folding — so the memtable is left exactly as the test built it.
     async fn commit(&self, forest: Arc<ScopedForest>, first_offset: u64, events: &[EdgeEvent]) {
+        self.flush(forest, first_offset, events, u64::MAX, true)
+            .await;
+    }
+
+    /// As `commit`, but folding the memtable into a fresh local base whenever
+    /// it holds `fold_after` links or more.
+    async fn commit_folding(
+        &self,
+        forest: Arc<ScopedForest>,
+        first_offset: u64,
+        events: &[EdgeEvent],
+        fold_after: u64,
+    ) {
+        self.flush(forest, first_offset, events, fold_after, true)
+            .await;
+    }
+
+    async fn flush(
+        &self,
+        forest: Arc<ScopedForest>,
+        first_offset: u64,
+        events: &[EdgeEvent],
+        fold_after: u64,
+        leader: bool,
+    ) {
         let buffer = Arc::new(EdgeBuffer::new());
         for (i, e) in events.iter().enumerate() {
             buffer.append(first_offset + i as u64, e);
@@ -114,9 +140,16 @@ impl Warehouse {
             buffer,
             store: self.store.clone(),
             catalog: self.catalog.clone(),
-            elector: Arc::new(StaticElector(true)),
+            elector: Arc::new(StaticElector(leader)),
             table_prefix: self.prefix.clone(),
-            worker_id: "test-leader".into(),
+            worker_id: if leader {
+                "test-leader"
+            } else {
+                "test-follower"
+            }
+            .into(),
+            base_dir: Some(self.cache.path().to_path_buf()),
+            fold_after_links: fold_after,
         };
         flusher.tick().await.unwrap();
     }
@@ -358,6 +391,184 @@ async fn streamed_compaction_matches_the_materialized_snapshot() {
         keys.windows(2).all(|w| w[0] < w[1]),
         "output must be sorted"
     );
+}
+
+/// The memtable has to be foldable into a fresh base **while the worker runs**.
+/// Compaction alone only reads the forest, so without a fold a cold start's
+/// small memtable is an initial condition rather than a steady state, and the
+/// process drifts back to heap-resident. Drive many folds over randomized
+/// state and require every answer to keep matching the model.
+#[tokio::test]
+async fn repeated_folds_bound_the_memtable_without_changing_answers() {
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    const NODES: u64 = 400;
+    const SCOPES: [u32; 3] = [1, 2, 3];
+    const ROUNDS: usize = 6;
+    const PER_ROUND: usize = 150;
+    const FOLD_AFTER: u64 = 40;
+
+    let mut rng = StdRng::seed_from_u64(0xF01D);
+    let wh = Warehouse::new();
+    let mut model = RefModel::default();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+    let mut peak_memtable = 0u64;
+    let mut expected_folds = 0u64;
+
+    for round in 0..ROUNDS {
+        let mut batch = Vec::with_capacity(PER_ROUND);
+        for _ in 0..PER_ROUND {
+            let (u, v) = (rng.random_range(0..NODES), rng.random_range(0..NODES));
+            let event = if rng.random_range(0..100) < 30 {
+                model.global_edges.push((u, v));
+                global_edge(u, v)
+            } else {
+                let s = SCOPES[rng.random_range(0..SCOPES.len())];
+                model.scope_edges.push((s, u, v));
+                scoped_edge(u, v, &[s])
+            };
+            forest.apply(&event);
+            batch.push(event);
+        }
+        // Links saturate once a scope's nodes are all one component, so a late
+        // round may legitimately not reach the trigger. Predict from the same
+        // signal the flusher uses rather than assuming one fold per round.
+        let pending = forest.memtable_links();
+        peak_memtable = peak_memtable.max(pending);
+        if pending >= FOLD_AFTER {
+            expected_folds += 1;
+        }
+
+        wh.commit_folding(forest.clone(), offset, &batch, FOLD_AFTER)
+            .await;
+        offset += batch.len() as u64;
+
+        // The fold happened in place: this is the *same* forest object the
+        // queries below and the next round's writes go through.
+        let stats = forest.stats();
+        assert_eq!(stats.folds, expected_folds, "round {round}: fold not taken");
+        if pending >= FOLD_AFTER {
+            assert_eq!(
+                forest.memtable_links(),
+                0,
+                "round {round}: fold must leave the memtable empty"
+            );
+            assert!(stats.base_shared_pairs + stats.base_overlay_pairs > 0);
+        }
+
+        for _ in 0..300 {
+            let (a, b) = (rng.random_range(0..NODES), rng.random_range(0..NODES));
+            let s = if rng.random_range(0..4) == 0 {
+                GLOBAL_SCOPE
+            } else {
+                SCOPES[rng.random_range(0..SCOPES.len())]
+            };
+            assert_eq!(
+                forest.connected(s, a, b),
+                model.connected(s, a, b),
+                "round {round}: connectivity diverged after fold in scope {s} ({a},{b})"
+            );
+            assert_eq!(
+                forest.scope_root(s, a),
+                model.component_min(s, a),
+                "round {round}: root({a}) in scope {s} is not the component min after fold"
+            );
+        }
+    }
+
+    // The point of the exercise: heap stayed bounded by the fold trigger while
+    // the state behind it grew round after round.
+    assert!(
+        peak_memtable > FOLD_AFTER,
+        "the trigger was never exercised"
+    );
+    let final_stats = forest.stats();
+    assert!(
+        expected_folds >= 3,
+        "expected several folds over {ROUNDS} rounds, got {expected_folds}"
+    );
+    assert_eq!(final_stats.folds, expected_folds);
+    assert!(
+        final_stats.base_shared_pairs + final_stats.base_overlay_pairs > peak_memtable,
+        "the base should now hold more than the memtable ever did"
+    );
+}
+
+/// Followers serve from the same structures and grow at the same rate, so
+/// folding only on the leader would relocate the leak rather than fix it. A
+/// follower must fold and must still commit nothing.
+#[tokio::test]
+async fn followers_fold_but_never_commit() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut events = Vec::new();
+    for i in 0..80u64 {
+        let e = global_edge(i, i + 1);
+        forest.apply(&e);
+        events.push(e);
+    }
+    assert_eq!(forest.memtable_links(), 80);
+
+    wh.flush(forest.clone(), 1, &events, 10, false).await;
+
+    assert_eq!(forest.stats().folds, 1, "a follower must still fold");
+    assert_eq!(forest.memtable_links(), 0);
+    assert!(
+        wh.catalog.latest().await.unwrap().is_none(),
+        "a follower must not commit a snapshot"
+    );
+    // ...and it still answers over the whole chain, now from its local base.
+    assert!(forest.connected(GLOBAL_SCOPE, 0, 80));
+    assert_eq!(forest.scope_root(GLOBAL_SCOPE, 80), 0);
+}
+
+/// A fold rewrites the base under live queries. Readers are never blocked, so
+/// assert directly that concurrent lookups see no intermediate state — every
+/// answer is either the pre-fold or the post-fold one, and those are equal.
+#[tokio::test]
+async fn queries_see_no_torn_state_while_folding() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut events = Vec::new();
+    for i in 0..400u64 {
+        // Two long chains, so a torn read would be obvious: any node's root is
+        // the chain head, and the answer must never be an intermediate node.
+        let e = global_edge(i, i + 1);
+        forest.apply(&e);
+        events.push(e);
+        let e = scoped_edge(10_000 + i, 10_001 + i, &[9]);
+        forest.apply(&e);
+        events.push(e);
+    }
+
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let f = forest.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    // Global chain 0..=400: every node's root is 0.
+                    assert_eq!(f.scope_root(GLOBAL_SCOPE, 400), 0);
+                    // Scope 9 additionally sees 10_000..=10_400, a component
+                    // disjoint from the global chain, so its min is 10_000.
+                    assert_eq!(f.scope_root(9, 10_400), 10_000);
+                    assert_eq!(f.scope_root(9, 400), 0);
+                    assert!(f.connected(9, 10_000, 10_400));
+                    assert!(!f.connected(GLOBAL_SCOPE, 0, 10_000));
+                    assert!(!f.connected(9, 0, 10_000));
+                }
+            })
+        })
+        .collect();
+
+    wh.commit_folding(forest.clone(), 1, &events, 10).await;
+    for r in readers {
+        r.join()
+            .expect("a reader observed torn state during the fold");
+    }
+    assert_eq!(forest.stats().folds, 1);
+    assert_eq!(forest.memtable_links(), 0);
 }
 
 /// A base-backed forest holds only post-snapshot merges in the heap: that is

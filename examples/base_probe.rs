@@ -192,6 +192,58 @@ fn main() {
         ram_rss,
         rss_mb() - after_drop
     );
+
+    // --- the fold: what keeps heap bounded while the worker runs ---
+    // Without it the memtable below would simply keep growing for the life of
+    // the process, and the disk tier's RAM argument would expire here.
+    let mut w = StdRng::seed_from_u64(31);
+    for _ in 0..300_000 {
+        disk.apply(&EdgeEvent {
+            src: w.random_range(0..NODES),
+            dst: w.random_range(0..NODES),
+            visibility: Visibility::Scoped(smallvec::smallvec![w.random_range(1..=SCOPES)]),
+            event_time_ms: 0,
+            props: None,
+        });
+    }
+    let grown = disk.memtable_links();
+    let before = rss_mb();
+    let fold_path = std::env::temp_dir().join("blaze-probe-fold.puffin");
+    let t = Instant::now();
+    let mut writer = codec::BlobWriter::new(2);
+    let bytes = disk
+        .compact_and_fold(&mut writer, |sink| {
+            let bytes = puffin::write(&sink.finish(), BTreeMap::new());
+            std::fs::write(&fold_path, &bytes)?;
+            let base: Arc<dyn blaze::core::RoutingBase> = Arc::new(PuffinBase::open(&fold_path)?);
+            anyhow::Ok((base, bytes.len()))
+        })
+        .unwrap();
+    println!(
+        "fold: {} memtable links -> 0 in {:.0} ms (ingest stalled; {:.0} MB base rewritten), \
+         heap delta {:+.0} MB",
+        grown,
+        t.elapsed().as_secs_f64() * 1000.0,
+        bytes as f64 / 1e6,
+        rss_mb() - before
+    );
+    assert_eq!(disk.memtable_links(), 0);
+    assert_eq!(disk.stats().folds, 1);
+
+    let mut q = StdRng::seed_from_u64(11);
+    let t = Instant::now();
+    let mut sink = 0u64;
+    for _ in 0..Q {
+        sink += disk.scope_root(q.random_range(0..=SCOPES), q.random_range(0..NODES));
+    }
+    let post = t.elapsed().as_secs_f64();
+    std::hint::black_box(sink);
+    println!(
+        "after fold: {:>9.0} lookups/s   ({:.2} us each)",
+        Q as f64 / post,
+        post * 1e6 / Q as f64
+    );
+    std::fs::remove_file(&fold_path).ok();
     // RAM-mode cold start for comparison: parse every blob and rebuild the
     // whole forest in the heap.
     let t = Instant::now();

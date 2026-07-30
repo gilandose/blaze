@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+arc-swap = "1.9.2"
 arrow-array = "59.1.0"
 arrow-buffer = "59.1.0"
 arrow-ord = "59.1.0"

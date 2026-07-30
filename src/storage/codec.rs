@@ -145,7 +145,7 @@ pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64) -> Vec<Blob> {
 /// The one term still proportional to state is the registry, which must be
 /// sorted by root *across* scopes and so is buffered. It is 12 bytes per
 /// overlay endpoint; spilling it to an external sort is design 001's job.
-struct BlobWriter {
+pub struct BlobWriter {
     sequence: i64,
     shared: BytesMut,
     shared_pairs: u64,
@@ -168,7 +168,7 @@ fn close_table(mut buf: BytesMut, count: u64) -> Bytes {
 }
 
 impl BlobWriter {
-    fn new(sequence: u64) -> Self {
+    pub fn new(sequence: u64) -> Self {
         Self {
             sequence: sequence as i64,
             shared: open_table(),
@@ -191,7 +191,7 @@ impl BlobWriter {
 
     /// Blob order matches [`snapshot_to_blobs`]: shared tier, scopes
     /// ascending, then the registry index.
-    fn finish(mut self) -> Vec<Blob> {
+    pub fn finish(&mut self) -> Vec<Blob> {
         let mut blobs = Vec::with_capacity(2 + self.scope_blobs.len());
         let shared = close_table(std::mem::take(&mut self.shared), self.shared_pairs);
         blobs.push(self.blob(GLOBAL_BLOB_TYPE, shared, BTreeMap::new()));

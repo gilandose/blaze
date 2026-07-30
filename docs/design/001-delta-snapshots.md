@@ -1,5 +1,13 @@
 # 001 — Delta snapshots & compaction
 
+> **Now the top priority, and load-bearing rather than merely nice.** 003
+> shipped, which means compaction no longer materializes state (streamed) *and*
+> the memtable is folded into a fresh base while the worker runs — so heap is
+> bounded. But the fold rewrites the whole base, so it pays the exact cost this
+> design removes: measured 2.95 s of ingest stall for a 125 MB base, extrapolating
+> to tens of minutes at the target profile. Everything below applies unchanged;
+> the delta chain is what turns a fold from O(state) into O(memtable).
+
 ## Problem
 
 The flusher writes the **entire** routing map every tick. Measured at 15M

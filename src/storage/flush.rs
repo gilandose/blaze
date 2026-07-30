@@ -29,6 +29,28 @@ pub struct Flusher {
     pub elector: Arc<dyn LeaderElector>,
     pub table_prefix: Path,
     pub worker_id: String,
+    /// Where to write folded routing bases. `None` = RAM mode: the memtable
+    /// *is* the state, so there is nothing to fold it into.
+    pub base_dir: Option<std::path::PathBuf>,
+    /// Fold once the memtable holds at least this many links. Size-triggered
+    /// rather than every tick because a fold rewrites the whole base: the
+    /// trigger is what trades write amplification against resident heap.
+    pub fold_after_links: u64,
+}
+
+/// Links a memtable may hold before a fold is due (~50 MB of DashMap).
+pub const DEFAULT_FOLD_AFTER_LINKS: u64 = 1_000_000;
+
+/// Warn when a fold stalls ingest for longer than this.
+const FOLD_STALL_WARN_MS: u64 = 5_000;
+
+/// Write `bytes` to `path` via a temp file and rename, so a torn write can
+/// never be observed — or mapped — as a routing base.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp = path.with_extension("partial");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -72,7 +94,13 @@ impl Flusher {
             }
         }
 
+        let sequence = latest.as_ref().map(|s| s.sequence + 1).unwrap_or(1);
+
         if !self.elector.is_leader() {
+            // Followers serve queries from the same structures the leader
+            // does, so their memtable grows at exactly the same rate. Folding
+            // only on the leader would relocate the leak, not fix it.
+            self.fold_if_due(sequence, latest.as_ref().map(|s| s.watermark).unwrap_or(0))?;
             return Ok(());
         }
 
@@ -80,7 +108,6 @@ impl Flusher {
         if segments.is_empty() {
             return Ok(());
         }
-        let sequence = latest.as_ref().map(|s| s.sequence + 1).unwrap_or(1);
         let watermark = segments.iter().map(|s| s.max_offset).max().unwrap_or(0);
         let min_offset = segments.iter().map(|s| s.min_offset).min().unwrap_or(0);
 
@@ -98,14 +125,15 @@ impl Flusher {
         // 2. Puffin DSU sidecar. Streamed out of the forest rather than
         // snapshotted into the heap first: compaction holds the union lock, so
         // an O(state) allocation here would stall ingest for its duration.
-        let blobs = codec::compact_to_blobs(&self.forest, sequence);
-        let puffin_bytes = puffin::write(
-            &blobs,
-            BTreeMap::from([
-                ("created-by".to_string(), "blaze".to_string()),
-                ("watermark".to_string(), watermark.to_string()),
-            ]),
-        );
+        // When a fold is due these are the same bytes the worker now serves
+        // from, so the leader never re-downloads what it just produced.
+        let puffin_bytes = match self.fold_if_due(sequence, watermark)? {
+            Some(bytes) => bytes,
+            None => puffin::write(
+                &codec::compact_to_blobs(&self.forest, sequence),
+                puffin_metadata(watermark),
+            ),
+        };
         let puffin_path = self
             .table_prefix
             .clone()
@@ -145,6 +173,81 @@ impl Flusher {
         }
         Ok(())
     }
+
+    /// Fold the memtable into a fresh local base, if one is due.
+    ///
+    /// This is the step that makes the disk tier's RAM bound hold for longer
+    /// than one flush interval. Compaction alone only *reads* the forest, so
+    /// without a fold the memtable accumulates for the life of the worker and
+    /// the process ends up heap-resident again — a cold start's 51 MB is not a
+    /// steady state, it is an initial condition.
+    ///
+    /// Returns the Puffin bytes when it folded, so the leader can commit the
+    /// very file it is now serving from. `Ok(None)` means no fold was due (or
+    /// the worker is in RAM mode).
+    ///
+    /// The fold precedes the catalog commit, so a lost commit race leaves a
+    /// local base whose bytes were never committed. That is harmless: it
+    /// encodes this worker's own composed state, which is correct regardless of
+    /// who won, and restart recovery goes through the catalog either way.
+    fn fold_if_due(&self, sequence: u64, watermark: u64) -> anyhow::Result<Option<bytes::Bytes>> {
+        let Some(dir) = &self.base_dir else {
+            return Ok(None);
+        };
+        let links = self.forest.memtable_links();
+        if links < self.fold_after_links {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(dir)?;
+        // One stable path per worker. Renaming over a mapped file is safe: the
+        // old mapping keeps the old inode alive until the last query using it
+        // drops, and the space is reclaimed then — so nothing has to track or
+        // garbage-collect previous folds.
+        let path = dir.join(format!("routing-fold-{}.puffin", self.worker_id));
+
+        let started = std::time::Instant::now();
+        let mut writer = codec::BlobWriter::new(sequence);
+        let bytes = self.forest.compact_and_fold(&mut writer, |w| {
+            let bytes = puffin::write(&w.finish(), puffin_metadata(watermark));
+            write_atomically(&path, &bytes)?;
+            let base: Arc<dyn RoutingBase> = Arc::new(PuffinBase::open(&path)?);
+            anyhow::Ok((base, bytes))
+        })?;
+
+        let stalled_ms = started.elapsed().as_millis() as u64;
+        let stats = self.forest.stats();
+        info!(
+            sequence,
+            folded_links = links,
+            memtable_links_now = stats.global_links,
+            base_shared_pairs = stats.base_shared_pairs,
+            base_overlay_pairs = stats.base_overlay_pairs,
+            base_mb = stats.base_mapped_bytes / (1024 * 1024),
+            stalled_ms,
+            "folded memtable into a fresh routing base"
+        );
+        // A fold rewrites the whole base, so the stall grows with total state
+        // rather than with what was folded. Say so out loud: silently pausing
+        // ingest for tens of seconds is the kind of thing an operator should
+        // hear about before it becomes a backlog.
+        if stalled_ms > FOLD_STALL_WARN_MS {
+            warn!(
+                stalled_ms,
+                folded_links = links,
+                base_mb = stats.base_mapped_bytes / (1024 * 1024),
+                "fold stalled ingest for a long time; raise --fold-after-links, \
+                 or land delta snapshots (docs/design/001) so folds stop being O(state)"
+            );
+        }
+        Ok(Some(bytes))
+    }
+}
+
+fn puffin_metadata(watermark: u64) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("created-by".to_string(), "blaze".to_string()),
+        ("watermark".to_string(), watermark.to_string()),
+    ])
 }
 
 /// Open the latest committed routing snapshot as an mmap'd base on local

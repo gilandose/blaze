@@ -6,12 +6,21 @@
 > lookup touches 1–2 mapped pages instead of ~26, the composed base+memtable
 > read *and* write paths, a `blaze-registry-v1` index so fix-ups against
 > base-resident roots cost one probe, local read-through caching from object
-> storage, and **streaming** compaction (`SnapshotSink`) that re-emits composed
-> state with no per-node allocation. Deferred: bloom filters over overlay
+> storage, **streaming** compaction (`SnapshotSink`) that re-emits composed
+> state with no per-node allocation, and the **fold** — `compact_and_fold`
+> swaps a fresh base in and drops the memtable under one lock hold, on every
+> worker rather than only the leader, so the memtable is bounded in a live
+> process and not merely at startup. Deferred: bloom filters over overlay
 > membership (the registry blob covers the same need for now) and spilling the
 > compaction-time registry buffer to an external sort. Measured results are in
-> ARCHITECTURE.md; note this landed *before* 001/002, so the memtable is
-> bounded by flush cadence rather than by delta chains.
+> ARCHITECTURE.md.
+>
+> **The caveat that matters**: this landed *before* 001, so a fold rewrites the
+> whole base and stalls ingest for time proportional to total state (measured:
+> 2.95 s for a 125 MB base). The "memtable resets to empty" claim below is now
+> true, but it is bought with O(state) write amplification per fold rather than
+> with the delta chains that make it cheap. Folds are size-triggered so the
+> frequency is an operator choice, and one slower than 5 s logs a warning.
 
 ## Problem
 

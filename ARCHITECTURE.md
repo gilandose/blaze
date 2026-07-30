@@ -354,6 +354,42 @@ is also advised `MADV_RANDOM`, since default readahead prefetches pages a
 binary search will never visit — except during a compaction sweep, which
 re-advises its own byte range `MADV_SEQUENTIAL` for the duration.
 
+### The fold: why a cold start's 51 MB is not a steady state
+
+Compaction only *reads* the forest, so on its own it does nothing for resident
+heap: a worker starts with a small memtable and then accumulates for its entire
+life. Cold start being cheap is an initial condition, not a bound.
+
+So the flush loop **folds**: compact, write the resulting Puffin file locally,
+map it, adopt it as the new base, and drop the memtable — all in one step.
+`ScopedForest::compact_and_fold` holds the union lock across the whole thing,
+because a two-call version would lose anything applied in between. Folds are
+triggered by memtable size (`--fold-after-links`, default 1M) rather than by
+the flush clock, since that is the knob that trades write amplification against
+resident heap. **Every worker folds, leader or not** — a follower serves from
+the same structures and grows at the same rate, so leader-only folding would
+relocate the leak rather than fix it. `folds` in `/stats` is the signal: if it
+stops advancing while `global_links` climbs, heap use is unbounded again.
+
+The fold replaces the entire tier (base + memtable + registry) behind one
+atomic pointer swap rather than clearing the maps in place. That is not a
+stylistic choice: `DashMap::clear` is not atomic across shards, so a concurrent
+`find_ro` could walk a half-cleared chain and stop at an intermediate node,
+returning a non-root as a component id. Under RCU a reader that loaded the
+previous generation keeps resolving against the previous base *and* its intact
+memtable — which by construction gives the same answers — and that generation
+is freed when the last such reader drops it. Queries are never blocked, and
+`queries_see_no_torn_state_while_folding` runs four reader threads through a
+live fold to keep it that way.
+
+**What the fold costs, plainly:** it rewrites the whole base, so ingest stalls
+for time proportional to *total state*, not to what was folded — measured below
+at 2.95 s for a 125 MB base, and the Puffin bytes are buffered in RAM while it
+happens. That is fine for bases of a few GB and untenable at 50 GB, which is
+why a fold slower than 5 s logs a warning naming the two ways out: raise the
+trigger, or land [design 001](docs/design/001-delta-snapshots.md) so a fold
+writes only the delta and becomes O(memtable) in both time and bytes.
+
 ### Compaction streams; it never materializes
 
 Compaction runs under the union lock, which makes any O(state) allocation there
@@ -374,7 +410,9 @@ Measured (3M links / 3000 scopes / 113 MB base, release build):
 | Resident for committed state | 479 MB | **108 MB** (touched pages; OS-reclaimable) + 0.2 MB index |
 | `scope_root` lookups/s (1 thread) | 2.78M (0.36 µs) | 1.30M (0.77 µs) |
 | Compaction, heap above the output | +57 MB (3.2M-pair snapshot) | **+0 MB** (streamed) |
-| Compaction wall time | 1486 ms (collect) | **787 ms** (stream) |
+| Compaction wall time | 1432 ms (collect) | **756 ms** (stream) |
+| Fold: 300k memtable links → 0 | n/a | 2950 ms ingest stall, 125 MB rewritten |
+| Lookups/s after a fold | — | 1.37M (0.73 µs) — unchanged |
 
 Cold start is O(blob count) rather than O(pairs), so the gap widens linearly
 with state — the reason a multi-gigabyte base serves in milliseconds. Warm
@@ -386,10 +424,18 @@ file is only ever a read-through cache of an object-storage snapshot, written to
 a temp path and renamed so a torn download can never be mapped, and the mapping
 is read-only.
 
-What still scales with state: the sparse index (~0.4% of the base) and the
-registry buffer built during compaction (12 bytes per overlay endpoint, which
-must be sorted by root across scopes). Spilling that to an external sort is
-[design 001](docs/design/001-delta-snapshots.md)'s job.
+What still scales with state, named so it is not mistaken for solved:
+
+- **The fold's stall and write amplification** — it rewrites the whole base
+  (above). The single biggest reason to land design 001 next.
+- **The Puffin file itself**, buffered in RAM before it is written and
+  uploaded. Streaming it to disk and doing a multipart upload would remove
+  this; it is only invisible today because a fold already dominates.
+- **The sparse index**, ~0.4% of the base — the deliberate price of bounding
+  cold-page faults.
+- **The registry buffer built during compaction**, 12 bytes per overlay
+  endpoint, because it must be sorted by root *across* scopes and so cannot
+  stream without an external sort.
 
 ## Next phase
 
