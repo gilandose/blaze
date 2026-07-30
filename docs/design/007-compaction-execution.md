@@ -50,6 +50,39 @@ throughout, which was the point: awaiting a merge inside the tick meant nothing
 drained the memtable for its duration, so the fold trigger stopped bounding
 memory for however many minutes a high-level merge took.
 
+### Measured
+
+`examples/detached_merge` drives the real `Flusher` — real object store, real
+catalog, real policy — with a separate thread ingesting continuously, because the
+claim is about concurrency and nothing else would test it. Both arms take the same
+3M links and tick on the same fixed schedule.
+
+| policy | ticks | ingest/s | peak memtable | p50 tick | p99 tick | max tick |
+|---|---|---|---|---|---|---|
+| inline | 100 | 92k | 661,468 | 92 ms | 1200 ms | 3258 ms |
+| detached | 139 | 85k | **111,168** | 89 ms | **296 ms** | **650 ms** |
+
+- **Peak memtable is 5.9x lower**, which is the whole claim. Inline, the memtable
+  is whatever arrives during the longest merge, and nothing bounds it but the
+  merge's duration; detached, the fold trigger bounds it as designed.
+- **Tail latency: p99 4.1x lower, worst tick 5.0x lower.** A 3.3-second tick is
+  3.3 seconds of watermark not advancing and segments not dropping.
+- **p50 is unchanged** (92 vs 89 ms), so detaching costs nothing in the common
+  case where no merge is running.
+- **Ingest was ~8% slower detached** (85k vs 92k links/s), which was not expected.
+  Shorter ticks mean more of them fit in the same window — 139 against 100 — and
+  every one folds, taking the union lock that ingest needs. So the trade is real:
+  much lower memory and tail latency for slightly lower throughput. One run, so
+  treat the 8% as indicative rather than settled.
+
+Two caveats on the numbers. Ingest saturated at ~90k links/s on this box against a
+requested 100k, so this is a *saturated* writer, far above the ~50/s target — which
+is the harder case for stall behaviour and the right one to test. And a first
+version of the harness let the ingest thread run free for a fixed tick count, so
+the arm with slower ticks also got more wall time to ingest and was handed 47%
+more data than its comparator; fixing the link budget and the tick schedule is
+what makes the two columns comparable.
+
 Three things this needed that were not obvious up front:
 
 - **The merged run is located by identity, not by remembered indices.** A merge
