@@ -1,8 +1,12 @@
 # 006 — Tiered compaction, and sizing for a backfill-dominated workload
 
-> **Now the top priority.** It replaces "storage-side compaction" (001) at the
-> front of the queue, because the recalibrated workload changes which cost
-> actually hurts. See "What changed" below.
+> **Now the top priority, and measurement upgraded it from optimization to
+> precondition.** A 145M-link stress run (`examples/ceiling.rs`) shows flat
+> base+delta compaction is **O(N²) in total state**: per-pair cost is constant
+> (3.39, 3.44, 3.33 µs across three compactions) while each cycle merges linearly
+> more, so the costs sum quadratically. Extrapolated to 2B links with the measured
+> constant: **~58 hours of compaction against ~13 hours of ingest**, i.e. 82% of
+> wall clock. Tiering turns that into O(N log N). See "Measured" below.
 
 ## The workload, restated
 
@@ -34,6 +38,34 @@ triggers we have both misbehave here:
 
 Neither is a tuning problem. A single base plus one flat run of deltas has no
 setting that is simultaneously cheap to write and cheap to read.
+
+## Measured
+
+145M links in 56.2 min on a 4-core / 15 GB / 17 GB-disk box, fold every 5M links,
+compact at 8 layers. Stopped by the disk guard, since a compaction needs room for
+the old and new base at once.
+
+| # | pairs merged | time | µs/pair | registry | corrections | output |
+|---|---|---|---|---|---|---|
+| 1 | 40.4M | 136.8 s | 3.39 | 68.0M | 359,223 (0.53%) | 1.46 GB |
+| 2 | 76.5M | 263.4 s | 3.44 | 127.5M | 1,000,104 (0.78%) | 2.75 GB |
+| 3 | 113.2M | 376.8 s | 3.33 | 187.0M | 1,658,017 (0.89%) | 4.06 GB |
+
+- **The quadratic is the headline.** Linear per-pair cost × linearly growing state
+  per cycle = quadratic total. This is the ceiling, and no dial avoids it.
+- **Effective throughput was 43k links/s** end to end including folds and
+  compactions — against 253k/s ingest at one layer, and the 357k/s the DSU
+  sustains with no base attached at all.
+- **Depth, not size, drives the slowdown**: ingest at depth 7 held at 46.8k →
+  44.3k → 47.0k links/s across the three cycles even as state tripled.
+- **Bounded corrections hold**, at under 1% — ~20 MB buffered where
+  collect-and-sort needed 2.2 GB. But the fraction drifts up (0.53 → 0.78 →
+  0.89%) as scopes come to reference more roots each, so it is not a constant.
+- **Heap flat, RSS not**: ~0.9 GB anonymous, but 8.4 GB RSS against a 5.4 GB base,
+  because compaction reads the base end to end and those clean file-backed pages
+  stay resident until evicted. Reclaimable, but it means compaction evicts the
+  query working set while it runs. An `MADV_DONTNEED` over the merged range once
+  the sweep finishes would bound it.
 
 ## Design: size-tiered levels
 
