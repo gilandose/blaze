@@ -95,9 +95,10 @@ impl Flusher {
             .put(&data_path, PutPayload::from(parquet_bytes))
             .await?;
 
-        // 2. Puffin DSU sidecar.
-        let snapshot = self.forest.snapshot();
-        let blobs = codec::snapshot_to_blobs(&snapshot, sequence);
+        // 2. Puffin DSU sidecar. Streamed out of the forest rather than
+        // snapshotted into the heap first: compaction holds the union lock, so
+        // an O(state) allocation here would stall ingest for its duration.
+        let blobs = codec::compact_to_blobs(&self.forest, sequence);
         let puffin_bytes = puffin::write(
             &blobs,
             BTreeMap::from([

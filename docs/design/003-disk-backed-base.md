@@ -1,13 +1,15 @@
 # 003 — Disk-backed routing base (LSM-in-time)
 
 > **Status: implemented** (`--routing-base disk`, `src/storage/base.rs`,
-> `src/core/base.rs`). Shipped: mmap'd base with binary-search lookups, the
-> composed base+memtable read *and* write paths, a `blaze-registry-v1` index
-> so fix-ups against base-resident roots cost one probe, local read-through
-> caching from object storage, and compaction that re-emits composed state.
-> Deferred: bloom filters over overlay membership (the registry blob covers
-> the same need for now) and pruning the memtable at compaction boundaries
-> beyond what a fresh base already does. Measured results are in
+> `src/core/base.rs`). Shipped: mmap'd base with binary-search lookups, a
+> sparse in-RAM index (first key per 4 KiB block) plus `MADV_RANDOM` so a
+> lookup touches 1–2 mapped pages instead of ~26, the composed base+memtable
+> read *and* write paths, a `blaze-registry-v1` index so fix-ups against
+> base-resident roots cost one probe, local read-through caching from object
+> storage, and **streaming** compaction (`SnapshotSink`) that re-emits composed
+> state with no per-node allocation. Deferred: bloom filters over overlay
+> membership (the registry blob covers the same need for now) and spilling the
+> compaction-time registry buffer to an external sort. Measured results are in
 > ARCHITECTURE.md; note this landed *before* 001/002, so the memtable is
 > bounded by flush cadence rather than by delta chains.
 
@@ -28,7 +30,9 @@ over base), now layered across the RAM/disk boundary:
   (read-through from S3), mmap'd. Blobs are sorted `(node, root)` runs;
   lookup is binary search over the mapped range — the exact access path the
   `puffin_lifecycle` example demonstrates, ~10–50 µs on a cold NVMe page,
-  ~1 µs when page-cached.
+  ~1 µs when page-cached. As implemented, the search is narrowed by a sparse
+  in-RAM index (one key per 4 KiB block) so it touches 1–2 pages rather than
+  the ~26 distinct cold pages a full binary search over 2B pairs would.
 - **Memtable (RAM)**: the in-memory forest holds only links applied since
   the base was compacted, plus the dirty overlay of 001.
 

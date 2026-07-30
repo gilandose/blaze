@@ -75,6 +75,70 @@ pub struct ForestSnapshot {
     pub scopes: Vec<(ScopeId, Vec<(NodeId, NodeId)>)>,
 }
 
+/// Receives a compacted forest as an ordered *stream*, so compaction never
+/// has to materialize the state it is writing.
+///
+/// This exists because [`ForestSnapshot`] is O(state): at 2B links it is a
+/// ~32 GB `Vec` built under the union lock, which stalls ingest for as long
+/// as it takes to allocate. A sink that writes bytes as they arrive (see
+/// `storage::codec::compact_to_blobs`) keeps compaction at O(memtable) heap.
+///
+/// **Emission order is part of the contract**: every shared pair in ascending
+/// node order, then each scope in ascending scope order with its overlay
+/// pairs in ascending node order. Sinks can therefore write the fixed-stride
+/// sorted tables the on-disk format wants with no buffering and no sort.
+pub trait SnapshotSink {
+    /// A composed shared-tier pair; only emitted when `root != node`.
+    fn shared_pair(&mut self, node: NodeId, root: NodeId);
+
+    /// A composed overlay pair for the most recently opened scope.
+    fn overlay_pair(&mut self, node: NodeId, root: NodeId);
+
+    /// Opens `scope`. A scope may turn out to contribute no pairs at all, so
+    /// sinks that must not emit empty groups should buffer and discard in
+    /// [`SnapshotSink::scope_end`].
+    fn scope_start(&mut self, _scope: ScopeId) {}
+
+    fn scope_end(&mut self, _scope: ScopeId) {}
+
+    /// One `shared root -> scope` reverse-index entry per endpoint of each
+    /// emitted overlay pair, already resolved to the *live* shared root.
+    /// Grouped by scope, so a sink wanting root order must sort.
+    fn registry_entry(&mut self, _root: NodeId, _scope: ScopeId) {}
+}
+
+/// Collects a stream back into a [`ForestSnapshot`] (the RAM-mode path).
+#[derive(Default)]
+struct SnapshotCollector {
+    global: Vec<(NodeId, NodeId)>,
+    scopes: Vec<(ScopeId, Vec<(NodeId, NodeId)>)>,
+    open: Option<(ScopeId, Vec<(NodeId, NodeId)>)>,
+}
+
+impl SnapshotSink for SnapshotCollector {
+    fn shared_pair(&mut self, node: NodeId, root: NodeId) {
+        self.global.push((node, root));
+    }
+
+    fn overlay_pair(&mut self, node: NodeId, root: NodeId) {
+        if let Some((_, pairs)) = &mut self.open {
+            pairs.push((node, root));
+        }
+    }
+
+    fn scope_start(&mut self, scope: ScopeId) {
+        self.open = Some((scope, Vec::new()));
+    }
+
+    fn scope_end(&mut self, _scope: ScopeId) {
+        if let Some((scope, pairs)) = self.open.take()
+            && !pairs.is_empty()
+        {
+            self.scopes.push((scope, pairs));
+        }
+    }
+}
+
 impl ScopedForest {
     pub fn new() -> Self {
         Self::default()
@@ -249,60 +313,111 @@ impl ScopedForest {
         }
     }
 
-    /// Capture a consistent snapshot. Takes the union lock so no merge or
-    /// fix-up is half-applied in the captured state; queries keep running.
+    /// Stream the composed (base ⊕ memtable) state to `sink` in key order.
     ///
-    /// With a base attached this is the **compaction** read: base pairs are
-    /// re-resolved through the memtable so the result is the complete
-    /// composed state, and the next base subsumes both layers.
-    pub fn snapshot(&self) -> ForestSnapshot {
+    /// This is **compaction**: base pairs are re-resolved through the memtable
+    /// so the emitted state is complete and the next base subsumes both
+    /// layers. Takes the union lock, so no merge or fix-up is half-applied in
+    /// the captured state; queries keep running throughout.
+    ///
+    /// Heap cost is O(memtable), not O(state): the base is walked as an
+    /// ascending stream and merge-joined against the memtable's (small,
+    /// sorted) key set, so nothing per-node is ever collected. Memtable keys
+    /// are composed roots and are therefore disjoint from base keys — the
+    /// equal-key case is handled rather than relied upon.
+    pub fn compact_into(&self, sink: &mut dyn SnapshotSink) {
         let _g = self.union_lock.lock();
 
-        let mut shared_keys = self.global.keys();
+        let mut mem = self.global.keys();
+        mem.sort_unstable();
+        let mut i = 0usize;
         if let Some(base) = &self.base {
-            shared_keys.extend(base.shared_nodes());
-            shared_keys.sort_unstable();
-            shared_keys.dedup();
+            base.for_each_shared_pair(&mut |k, _| {
+                while i < mem.len() && mem[i] < k {
+                    self.emit_shared(sink, mem[i]);
+                    i += 1;
+                }
+                if i < mem.len() && mem[i] == k {
+                    i += 1;
+                }
+                self.emit_shared(sink, k);
+            });
         }
-        let global: Vec<(NodeId, NodeId)> = shared_keys
-            .into_iter()
-            .filter_map(|k| {
-                let r = self.shared_root(k, false);
-                (r != k).then_some((k, r))
-            })
-            .collect();
+        while i < mem.len() {
+            self.emit_shared(sink, mem[i]);
+            i += 1;
+        }
 
         let mut scope_ids: Vec<ScopeId> = self.overlays.iter().map(|e| *e.key()).collect();
         if let Some(base) = &self.base {
             scope_ids.extend(base.scopes());
-            scope_ids.sort_unstable();
-            scope_ids.dedup();
         }
-        let mut scopes = Vec::with_capacity(scope_ids.len());
+        scope_ids.sort_unstable();
+        scope_ids.dedup();
+
         for scope in scope_ids {
-            let mut keys = self
+            sink.scope_start(scope);
+            let mut mem = self
                 .overlays
                 .get(&scope)
                 .map(|o| o.keys())
                 .unwrap_or_default();
+            mem.sort_unstable();
+            let mut i = 0usize;
             if let Some(base) = &self.base {
-                keys.extend(base.overlay_nodes(scope));
-                keys.sort_unstable();
-                keys.dedup();
+                base.for_each_overlay_pair(scope, &mut |k, _| {
+                    while i < mem.len() && mem[i] < k {
+                        self.emit_overlay(sink, scope, mem[i]);
+                        i += 1;
+                    }
+                    if i < mem.len() && mem[i] == k {
+                        i += 1;
+                    }
+                    self.emit_overlay(sink, scope, k);
+                });
             }
-            let pairs: Vec<(NodeId, NodeId)> = keys
-                .into_iter()
-                .filter_map(|k| {
-                    let r = self.overlay_root(scope, k, false);
-                    (r != k).then_some((k, r))
-                })
-                .collect();
-            if !pairs.is_empty() {
-                scopes.push((scope, pairs));
+            while i < mem.len() {
+                self.emit_overlay(sink, scope, mem[i]);
+                i += 1;
             }
+            sink.scope_end(scope);
         }
-        scopes.sort_by_key(|(s, _)| *s);
-        ForestSnapshot { global, scopes }
+    }
+
+    fn emit_shared(&self, sink: &mut dyn SnapshotSink, node: NodeId) {
+        let root = self.shared_root(node, false);
+        if root != node {
+            sink.shared_pair(node, root);
+        }
+    }
+
+    fn emit_overlay(&self, sink: &mut dyn SnapshotSink, scope: ScopeId, node: NodeId) {
+        let root = self.overlay_root(scope, node, false);
+        if root == node {
+            return;
+        }
+        sink.overlay_pair(node, root);
+        // Both endpoints are (possibly historical) shared roots. Record them
+        // under their *live* shared roots so a future merge of one still
+        // notifies this scope after the next cold start.
+        let a = self.shared_root(node, false);
+        sink.registry_entry(a, scope);
+        let b = self.shared_root(root, false);
+        if b != a {
+            sink.registry_entry(b, scope);
+        }
+    }
+
+    /// Capture a consistent snapshot in the heap. Convenience over
+    /// [`ScopedForest::compact_into`] for RAM-mode callers and tests; the
+    /// flush path streams instead of collecting.
+    pub fn snapshot(&self) -> ForestSnapshot {
+        let mut c = SnapshotCollector::default();
+        self.compact_into(&mut c);
+        ForestSnapshot {
+            global: c.global,
+            scopes: c.scopes,
+        }
     }
 
     /// Rebuild forest state from a snapshot (startup recovery path).

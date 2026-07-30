@@ -52,8 +52,61 @@ fn main() {
         rss_mb() - base_rss
     );
 
+    // Compaction, two ways to the same bytes. Both must pay for the output
+    // blobs; only the collecting path also pays for a whole ForestSnapshot
+    // first, under the union lock. Measure that intermediate on its own,
+    // because it is the term that scales with state.
+    let before = rss_mb();
+    let t = Instant::now();
     let snap = forest.snapshot();
-    let blobs = codec::snapshot_to_blobs(&snap, 1);
+    let snapshot_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let intermediate_mb = rss_mb() - before;
+    let pairs = snap.global.len() + snap.scopes.iter().map(|(_, p)| p.len()).sum::<usize>();
+    let collect_blobs = codec::snapshot_to_blobs(&snap, 1);
+    let collect_ms = snapshot_ms + t.elapsed().as_secs_f64() * 1000.0 - snapshot_ms;
+    drop(snap);
+    println!(
+        "compaction, collecting: {:.0} ms, intermediate ForestSnapshot = {} pairs, +{:.0} MB heap",
+        collect_ms, pairs, intermediate_mb
+    );
+
+    // Streaming with a sink that counts and drops: compaction's own footprint,
+    // with the unavoidable output removed. This is the allocation that goes
+    // from ~57 MB here to ~32 GB at 2B links if it is not streamed.
+    struct Counting(usize);
+    impl blaze::core::SnapshotSink for Counting {
+        fn shared_pair(&mut self, _n: u64, _r: u64) {
+            self.0 += 1;
+        }
+        fn overlay_pair(&mut self, _n: u64, _r: u64) {
+            self.0 += 1;
+        }
+    }
+    let before = rss_mb();
+    let t = Instant::now();
+    let mut counting = Counting(0);
+    forest.compact_into(&mut counting);
+    println!(
+        "compaction, streaming:  {:.0} ms, {} pairs emitted, +{:.0} MB heap",
+        t.elapsed().as_secs_f64() * 1000.0,
+        counting.0,
+        rss_mb() - before
+    );
+    assert_eq!(counting.0, pairs);
+
+    let t = Instant::now();
+    let blobs = codec::compact_to_blobs(&forest, 1);
+    println!(
+        "compaction, streaming into blobs: {:.0} ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    assert_eq!(
+        blobs.iter().map(|b| b.data.len()).sum::<usize>(),
+        collect_blobs.iter().map(|b| b.data.len()).sum::<usize>(),
+        "the two compaction paths must produce identical payloads"
+    );
+    drop(collect_blobs);
+
     let bytes = puffin::write(&blobs, BTreeMap::new());
     let path = std::env::temp_dir().join("blaze-probe-base.puffin");
     std::fs::write(&path, &bytes).unwrap();
@@ -64,7 +117,6 @@ fn main() {
     );
     drop(blobs);
     drop(bytes);
-    drop(snap);
 
     // --- query latency, RAM mode (this forest) ---
     let mut q = StdRng::seed_from_u64(11);
@@ -113,11 +165,13 @@ fn main() {
     let bs = mmapped.stats();
     let disk = ScopedForest::with_base(mmapped);
     println!(
-        "disk mode: opened in {:.1} ms ({} shared + {} overlay pairs mapped, {:.0} MB file)",
+        "disk mode: opened in {:.1} ms ({} shared + {} overlay pairs mapped, {:.0} MB file, \
+         {:.1} MB sparse index)",
         open_ms,
         bs.shared_pairs,
         bs.overlay_pairs,
-        bs.mapped_bytes as f64 / 1e6
+        bs.mapped_bytes as f64 / 1e6,
+        bs.index_bytes as f64 / 1e6
     );
 
     let mut q = StdRng::seed_from_u64(11);

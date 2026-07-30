@@ -57,12 +57,19 @@ pub trait RoutingBase: Send + Sync + std::fmt::Debug {
     /// Scopes with any overlay state in the base.
     fn scopes(&self) -> Vec<ScopeId>;
 
-    /// Every `(node, parent)` pair in the shared tier. Used by compaction to
-    /// re-emit a full snapshot; not on any query path.
-    fn shared_nodes(&self) -> Vec<NodeId>;
+    /// Visit every `(node, parent)` pair in the shared tier, in **ascending
+    /// node order**. Used by compaction to re-emit a full snapshot; not on any
+    /// query path.
+    ///
+    /// Streaming, not collecting, is load-bearing: compaction runs under the
+    /// union lock, and at 2B links a `Vec<NodeId>` of keys would be a ~16 GB
+    /// allocation that stalls ingest. Ascending order lets the caller
+    /// merge-join against its (much smaller) memtable key set in one pass and
+    /// emit already-sorted output.
+    fn for_each_shared_pair(&self, f: &mut dyn FnMut(NodeId, NodeId));
 
-    /// Every keyed node in `scope`'s overlay.
-    fn overlay_nodes(&self, scope: ScopeId) -> Vec<NodeId>;
+    /// Same, for `scope`'s overlay: ascending node order, no allocation.
+    fn for_each_overlay_pair(&self, scope: ScopeId, f: &mut dyn FnMut(NodeId, NodeId));
 
     fn stats(&self) -> BaseStats;
 }
@@ -76,6 +83,10 @@ pub struct BaseStats {
     pub scopes: u64,
     /// Bytes mapped (file size), not resident bytes.
     pub mapped_bytes: u64,
+    /// Heap held by in-RAM lookup indexes over the mapping. Small and
+    /// proportional to `mapped_bytes` (~0.4%), but not zero — the one part of
+    /// a disk-backed base that still scales with state.
+    pub index_bytes: u64,
     /// True when the base carried a precomputed registry blob; false means
     /// the registry was rebuilt in memory at load time.
     pub registry_indexed: bool,

@@ -333,25 +333,63 @@ a node that already has a memtable parent can skip the base entirely. It also
 means merge fix-ups must consult the base: a scope whose overlay class lives
 only on disk still has to be notified when a shared root it references is
 absorbed, which the base's `blaze-registry-v1` blob (`root -> scopes`, sorted,
-binary-searchable) answers in one probe. Snapshots taken from a base-backed
-forest re-resolve base pairs through the memtable, so each compaction emits the
-complete composed state and the next base subsumes both layers.
+binary-searchable) answers in one probe.
+
+### Bounding the cold-page cost: the sparse index
+
+A naive binary search over the mapping is a latency trap at scale. At 2B pairs
+it is ~31 probes striding up to ~16 GB, and the first ~26 of them land on
+distinct cold pages — ~150–250 µs of page faults for one answer, nearly all of
+it spent walking levels small enough to keep in RAM for free.
+
+So each table carries a **sparse in-RAM index**: the first key of every 4 KiB
+block of entries. A lookup binary-searches that `Vec` (no faults), narrows to
+one block, and only then touches the mapping — over 4 KiB of *contiguous*
+bytes, so 1–2 mapped pages regardless of how the payload is aligned inside the
+Puffin file. `narrowed_search_reads_at_most_one_block` pins that bound as a
+test, because a probe whose base fits in page cache cannot observe it. The
+index costs one `u64` per block: 0.4% of the table it indexes, so ~62 MB to
+index a 16 GB shared tier, reported as `index_bytes` in `/stats`. The mapping
+is also advised `MADV_RANDOM`, since default readahead prefetches pages a
+binary search will never visit — except during a compaction sweep, which
+re-advises its own byte range `MADV_SEQUENTIAL` for the duration.
+
+### Compaction streams; it never materializes
+
+Compaction runs under the union lock, which makes any O(state) allocation there
+an ingest stall. So `ScopedForest::compact_into` emits the composed state to a
+`SnapshotSink` as an ordered stream — base pairs walked as an ascending
+sequential scan, merge-joined against the memtable's (small, sorted) key set —
+and `codec::compact_to_blobs` writes each fixed-stride blob in place, patching
+in its count header at the end. Nothing per-node is ever collected, and the
+output is already in the sorted order the format wants, so no sort either.
+`ForestSnapshot` still exists for RAM-mode callers and tests; the flush path
+does not build one.
 
 Measured (3M links / 3000 scopes / 113 MB base, release build):
 
 | | all-RAM | mmap base |
 |---|---|---|
-| Cold start (to first correct answer) | 4374 ms (read+parse+hydrate) | **2.8 ms** (mmap + footer index) |
-| Resident for committed state | 479 MB | **51 MB** (touched pages; OS-reclaimable) |
-| `scope_root` lookups/s (1 thread) | 2.83M (0.35 µs) | 1.29M (0.78 µs) |
+| Cold start (to first correct answer) | 3284 ms (read+parse+hydrate) | **3.6 ms** (mmap + footer index + sparse index) |
+| Resident for committed state | 479 MB | **108 MB** (touched pages; OS-reclaimable) + 0.2 MB index |
+| `scope_root` lookups/s (1 thread) | 2.78M (0.36 µs) | 1.30M (0.77 µs) |
+| Compaction, heap above the output | +57 MB (3.2M-pair snapshot) | **+0 MB** (streamed) |
+| Compaction wall time | 1486 ms (collect) | **787 ms** (stream) |
 
 Cold start is O(blob count) rather than O(pairs), so the gap widens linearly
-with state — the reason a multi-gigabyte base serves in milliseconds. The
-lookup cost roughly doubles on page-cached data and rises to ~10–50 µs on a
-cold NVMe page: still well inside the sub-millisecond SLO. Durability is
-unchanged (invariant I4): the local file is only ever a read-through cache of
-an object-storage snapshot, written to a temp path and renamed so a torn
-download can never be mapped, and the mapping is read-only.
+with state — the reason a multi-gigabyte base serves in milliseconds. Warm
+lookups cost roughly 2× a heap lookup and rise to ~10–50 µs on a cold NVMe
+page; the sparse index is what keeps that "a page fault", singular. The
+compaction intermediate that streaming removes is the same 16 bytes/pair that
+would be ~32 GB at 2B links. Durability is unchanged (invariant I4): the local
+file is only ever a read-through cache of an object-storage snapshot, written to
+a temp path and renamed so a torn download can never be mapped, and the mapping
+is read-only.
+
+What still scales with state: the sparse index (~0.4% of the base) and the
+registry buffer built during compaction (12 bytes per overlay endpoint, which
+must be sorted by root across scopes). Spilling that to an external sort is
+[design 001](docs/design/001-delta-snapshots.md)'s job.
 
 ## Next phase
 

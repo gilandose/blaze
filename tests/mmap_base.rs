@@ -289,6 +289,77 @@ async fn base_backed_forest_matches_model_across_cycles() {
     }
 }
 
+/// Compaction reads the base as a stream and merge-joins it against the
+/// memtable. That merge is where a composed forest can silently drop or
+/// duplicate a key, so assert the streamed blobs equal the ones built from a
+/// fully materialized snapshot — over state that spans both tiers.
+#[tokio::test]
+async fn streamed_compaction_matches_the_materialized_snapshot() {
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    let wh = Warehouse::new();
+    let mut rng = StdRng::seed_from_u64(0x571EA1);
+    let mut events = Vec::new();
+    let ram = Arc::new(ScopedForest::new());
+    for _ in 0..600 {
+        let e = if rng.random_range(0..100) < 30 {
+            global_edge(rng.random_range(0..300), rng.random_range(0..300))
+        } else {
+            scoped_edge(
+                rng.random_range(0..300),
+                rng.random_range(0..300),
+                &[rng.random_range(1..=25u32)],
+            )
+        };
+        ram.apply(&e);
+        events.push(e);
+    }
+    wh.commit(ram, 1, &events).await;
+
+    // Now half in the base, half in the memtable: keys interleave, and some
+    // memtable merges absorb roots the base still stores pairs for.
+    let (forest, _) = wh.open_base_backed().await;
+    for _ in 0..400 {
+        let e = if rng.random_range(0..100) < 40 {
+            global_edge(rng.random_range(0..300), rng.random_range(0..300))
+        } else {
+            scoped_edge(
+                rng.random_range(0..300),
+                rng.random_range(0..300),
+                &[rng.random_range(1..=25u32)],
+            )
+        };
+        forest.apply(&e);
+    }
+
+    let streamed = blaze::storage::codec::compact_to_blobs(&forest, 2);
+    let collected = blaze::storage::codec::snapshot_to_blobs(&forest.snapshot(), 2);
+    let fields = |bs: &[blaze::storage::puffin::Blob]| {
+        bs.iter()
+            .map(|b| (b.blob_type.clone(), b.properties.clone(), b.data.to_vec()))
+            .collect::<Vec<_>>()
+    };
+    assert!(streamed.len() > 10, "expected many scope blobs");
+    assert_eq!(fields(&streamed), fields(&collected));
+
+    // And each shared key appears exactly once despite living in both tiers.
+    let snap = forest.snapshot();
+    let mut keys: Vec<u64> = snap.global.iter().map(|(k, _)| *k).collect();
+    let unique = {
+        let mut k = keys.clone();
+        k.sort_unstable();
+        k.dedup();
+        k
+    };
+    keys.sort_unstable();
+    assert_eq!(keys, unique, "compaction emitted a duplicate shared key");
+    assert!(
+        keys.windows(2).all(|w| w[0] < w[1]),
+        "output must be sorted"
+    );
+}
+
 /// A base-backed forest holds only post-snapshot merges in the heap: that is
 /// the whole point of the disk tier.
 #[tokio::test]

@@ -8,7 +8,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::BTreeMap;
 
-use crate::core::{ForestSnapshot, NodeId, ScopeId};
+use crate::core::{ForestSnapshot, NodeId, ScopeId, ScopedForest, SnapshotSink};
 use crate::storage::puffin::Blob;
 
 pub const GLOBAL_BLOB_TYPE: &str = "blaze-global-dsu-v1";
@@ -134,6 +134,125 @@ pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64) -> Vec<Blob> {
     blobs
 }
 
+/// Encodes a compacted forest straight into Puffin blob payloads as it is
+/// streamed, so the flush path never materializes the state it is writing.
+///
+/// [`ScopedForest::compact_into`] emits keys in ascending order — exactly the
+/// layout the blobs need — so each fixed-stride table is written once, in
+/// place, with no intermediate `Vec` of pairs and no sort. The pair-count
+/// header is reserved up front and patched in when the table closes.
+///
+/// The one term still proportional to state is the registry, which must be
+/// sorted by root *across* scopes and so is buffered. It is 12 bytes per
+/// overlay endpoint; spilling it to an external sort is design 001's job.
+struct BlobWriter {
+    sequence: i64,
+    shared: BytesMut,
+    shared_pairs: u64,
+    /// The scope currently open, its payload, and its pair count.
+    scope: Option<(ScopeId, BytesMut, u64)>,
+    registry: Vec<(NodeId, ScopeId)>,
+    scope_blobs: Vec<Blob>,
+}
+
+/// A table payload with its 8-byte count header reserved but not yet known.
+fn open_table() -> BytesMut {
+    let mut buf = BytesMut::new();
+    buf.put_u64_le(0);
+    buf
+}
+
+fn close_table(mut buf: BytesMut, count: u64) -> Bytes {
+    buf[..8].copy_from_slice(&count.to_le_bytes());
+    buf.freeze()
+}
+
+impl BlobWriter {
+    fn new(sequence: u64) -> Self {
+        Self {
+            sequence: sequence as i64,
+            shared: open_table(),
+            shared_pairs: 0,
+            scope: None,
+            registry: Vec::new(),
+            scope_blobs: Vec::new(),
+        }
+    }
+
+    fn blob(&self, blob_type: &str, data: Bytes, properties: BTreeMap<String, String>) -> Blob {
+        Blob {
+            blob_type: blob_type.into(),
+            data,
+            properties,
+            snapshot_id: self.sequence,
+            sequence_number: self.sequence,
+        }
+    }
+
+    /// Blob order matches [`snapshot_to_blobs`]: shared tier, scopes
+    /// ascending, then the registry index.
+    fn finish(mut self) -> Vec<Blob> {
+        let mut blobs = Vec::with_capacity(2 + self.scope_blobs.len());
+        let shared = close_table(std::mem::take(&mut self.shared), self.shared_pairs);
+        blobs.push(self.blob(GLOBAL_BLOB_TYPE, shared, BTreeMap::new()));
+        blobs.append(&mut self.scope_blobs);
+        self.registry.sort_unstable();
+        self.registry.dedup();
+        if !self.registry.is_empty() {
+            let data = encode_registry(&self.registry);
+            blobs.push(self.blob(REGISTRY_BLOB_TYPE, data, BTreeMap::new()));
+        }
+        blobs
+    }
+}
+
+impl SnapshotSink for BlobWriter {
+    fn shared_pair(&mut self, node: NodeId, root: NodeId) {
+        self.shared.put_u64_le(node);
+        self.shared.put_u64_le(root);
+        self.shared_pairs += 1;
+    }
+
+    fn overlay_pair(&mut self, node: NodeId, root: NodeId) {
+        if let Some((_, buf, count)) = &mut self.scope {
+            buf.put_u64_le(node);
+            buf.put_u64_le(root);
+            *count += 1;
+        }
+    }
+
+    fn scope_start(&mut self, scope: ScopeId) {
+        self.scope = Some((scope, open_table(), 0));
+    }
+
+    fn scope_end(&mut self, _scope: ScopeId) {
+        let Some((scope, buf, count)) = self.scope.take() else {
+            return;
+        };
+        // A scope whose overlay resolved to nothing gets no blob at all.
+        if count == 0 {
+            return;
+        }
+        let data = close_table(buf, count);
+        let props = BTreeMap::from([(SCOPE_ID_PROP.into(), scope.to_string())]);
+        let blob = self.blob(SCOPE_BLOB_TYPE, data, props);
+        self.scope_blobs.push(blob);
+    }
+
+    fn registry_entry(&mut self, root: NodeId, scope: ScopeId) {
+        self.registry.push((root, scope));
+    }
+}
+
+/// Compact `forest` directly into Puffin blobs. Byte-identical to
+/// `snapshot_to_blobs(&forest.snapshot(), sequence)`, but without the
+/// O(state) intermediate — this is the flush path.
+pub fn compact_to_blobs(forest: &ScopedForest, sequence: u64) -> Vec<Blob> {
+    let mut writer = BlobWriter::new(sequence);
+    forest.compact_into(&mut writer);
+    writer.finish()
+}
+
 /// Decode Puffin blobs back into a forest snapshot. Unknown blob types are
 /// ignored (forward compatibility).
 pub fn blobs_to_snapshot(blobs: &[Blob]) -> anyhow::Result<ForestSnapshot> {
@@ -184,6 +303,43 @@ mod tests {
         assert_eq!(back.scopes[0].0, 3);
         assert_eq!(back.scopes[1].0, 2999);
         assert_eq!(back.scopes[1].1, vec![(4, 2), (8, 2)]);
+    }
+
+    /// The streaming flush path and the collecting snapshot path must be the
+    /// same function. Anything else means a worker's committed base depends on
+    /// which code path wrote it.
+    #[test]
+    fn streaming_and_collecting_paths_agree_byte_for_byte() {
+        use crate::core::{EdgeEvent, Visibility};
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0xC0DEC);
+        let forest = ScopedForest::new();
+        for _ in 0..2_000 {
+            let visibility = if rng.random_range(0..100u8) < 25 {
+                Visibility::Global
+            } else {
+                Visibility::Scoped(smallvec::smallvec![rng.random_range(1..=40u32)])
+            };
+            forest.apply(&EdgeEvent {
+                src: rng.random_range(0..400u64),
+                dst: rng.random_range(0..400u64),
+                visibility,
+                event_time_ms: 0,
+                props: None,
+            });
+        }
+
+        let streamed = compact_to_blobs(&forest, 9);
+        let collected = snapshot_to_blobs(&forest.snapshot(), 9);
+        let fields = |bs: &[Blob]| -> Vec<(String, BTreeMap<String, String>, Vec<u8>)> {
+            bs.iter()
+                .map(|b| (b.blob_type.clone(), b.properties.clone(), b.data.to_vec()))
+                .collect()
+        };
+        assert!(streamed.len() > 20, "test should exercise many scope blobs");
+        assert_eq!(fields(&streamed), fields(&collected));
     }
 
     #[test]
