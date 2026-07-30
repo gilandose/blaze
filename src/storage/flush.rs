@@ -22,7 +22,7 @@ use crate::ha::LeaderElector;
 use crate::ingest::EdgeBuffer;
 use crate::storage::base::PuffinBase;
 use crate::storage::catalog::{
-    CommitOutcome, DataFileMeta, RunMeta, SnapshotCatalog, SnapshotMeta,
+    CommitOutcome, DataFileMeta, RunMeta, RunSet, SnapshotCatalog, SnapshotMeta,
 };
 use crate::storage::compact::compact_layers;
 use crate::storage::layered::LayeredBase;
@@ -102,15 +102,19 @@ impl LocalRun {
     }
 
     /// A run this worker holds locally that the catalog already knows about.
-    fn committed(meta: &RunMeta, path: PathBuf) -> Self {
+    ///
+    /// Sizes come from the mapped file rather than from `meta`, so they are right
+    /// even for a pre-`runs` snapshot, which recorded none.
+    fn committed(meta: &RunMeta, path: PathBuf, mapped: &PuffinBase) -> Self {
+        let stats = mapped.stats();
         Self {
             path,
             remote: Some(meta.path.clone()),
             level: meta.level,
             min_sequence: meta.min_sequence,
             max_sequence: meta.max_sequence,
-            pairs: meta.pairs,
-            bytes: meta.bytes,
+            pairs: stats.shared_pairs + stats.overlay_pairs,
+            bytes: stats.mapped_bytes,
         }
     }
 
@@ -544,9 +548,10 @@ impl Flusher {
         let merged_layers = stack.layers();
         let flat = Arc::new(LayeredBase::new(Arc::new(PuffinBase::open(&path)?)));
         self.forest.swap_base(flat.clone());
+        let run = LocalRun::committed(&merged, path.clone(), flat.layer(0));
         *self.layers.lock() = Some(LocalLayers {
             base: flat,
-            runs: vec![LocalRun::committed(&merged, path.clone())],
+            runs: vec![run],
         });
         // Unlinking a mapped file is safe: the mapping keeps the inode alive
         // until the last query using it drops, and the space is reclaimed then.
@@ -765,23 +770,16 @@ pub async fn open_base_from_catalog(
     };
     std::fs::create_dir_all(data_dir)?;
 
-    // Committed routing state is the base plus every delta above it, so a cold
-    // start maps the whole chain. `SnapshotMeta::chain` is inclusive and dense,
-    // and `catalog.get` fails loudly on a hole rather than skipping it (I5) —
-    // a skipped delta would serve stale topology as if it were current.
-    let chain = latest.chain();
-    let mut runs = Vec::new();
-    let mut layers = Vec::new();
-    for sequence in chain.clone() {
-        let meta = if sequence == latest.sequence {
-            latest.clone()
-        } else {
-            catalog.get(sequence).await?
-        };
-        let local = data_dir.join(format!("routing-layer-{sequence:012}.puffin"));
+    // Committed routing state is every run in the snapshot's run set, so a cold
+    // start maps all of them, oldest span first.
+    let runs = committed_runs(catalog, &latest).await?;
+    let mut local_runs = Vec::with_capacity(runs.len());
+    let mut layers = Vec::with_capacity(runs.len());
+    for run in &runs {
+        let local = data_dir.join(run_cache_name(run));
         if !local.exists() {
             let bytes = store
-                .get(&Path::from(meta.puffin_path.clone()))
+                .get(&Path::from(run.path.clone()))
                 .await?
                 .bytes()
                 .await?;
@@ -791,30 +789,26 @@ pub async fn open_base_from_catalog(
             std::fs::write(&tmp, &bytes)?;
             std::fs::rename(&tmp, &local)?;
             info!(
-                sequence,
+                min_sequence = run.min_sequence,
+                max_sequence = run.max_sequence,
                 bytes = bytes.len(),
                 path = %local.display(),
-                "cached routing layer from object storage"
+                "cached routing run from object storage"
             );
         }
         let mapped = Arc::new(PuffinBase::open(&local)?);
-        // The chain describes one commit per link, so each is its own span. The
-        // run set the snapshot carries knows better — a merged run spans
-        // everything it subsumed — but walking the chain cannot recover that, so
-        // synthesise the conservative shape and let the next merge relabel it.
-        let mut run = LocalRun::written(local, &mapped, 0, sequence..=sequence);
-        // Every layer here came from the catalog, so a delta may be layered on
-        // top immediately.
-        run.remote = Some(meta.puffin_path.clone());
+        // Every run here came from the catalog, so a delta may be layered on top
+        // immediately.
+        local_runs.push(LocalRun::committed(run, local, &mapped));
         layers.push(mapped);
-        runs.push(run);
     }
 
     let base = Arc::new(LayeredBase::from_layers(layers)?);
     let stats = base.stats();
     info!(
         sequence = latest.sequence,
-        base_sequence = *chain.start(),
+        base_sequence = local_runs.first().map(|r| r.max_sequence).unwrap_or(0),
+        runs = local_runs.len(),
         delta_layers = base.delta_count(),
         watermark = latest.watermark,
         shared_pairs = stats.shared_pairs,
@@ -824,9 +818,68 @@ pub async fn open_base_from_catalog(
     );
     let local = LocalLayers {
         base: base.clone(),
-        runs,
+        runs: local_runs,
     };
     Ok(Some((base, latest.watermark, local)))
+}
+
+/// The runs making up committed routing state as of `latest`, oldest span first.
+///
+/// A snapshot carrying an explicit run set names every run's object path, so this
+/// is a single catalog read. The pre-`runs` format recorded only the *newest*
+/// commit's Puffin path, so each link there needs its own snapshot fetched, and
+/// `catalog.get` fails loudly on a hole rather than skipping it (I5) — a skipped
+/// delta would serve stale topology as if it were current.
+///
+/// Worth noting what changed for the better: on the run-set path an intermediate
+/// snapshot JSON is no longer load-bearing at all, so losing one costs nothing.
+/// A missing *layer object* is still fatal, which is where the guarantee actually
+/// belongs.
+async fn committed_runs(
+    catalog: &SnapshotCatalog,
+    latest: &SnapshotMeta,
+) -> anyhow::Result<Vec<RunMeta>> {
+    match latest.run_set() {
+        RunSet::Runs(runs) => Ok(runs),
+        RunSet::SequencesOnly(chain) => {
+            let mut out = Vec::new();
+            for sequence in chain {
+                let meta = if sequence == latest.sequence {
+                    latest.clone()
+                } else {
+                    catalog.get(sequence).await?
+                };
+                out.push(RunMeta {
+                    path: meta.puffin_path,
+                    // That format recorded neither levels nor spans. One commit was
+                    // one layer, so each run's span is its own sequence; the levels
+                    // are all 0 and the first merge relabels them.
+                    level: 0,
+                    min_sequence: sequence,
+                    max_sequence: sequence,
+                    pairs: 0,
+                    bytes: 0,
+                });
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Local cache filename for a run.
+///
+/// Single-sequence runs keep the historic name, so upgrading a worker does not
+/// invalidate its warm cache. Runs spanning several sequences only exist in the
+/// new format, so they are free to be named by their span.
+fn run_cache_name(run: &RunMeta) -> String {
+    if run.min_sequence == run.max_sequence {
+        format!("routing-layer-{:012}.puffin", run.min_sequence)
+    } else {
+        format!(
+            "routing-layer-{:012}-{:012}.puffin",
+            run.min_sequence, run.max_sequence
+        )
+    }
 }
 
 /// Load the latest committed snapshot and hydrate in-memory state from its
@@ -839,19 +892,14 @@ pub async fn hydrate_from_catalog(
     let Some(latest) = catalog.latest().await? else {
         return Ok(0);
     };
-    // Base first, then each delta in sequence order. Pairs are fully resolved
-    // at their commit time and roots only ever decrease, so applying a later
-    // pair for the same node simply overwrites with the newer, lower root —
-    // last-writer-wins by sequence is exactly right here.
-    let chain = latest.chain();
-    for sequence in chain.clone() {
-        let meta = if sequence == latest.sequence {
-            latest.clone()
-        } else {
-            catalog.get(sequence).await?
-        };
+    // Oldest span first. Pairs are fully resolved at their commit time and roots
+    // only ever decrease, so applying a later pair for the same node simply
+    // overwrites with the newer, lower root — last-writer-wins by span order is
+    // exactly right here.
+    let runs = committed_runs(catalog, &latest).await?;
+    for run in &runs {
         let bytes = store
-            .get(&Path::from(meta.puffin_path.clone()))
+            .get(&Path::from(run.path.clone()))
             .await?
             .bytes()
             .await?;
@@ -860,10 +908,10 @@ pub async fn hydrate_from_catalog(
     }
     info!(
         sequence = latest.sequence,
-        base_sequence = *chain.start(),
-        layers = chain.clone().count(),
+        base_sequence = runs.first().map(|r| r.max_sequence).unwrap_or(0),
+        runs = runs.len(),
         watermark = latest.watermark,
-        "hydrated DSU state from puffin base + delta chain"
+        "hydrated DSU state from the committed run set"
     );
     Ok(latest.watermark)
 }

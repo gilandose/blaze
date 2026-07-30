@@ -212,6 +212,34 @@ impl Warehouse {
             .join(format!("snap-{sequence:012}.json"));
         ObjectStoreExt::delete(&*self.store, &path).await.unwrap();
     }
+
+    /// Rewrite every committed snapshot the way an earlier build wrote them —
+    /// `runs` absent entirely, so `#[serde(default)]` has to carry it — leaving
+    /// only `base_sequence` + `delta_chain_len` to describe the state.
+    async fn downgrade_to_base_plus_chain(&self, through: u64) {
+        use object_store::{ObjectStoreExt, PutPayload};
+        for sequence in 1..=through {
+            let path = self
+                .prefix
+                .clone()
+                .join("metadata")
+                .join(format!("snap-{sequence:012}.json"));
+            let bytes = self.store.get(&path).await.unwrap().bytes().await.unwrap();
+            let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            json.as_object_mut().unwrap().remove("runs");
+            let payload = PutPayload::from(serde_json::to_vec(&json).unwrap());
+            ObjectStoreExt::put(&*self.store, &path, payload)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn delete_puffin(&self, path: &str) {
+        use object_store::ObjectStoreExt;
+        ObjectStoreExt::delete(&*self.store, &StorePath::from(path))
+            .await
+            .unwrap();
+    }
 }
 
 /// The case that breaks every shortcut: a scope's overlay state lives *only*
@@ -997,10 +1025,14 @@ async fn a_worker_with_local_only_layers_commits_a_base_not_a_delta() {
     assert!(cold.connected(GLOBAL_SCOPE, 2_000, 2_005));
 }
 
-/// A hole in the chain must fail loudly (I5). Skipping a delta would serve
-/// stale topology as though it were current, which is worse than not starting.
+/// A catalog written before snapshots carried run sets must cold-start with no
+/// migration step, mapping the same layers and answering identically.
+///
+/// This is the upgrade path — a running deployment's history is all in the old
+/// format — and it is the only thing exercising the synthesised branch, since
+/// every commit this build makes populates `runs`.
 #[tokio::test]
-async fn a_missing_chain_link_is_a_hard_error() {
+async fn a_pre_run_set_catalog_still_cold_starts() {
     let wh = Warehouse::new();
     let forest = Arc::new(ScopedForest::new());
     let mut offset = 1u64;
@@ -1015,17 +1047,91 @@ async fn a_missing_chain_link_is_a_hard_error() {
             .await;
         offset += events.len() as u64;
     }
-    assert_eq!(wh.latest_meta().await.delta_chain_len, 2);
+    let expected: Vec<u64> = (0..3u64)
+        .map(|tick| forest.scope_root(GLOBAL_SCOPE, tick * 50 + 10))
+        .collect();
 
-    // Delete the middle link's metadata and read from a cache-cold worker.
+    wh.downgrade_to_base_plus_chain(3).await;
+    assert!(
+        matches!(
+            wh.latest_meta().await.run_set(),
+            RunSet::SequencesOnly(chain) if chain == (1..=3)
+        ),
+        "the downgraded catalog must read as a base plus a chain"
+    );
+
+    let cold = tempfile::tempdir().unwrap();
+    let (base, watermark, local) = open_base_from_catalog(&wh.store, &wh.catalog, cold.path())
+        .await
+        .unwrap()
+        .expect("a committed snapshot");
+    assert_eq!(base.layers(), 3, "the whole chain must be mapped");
+    assert_eq!(watermark, 30);
+    // Synthesised runs are single-sequence, so a delta may still be layered on
+    // top — an old catalog must not force the next tick into a full merge.
+    assert!(local.fully_committed());
+
+    let cold = Arc::new(ScopedForest::with_base(base));
+    for (tick, want) in expected.iter().enumerate() {
+        assert_eq!(
+            cold.scope_root(GLOBAL_SCOPE, tick as u64 * 50 + 10),
+            *want,
+            "tick {tick} diverged after reading an old-format catalog"
+        );
+    }
+}
+
+/// A missing run must fail loudly (I5). Skipping one would serve stale topology
+/// as though it were current, which is worse than not starting.
+///
+/// Where that guarantee lives moved when snapshots started carrying run sets, and
+/// both halves are pinned here. A cold start now learns every run's path from the
+/// newest snapshot alone, so an intermediate snapshot JSON is no longer
+/// load-bearing and losing one costs nothing — a strict improvement over walking
+/// the chain, which needed every link's JSON to find the next path. The *layer
+/// objects* are what state actually lives in, and losing one of those is still
+/// fatal.
+#[tokio::test]
+async fn a_missing_run_is_a_hard_error() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+    for tick in 0..3u64 {
+        let events: Vec<EdgeEvent> = (0..10)
+            .map(|i| global_edge(tick * 50 + i, tick * 50 + i + 1))
+            .collect();
+        for e in &events {
+            forest.apply(e);
+        }
+        wh.flush_layered(forest.clone(), offset, &events, u64::MAX, true, 60)
+            .await;
+        offset += events.len() as u64;
+    }
+    let latest = wh.latest_meta().await;
+    assert_eq!(latest.delta_chain_len, 2);
+    let RunSet::Runs(runs) = latest.run_set() else {
+        panic!("the run set is what this test is about");
+    };
+    assert_eq!(runs.len(), 3);
+
+    // The middle snapshot's metadata is no longer needed to find its run.
     wh.delete_snapshot_meta(2).await;
     let cold = tempfile::tempdir().unwrap();
-    let err = open_base_from_catalog(&wh.store, &wh.catalog, cold.path())
+    let (base, _, _) = open_base_from_catalog(&wh.store, &wh.catalog, cold.path())
         .await
-        .expect_err("a hole in the chain must not be silently skipped");
+        .expect("a lost intermediate snapshot JSON must not break a cold start")
+        .expect("a committed snapshot");
+    assert_eq!(base.layers(), 3, "every run must still be mapped");
+
+    // The run's *object*, though, is where the state is.
+    wh.delete_puffin(&runs[1].path).await;
+    let colder = tempfile::tempdir().unwrap();
+    let err = open_base_from_catalog(&wh.store, &wh.catalog, colder.path())
+        .await
+        .expect_err("a missing run must not be silently skipped");
     assert!(
-        err.to_string().contains("missing snapshot 2"),
-        "error should name the missing link, got: {err}"
+        err.to_string().contains("dsu-000000000002"),
+        "error should name the missing run, got: {err}"
     );
 }
 
