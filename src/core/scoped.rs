@@ -38,26 +38,63 @@
 //! finds — the sub-millisecond API path — never take it and use the
 //! read-only `find_ro` walk so query load cannot contend with the writer.
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::base::{BaseStats, RoutingBase};
 use super::dsu::Dsu;
 use super::types::{EdgeEvent, GLOBAL_SCOPE, NodeId, ScopeId, Visibility};
 
 #[derive(Debug, Default)]
 pub struct ScopedForest {
-    global: Dsu,
-    overlays: DashMap<ScopeId, Dsu>,
-    /// global root -> scopes with overlay state keyed by that root.
-    registry: DashMap<NodeId, HashSet<ScopeId>>,
-    /// Serializes all mutations (global unions, overlay unions, fix-ups).
+    /// The whole resolvable state, replaced wholesale by a fold and never
+    /// mutated in place across it — see [`Tier`] and
+    /// [`ScopedForest::compact_and_fold`].
+    tier: ArcSwap<Tier>,
+    /// Serializes all mutations (global unions, overlay unions, fix-ups) and
+    /// the fold.
     union_lock: Mutex<()>,
     events_applied: AtomicU64,
     scope_links: AtomicU64,
     fixups: AtomicU64,
+    folds: AtomicU64,
+}
+
+/// One consistent generation of forest state: an optional committed base plus
+/// the memtable layered over it.
+///
+/// These four things have to move together. A fold publishes a base that
+/// subsumes the memtable and must drop the memtable in the same step — and
+/// "clear the maps in place" is not that step: `DashMap::clear` is not atomic
+/// across shards, so a concurrent query could walk a half-cleared chain and
+/// stop at an intermediate node, returning a non-root as a component id.
+///
+/// So a fold builds a new `Tier` and swaps the pointer. Readers load it once
+/// per query and resolve entirely within one generation; a reader holding the
+/// old generation keeps getting correct answers from the old base and memtable
+/// until it finishes, and that generation is freed when the last such reader
+/// drops it. Classic RCU, and the reason no query ever has to be blocked.
+#[derive(Debug, Default)]
+struct Tier {
+    /// Committed state living outside the heap (mmap'd base). When present the
+    /// maps below are the *memtable*: everything applied since it was
+    /// compacted. See [`super::base`] for the composition rules.
+    base: Option<Arc<dyn RoutingBase>>,
+    global: Dsu,
+    overlays: DashMap<ScopeId, Dsu>,
+    /// global root -> scopes with overlay state keyed by that root.
+    registry: DashMap<NodeId, HashSet<ScopeId>>,
+}
+
+impl Tier {
+    fn base(&self) -> Base<'_> {
+        self.base.as_deref()
+    }
 }
 
 /// A consistent point-in-time capture of the whole forest, suitable for
@@ -68,9 +105,100 @@ pub struct ForestSnapshot {
     pub scopes: Vec<(ScopeId, Vec<(NodeId, NodeId)>)>,
 }
 
+/// Receives a compacted forest as an ordered *stream*, so compaction never
+/// has to materialize the state it is writing.
+///
+/// This exists because [`ForestSnapshot`] is O(state): at 2B links it is a
+/// ~32 GB `Vec` built under the union lock, which stalls ingest for as long
+/// as it takes to allocate. A sink that writes bytes as they arrive (see
+/// `storage::codec::compact_to_blobs`) keeps compaction at O(memtable) heap.
+///
+/// **Emission order is part of the contract**: every shared pair in ascending
+/// node order, then each scope in ascending scope order with its overlay
+/// pairs in ascending node order. Sinks can therefore write the fixed-stride
+/// sorted tables the on-disk format wants with no buffering and no sort.
+pub trait SnapshotSink {
+    /// A composed shared-tier pair; only emitted when `root != node`.
+    fn shared_pair(&mut self, node: NodeId, root: NodeId);
+
+    /// A composed overlay pair for the most recently opened scope.
+    fn overlay_pair(&mut self, node: NodeId, root: NodeId);
+
+    /// Opens `scope`. A scope may turn out to contribute no pairs at all, so
+    /// sinks that must not emit empty groups should buffer and discard in
+    /// [`SnapshotSink::scope_end`].
+    fn scope_start(&mut self, _scope: ScopeId) {}
+
+    fn scope_end(&mut self, _scope: ScopeId) {}
+
+    /// One `shared root -> scope` reverse-index entry per endpoint of each
+    /// emitted overlay pair, already resolved to the *live* shared root.
+    /// Grouped by scope, so a sink wanting root order must sort.
+    fn registry_entry(&mut self, _root: NodeId, _scope: ScopeId) {}
+}
+
+/// The base a resolution is running against.
+type Base<'a> = Option<&'a dyn RoutingBase>;
+
+/// Collects a stream back into a [`ForestSnapshot`] (the RAM-mode path).
+#[derive(Default)]
+struct SnapshotCollector {
+    global: Vec<(NodeId, NodeId)>,
+    scopes: Vec<(ScopeId, Vec<(NodeId, NodeId)>)>,
+    open: Option<(ScopeId, Vec<(NodeId, NodeId)>)>,
+}
+
+impl SnapshotSink for SnapshotCollector {
+    fn shared_pair(&mut self, node: NodeId, root: NodeId) {
+        self.global.push((node, root));
+    }
+
+    fn overlay_pair(&mut self, node: NodeId, root: NodeId) {
+        if let Some((_, pairs)) = &mut self.open {
+            pairs.push((node, root));
+        }
+    }
+
+    fn scope_start(&mut self, scope: ScopeId) {
+        self.open = Some((scope, Vec::new()));
+    }
+
+    fn scope_end(&mut self, _scope: ScopeId) {
+        if let Some((scope, pairs)) = self.open.take()
+            && !pairs.is_empty()
+        {
+            self.scopes.push((scope, pairs));
+        }
+    }
+}
+
 impl ScopedForest {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a forest whose committed state is served from `base` (mmap'd
+    /// routing snapshot); the in-heap maps become the memtable of everything
+    /// applied after it.
+    pub fn with_base(base: Arc<dyn RoutingBase>) -> Self {
+        let forest = Self::default();
+        forest.tier.store(Arc::new(Tier {
+            base: Some(base),
+            ..Tier::default()
+        }));
+        forest
+    }
+
+    /// Stats for the attached base, if any.
+    pub fn base_stats(&self) -> Option<BaseStats> {
+        self.tier.load().base.as_ref().map(|b| b.stats())
+    }
+
+    /// Links held in the heap right now — what a fold would reclaim.
+    pub fn memtable_links(&self) -> u64 {
+        let t = self.tier.load();
+        let overlays: usize = t.overlays.iter().map(|e| e.value().len_links()).sum();
+        (t.global.len_links() + overlays) as u64
     }
 
     /// Apply one edge event to in-memory topology.
@@ -82,36 +210,109 @@ impl ScopedForest {
         self.events_applied.fetch_add(1, Ordering::Relaxed);
     }
 
+    // --- composed resolution (base -> memtable) -------------------------
+    //
+    // Memtable keys are always composed roots (see `super::base`), so a node
+    // that already has a memtable parent cannot also be stored in the base:
+    // one memtable walk settles it, and only a memtable-unknown node needs a
+    // base probe.
+
+    /// Shared-tier root of `node`, composing base and memtable.
+    fn shared_root(t: &Tier, node: NodeId, compress: bool) -> NodeId {
+        let m = if compress {
+            t.global.find(node)
+        } else {
+            t.global.find_ro(node)
+        };
+        if m != node {
+            return m;
+        }
+        match t.base().and_then(|b| b.shared_parent(node)) {
+            Some(b) if b != node => {
+                if compress {
+                    t.global.find(b)
+                } else {
+                    t.global.find_ro(b)
+                }
+            }
+            _ => node,
+        }
+    }
+
+    /// Overlay root of `shared_root` within `scope`, composing base and
+    /// memtable. `shared_root` must already be shared-composed.
+    fn overlay_root(t: &Tier, scope: ScopeId, shared_root: NodeId, compress: bool) -> NodeId {
+        let mem = t.overlays.get(&scope);
+        if let Some(overlay) = &mem {
+            let m = if compress {
+                overlay.find(shared_root)
+            } else {
+                overlay.find_ro(shared_root)
+            };
+            if m != shared_root {
+                return m;
+            }
+        }
+        let Some(b) = t.base().and_then(|b| b.overlay_parent(scope, shared_root)) else {
+            return shared_root;
+        };
+        if b == shared_root {
+            return shared_root;
+        }
+        match &mem {
+            Some(overlay) if compress => overlay.find(b),
+            Some(overlay) => overlay.find_ro(b),
+            None => b,
+        }
+    }
+
     fn apply_global(&self, u: NodeId, v: NodeId) {
         let _g = self.union_lock.lock();
-        if let Some(merge) = self.global.union(u, v) {
-            // Root `merge.child` no longer exists globally; tell every scope
-            // that keyed overlay state on it.
-            if let Some((_, scopes)) = self.registry.remove(&merge.child) {
-                for scope in &scopes {
-                    if let Some(overlay) = self.overlays.get(scope) {
-                        overlay.union(merge.child, merge.parent);
-                        self.fixups.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                self.registry
-                    .entry(merge.parent)
-                    .or_default()
-                    .extend(scopes);
+        let t = self.tier.load();
+        // Resolve through the base first so the memtable only ever links
+        // composed roots (the invariant in `super::base`).
+        let ru = Self::shared_root(&t, u, true);
+        let rv = Self::shared_root(&t, v, true);
+        let Some(merge) = t.global.union(ru, rv) else {
+            return;
+        };
+        // Root `merge.child` no longer exists in the shared tier; tell every
+        // scope that keyed overlay state on it — from the memtable registry
+        // and from the base's registry index.
+        let mut scopes: BTreeSet<ScopeId> = t
+            .registry
+            .remove(&merge.child)
+            .map(|(_, s)| s.into_iter().collect())
+            .unwrap_or_default();
+        if let Some(base) = t.base() {
+            scopes.extend(base.scopes_for_root(merge.child));
+        }
+        for &scope in &scopes {
+            // Compose the overlay operands too: either endpoint's overlay
+            // class may live in the base.
+            let a = Self::overlay_root(&t, scope, merge.child, true);
+            let b = Self::overlay_root(&t, scope, merge.parent, true);
+            if a != b {
+                t.overlays.entry(scope).or_default().union(a, b);
+                self.fixups.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if !scopes.is_empty() {
+            t.registry.entry(merge.parent).or_default().extend(scopes);
         }
     }
 
     fn apply_scoped(&self, u: NodeId, v: NodeId, scopes: &[ScopeId]) {
         let _g = self.union_lock.lock();
-        let ru = self.global.find(u);
-        let rv = self.global.find(v);
+        let t = self.tier.load();
+        let ru = Self::shared_root(&t, u, true);
+        let rv = Self::shared_root(&t, v, true);
         for &scope in scopes {
-            let overlay = self.overlays.entry(scope).or_default();
-            overlay.union(ru, rv);
-            drop(overlay);
-            self.registry.entry(ru).or_default().insert(scope);
-            self.registry.entry(rv).or_default().insert(scope);
+            let a = Self::overlay_root(&t, scope, ru, true);
+            let b = Self::overlay_root(&t, scope, rv, true);
+            t.overlays.entry(scope).or_default().union(a, b);
+            t.registry.entry(ru).or_default().insert(scope);
+            t.registry.entry(rv).or_default().insert(scope);
             self.scope_links.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -120,14 +321,14 @@ impl ScopedForest {
     /// graph id in that component. Read-only walk — never contends with the
     /// ingest writer.
     pub fn scope_root(&self, scope: ScopeId, node: NodeId) -> NodeId {
-        let g = self.global.find_ro(node);
+        // One tier load per query: a fold is rare, so readers pay a single
+        // lock-free load and then resolve entirely within one generation.
+        let t = self.tier.load();
+        let g = Self::shared_root(&t, node, false);
         if scope == GLOBAL_SCOPE {
             return g;
         }
-        match self.overlays.get(&scope) {
-            Some(overlay) => overlay.find_ro(g),
-            None => g,
-        }
+        Self::overlay_root(&t, scope, g, false)
     }
 
     /// Whether `u` and `v` are connected in `scope`'s view. Lock-free.
@@ -136,41 +337,201 @@ impl ScopedForest {
     }
 
     pub fn stats(&self) -> ForestStats {
+        let t = self.tier.load();
+        let base = t.base.as_ref().map(|b| b.stats()).unwrap_or_default();
         ForestStats {
             events_applied: self.events_applied.load(Ordering::Relaxed),
-            global_merges: self.global.merges(),
-            global_links: self.global.len_links() as u64,
+            global_merges: t.global.merges(),
+            // Memtable links: with a base attached these count only what has
+            // been applied since compaction.
+            global_links: t.global.len_links() as u64,
             scope_links: self.scope_links.load(Ordering::Relaxed),
-            active_scopes: self.overlays.len() as u64,
+            active_scopes: t.overlays.len() as u64,
             merge_fixups: self.fixups.load(Ordering::Relaxed),
+            base_shared_pairs: base.shared_pairs,
+            base_overlay_pairs: base.overlay_pairs,
+            base_mapped_bytes: base.mapped_bytes,
+            base_index_bytes: base.index_bytes,
+            base_sequence: base.sequence,
+            folds: self.folds.load(Ordering::Relaxed),
         }
     }
 
-    /// Capture a consistent snapshot. Takes the union lock so no merge or
-    /// fix-up is half-applied in the captured state; queries keep running.
-    pub fn snapshot(&self) -> ForestSnapshot {
+    /// Stream the composed (base ⊕ memtable) state to `sink` in key order.
+    ///
+    /// This is **compaction**: base pairs are re-resolved through the memtable
+    /// so the emitted state is complete and the next base subsumes both
+    /// layers. Takes the union lock, so no merge or fix-up is half-applied in
+    /// the captured state; queries keep running throughout.
+    ///
+    /// Heap cost is O(memtable), not O(state): the base is walked as an
+    /// ascending stream and merge-joined against the memtable's (small,
+    /// sorted) key set, so nothing per-node is ever collected. Memtable keys
+    /// are composed roots and are therefore disjoint from base keys — the
+    /// equal-key case is handled rather than relied upon.
+    pub fn compact_into(&self, sink: &mut dyn SnapshotSink) {
         let _g = self.union_lock.lock();
-        let global = self.global.snapshot();
-        let scope_ids: Vec<ScopeId> = self.overlays.iter().map(|e| *e.key()).collect();
-        let mut scopes = Vec::with_capacity(scope_ids.len());
-        for scope in scope_ids {
-            if let Some(overlay) = self.overlays.get(&scope) {
-                let pairs = overlay.snapshot();
-                if !pairs.is_empty() {
-                    scopes.push((scope, pairs));
+        self.compact_locked(sink);
+    }
+
+    /// Compact, then **adopt the result and drop the memtable**, without ever
+    /// releasing the union lock in between.
+    ///
+    /// This is what keeps heap use bounded in a running process. Without it
+    /// the memtable only starts empty — it grows for the life of the worker,
+    /// and the disk tier's RAM argument expires at the first flush.
+    ///
+    /// `build` turns the stream it was just handed into the base that encodes
+    /// it (write the Puffin file, map it) and may return anything else the
+    /// caller needs from the same bytes. It runs with the lock held, so
+    /// nothing can be applied between the compaction and the fold and then be
+    /// lost by it — which is precisely the bug a two-call API would have. The
+    /// price is that ingest stalls for the duration; that is why folds are
+    /// triggered by memtable size rather than run every flush, and why design
+    /// 001's delta chains are what eventually make them cheap.
+    ///
+    /// A failing `build` leaves the forest exactly as it was.
+    ///
+    /// # Why the whole tier is replaced
+    ///
+    /// Publishing the base and then clearing the memtable in place looks
+    /// equivalent and is not: `DashMap::clear` is not atomic across shards, so
+    /// a concurrent `find_ro` can walk into a half-cleared chain and stop at an
+    /// intermediate node, returning a non-root as a component id. Instead the
+    /// fold builds a fresh [`Tier`] — new base, empty memtable — and swaps the
+    /// pointer in one store. Readers are never blocked and never observe a
+    /// mixture: a query that loaded the previous generation keeps resolving
+    /// against the previous base *and* its intact memtable, which by
+    /// construction gives the same answers, and that generation is freed once
+    /// the last such reader drops it.
+    pub fn compact_and_fold<S: SnapshotSink + ?Sized, T, E>(
+        &self,
+        sink: &mut S,
+        build: impl FnOnce(&mut S) -> Result<(Arc<dyn RoutingBase>, T), E>,
+    ) -> Result<T, E> {
+        let _g = self.union_lock.lock();
+        self.compact_locked(sink);
+        let (base, out) = build(sink)?;
+        self.tier.store(Arc::new(Tier {
+            base: Some(base),
+            ..Tier::default()
+        }));
+        self.folds.fetch_add(1, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    fn compact_locked(&self, sink: &mut (impl SnapshotSink + ?Sized)) {
+        let t = self.tier.load();
+        let base = t.base();
+
+        let mut mem = t.global.keys();
+        mem.sort_unstable();
+        let mut i = 0usize;
+        if let Some(base) = base {
+            base.for_each_shared_pair(&mut |k, _| {
+                while i < mem.len() && mem[i] < k {
+                    Self::emit_shared(&t, sink, mem[i]);
+                    i += 1;
                 }
-            }
+                if i < mem.len() && mem[i] == k {
+                    i += 1;
+                }
+                Self::emit_shared(&t, sink, k);
+            });
         }
-        scopes.sort_by_key(|(s, _)| *s);
-        ForestSnapshot { global, scopes }
+        while i < mem.len() {
+            Self::emit_shared(&t, sink, mem[i]);
+            i += 1;
+        }
+
+        let mut scope_ids: Vec<ScopeId> = t.overlays.iter().map(|e| *e.key()).collect();
+        if let Some(base) = base {
+            scope_ids.extend(base.scopes());
+        }
+        scope_ids.sort_unstable();
+        scope_ids.dedup();
+
+        for scope in scope_ids {
+            sink.scope_start(scope);
+            let mut mem = t.overlays.get(&scope).map(|o| o.keys()).unwrap_or_default();
+            mem.sort_unstable();
+            let mut i = 0usize;
+            if let Some(base) = base {
+                base.for_each_overlay_pair(scope, &mut |k, _| {
+                    while i < mem.len() && mem[i] < k {
+                        Self::emit_overlay(&t, sink, scope, mem[i]);
+                        i += 1;
+                    }
+                    if i < mem.len() && mem[i] == k {
+                        i += 1;
+                    }
+                    Self::emit_overlay(&t, sink, scope, k);
+                });
+            }
+            while i < mem.len() {
+                Self::emit_overlay(&t, sink, scope, mem[i]);
+                i += 1;
+            }
+            sink.scope_end(scope);
+        }
+    }
+
+    fn emit_shared(t: &Tier, sink: &mut (impl SnapshotSink + ?Sized), node: NodeId) {
+        let root = Self::shared_root(t, node, false);
+        if root != node {
+            sink.shared_pair(node, root);
+        }
+    }
+
+    fn emit_overlay(
+        t: &Tier,
+        sink: &mut (impl SnapshotSink + ?Sized),
+        scope: ScopeId,
+        node: NodeId,
+    ) {
+        let root = Self::overlay_root(t, scope, node, false);
+        if root == node {
+            return;
+        }
+        sink.overlay_pair(node, root);
+        // Both endpoints are (possibly historical) shared roots. Record them
+        // under their *live* shared roots so a future merge of one still
+        // notifies this scope after the next cold start.
+        let a = Self::shared_root(t, node, false);
+        sink.registry_entry(a, scope);
+        let b = Self::shared_root(t, root, false);
+        if b != a {
+            sink.registry_entry(b, scope);
+        }
+    }
+
+    /// Capture a consistent snapshot in the heap. Convenience over
+    /// [`ScopedForest::compact_into`] for RAM-mode callers and tests; the
+    /// flush path streams instead of collecting.
+    pub fn snapshot(&self) -> ForestSnapshot {
+        let mut c = SnapshotCollector::default();
+        self.compact_into(&mut c);
+        ForestSnapshot {
+            global: c.global,
+            scopes: c.scopes,
+        }
     }
 
     /// Rebuild forest state from a snapshot (startup recovery path).
+    ///
+    /// RAM mode only: loading pairs into the memtable would break the
+    /// "memtable keys are composed roots" invariant if a base were attached
+    /// (use [`ScopedForest::with_base`] instead).
     pub fn hydrate(&self, snap: &ForestSnapshot) {
         let _g = self.union_lock.lock();
-        self.global.hydrate(&snap.global);
+        let t = self.tier.load();
+        debug_assert!(
+            t.base.is_none(),
+            "hydrate() is RAM mode only; a base-backed forest composes instead"
+        );
+        t.global.hydrate(&snap.global);
         for (scope, pairs) in &snap.scopes {
-            let overlay = self.overlays.entry(*scope).or_default();
+            let overlay = t.overlays.entry(*scope).or_default();
             overlay.hydrate(pairs);
             drop(overlay);
             // Re-register overlay members under their *current* global roots
@@ -179,8 +540,8 @@ impl ScopedForest {
             // DSU lands on the live root.
             for &(a, b) in pairs {
                 for m in [a, b] {
-                    let live = self.global.find(m);
-                    self.registry.entry(live).or_default().insert(*scope);
+                    let live = t.global.find(m);
+                    t.registry.entry(live).or_default().insert(*scope);
                 }
             }
             self.scope_links
@@ -197,6 +558,16 @@ pub struct ForestStats {
     pub scope_links: u64,
     pub active_scopes: u64,
     pub merge_fixups: u64,
+    /// Pairs served from the mmap'd base (0 when running all-RAM).
+    pub base_shared_pairs: u64,
+    pub base_overlay_pairs: u64,
+    pub base_mapped_bytes: u64,
+    /// Heap held by the base's in-RAM lookup indexes.
+    pub base_index_bytes: u64,
+    pub base_sequence: u64,
+    /// Times the memtable has been folded into a fresh base. If this stops
+    /// advancing while `global_links` climbs, heap use is unbounded.
+    pub folds: u64,
 }
 
 #[cfg(test)]

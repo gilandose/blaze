@@ -48,6 +48,25 @@ pub struct Blob {
     pub sequence_number: i64,
 }
 
+/// Where a blob lives inside the file, without copying its bytes — the entry
+/// point for mmap'd readers (see `storage::base`).
+#[derive(Debug, Clone)]
+pub struct BlobIndex {
+    pub blob_type: String,
+    /// Byte range of the payload within the file.
+    pub offset: usize,
+    pub length: usize,
+    pub properties: BTreeMap<String, String>,
+    pub snapshot_id: i64,
+    pub sequence_number: i64,
+}
+
+impl BlobIndex {
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.offset..self.offset + self.length
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct BlobMetadata {
     #[serde(rename = "type")]
@@ -115,8 +134,10 @@ pub fn write(blobs: &[Blob], file_properties: BTreeMap<String, String>) -> Bytes
     out.freeze()
 }
 
-/// Parse a Puffin file back into its blobs.
-pub fn read(data: &[u8]) -> Result<Vec<Blob>, PuffinError> {
+/// Parse the footer and return where each blob lives, **without copying any
+/// payload**. Validates framing and that every blob range sits strictly
+/// inside the blob area.
+pub fn read_index(data: &[u8]) -> Result<Vec<BlobIndex>, PuffinError> {
     let n = data.len();
     if n < MAGIC.len() * 3 + 8 {
         return Err(PuffinError::TooSmall);
@@ -158,12 +179,29 @@ pub fn read(data: &[u8]) -> Result<Vec<Blob>, PuffinError> {
                     file_len: n,
                 });
             }
-            Ok(Blob {
+            Ok(BlobIndex {
                 blob_type: meta.blob_type,
-                data: Bytes::copy_from_slice(&data[start..end]),
+                offset: start,
+                length: meta.length as usize,
                 properties: meta.properties,
                 snapshot_id: meta.snapshot_id,
                 sequence_number: meta.sequence_number,
+            })
+        })
+        .collect()
+}
+
+/// Parse a Puffin file into owned blobs (copies payloads).
+pub fn read(data: &[u8]) -> Result<Vec<Blob>, PuffinError> {
+    read_index(data)?
+        .into_iter()
+        .map(|idx| {
+            Ok(Blob {
+                data: Bytes::copy_from_slice(&data[idx.range()]),
+                blob_type: idx.blob_type,
+                properties: idx.properties,
+                snapshot_id: idx.snapshot_id,
+                sequence_number: idx.sequence_number,
             })
         })
         .collect()

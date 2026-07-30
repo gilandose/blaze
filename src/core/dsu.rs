@@ -124,14 +124,18 @@ impl Dsu {
         self.merges.load(Ordering::Relaxed)
     }
 
-    /// Fully-resolved `(node, root)` pairs for every non-root node.
+    /// Every node with a parent link (i.e. every non-root this map knows).
     ///
-    /// Keys are collected before resolving because `find` may write
-    /// (path-halving) into the same DashMap shard an iterator would hold a
-    /// read lock on.
+    /// Collected eagerly: `find` may write (path-halving) into the same
+    /// DashMap shard an iterator would hold a read lock on, so callers must
+    /// not resolve while iterating.
+    pub fn keys(&self) -> Vec<NodeId> {
+        self.parents.iter().map(|e| *e.key()).collect()
+    }
+
+    /// Fully-resolved `(node, root)` pairs for every non-root node.
     pub fn snapshot(&self) -> Vec<(NodeId, NodeId)> {
-        let keys: Vec<NodeId> = self.parents.iter().map(|e| *e.key()).collect();
-        keys.into_iter().map(|k| (k, self.find(k))).collect()
+        self.keys().into_iter().map(|k| (k, self.find(k))).collect()
     }
 
     /// Rebuild state from `(node, root)` pairs produced by [`Dsu::snapshot`].

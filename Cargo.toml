@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+arc-swap = "1.9.2"
 arrow-array = "59.1.0"
 arrow-buffer = "59.1.0"
 arrow-ord = "59.1.0"
@@ -17,6 +18,7 @@ dashmap = "6.2.1"
 futures = "0.3.33"
 k8s-openapi = { version = "0.28.0", features = ["latest"], optional = true }
 kube = { version = "4.0.0", default-features = false, features = ["client", "rustls-tls"], optional = true }
+memmap2 = "0.9.11"
 object_store = { version = "0.14.1", features = ["aws"] }
 parking_lot = "0.12.5"
 parquet = { version = "59.1.0", features = ["arrow"] }

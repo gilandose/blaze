@@ -13,7 +13,7 @@ use blaze::core::ScopedForest;
 use blaze::grpc::GrpcService;
 use blaze::ha::{LeaderElector, StaticElector};
 use blaze::ingest::{EdgeBuffer, Pipeline, SimulatorConfig, run_simulator};
-use blaze::storage::{Flusher, SnapshotCatalog, hydrate_from_catalog};
+use blaze::storage::{Flusher, SnapshotCatalog, hydrate_from_catalog, open_base_from_catalog};
 
 #[derive(Parser, Debug)]
 #[command(name = "blaze", about = "Multi-tenant streaming graph engine")]
@@ -33,6 +33,23 @@ struct Args {
     /// Table prefix inside the warehouse.
     #[arg(long, default_value = "graph/edges")]
     table: String,
+
+    /// Where committed routing state is served from: "ram" hydrates the
+    /// whole DSU into the heap; "disk" mmaps the latest snapshot from
+    /// --data-dir and keeps only post-snapshot merges in memory (bounded by
+    /// the compaction window, and restarts serve in seconds).
+    #[arg(long, default_value = "ram")]
+    routing_base: String,
+
+    /// Local cache directory for the mmap'd routing base (--routing-base disk).
+    #[arg(long, default_value = "./blaze-data")]
+    data_dir: String,
+
+    /// Fold the memtable into a fresh on-disk base once it holds this many
+    /// links (--routing-base disk only). Lower keeps heap smaller at the cost
+    /// of rewriting the base more often; the fold stalls ingest while it runs.
+    #[arg(long, default_value_t = blaze::storage::DEFAULT_FOLD_AFTER_LINKS)]
+    fold_after_links: u64,
 
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
@@ -136,9 +153,27 @@ async fn main() -> anyhow::Result<()> {
     };
     let catalog = Arc::new(SnapshotCatalog::new(store.clone(), table_prefix.clone()));
 
-    // In-memory state, hydrated from the latest committed Puffin snapshot.
-    let forest = Arc::new(ScopedForest::new());
-    let watermark = hydrate_from_catalog(&forest, &store, &catalog).await?;
+    // Committed routing state: either hydrated into the heap, or mmap'd from
+    // a local cache of the latest Puffin snapshot.
+    let base_dir = (args.routing_base == "disk").then(|| std::path::PathBuf::from(&args.data_dir));
+    let (forest, watermark) = match args.routing_base.as_str() {
+        "ram" => {
+            let forest = Arc::new(ScopedForest::new());
+            let watermark = hydrate_from_catalog(&forest, &store, &catalog).await?;
+            (forest, watermark)
+        }
+        "disk" => {
+            let dir = base_dir.clone().expect("set for disk mode");
+            match open_base_from_catalog(&store, &catalog, &dir).await? {
+                Some((base, watermark)) => (Arc::new(ScopedForest::with_base(base)), watermark),
+                None => {
+                    info!("no committed snapshot yet; starting with an empty memtable");
+                    (Arc::new(ScopedForest::new()), 0)
+                }
+            }
+        }
+        other => anyhow::bail!("unknown --routing-base '{other}' (ram, disk)"),
+    };
     let buffer = Arc::new(EdgeBuffer::new());
 
     // Leader election.
@@ -186,6 +221,8 @@ async fn main() -> anyhow::Result<()> {
         elector: elector.clone(),
         table_prefix,
         worker_id: worker_id.clone(),
+        base_dir,
+        fold_after_links: args.fold_after_links,
     });
     let flush_handle = tokio::spawn(
         flusher

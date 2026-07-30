@@ -44,6 +44,23 @@ curl -X POST localhost:8080/v1/edges \
 Restarting against the same warehouse hydrates the in-memory DSU from the
 latest committed Puffin snapshot — no event replay needed for topology.
 
+## Routing-state modes
+
+| `--routing-base` | Committed state lives in | Cold start | Use when |
+|---|---|---|---|
+| `ram` (default) | the heap (hydrated from Puffin) | O(pairs) | state fits comfortably in RAM |
+| `disk` | an mmap'd Puffin file under `--data-dir` | O(blobs) — milliseconds | state is large, or fast restarts matter |
+
+```bash
+# Serve committed routing state from a local NVMe cache instead of the heap:
+blaze --routing-base disk --data-dir /nvme/blaze --warehouse s3://bucket/prefix
+```
+
+In `disk` mode the in-memory DSU holds only merges applied since the last
+compaction; queries compose the mapped base with that memtable. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the composition rules and measured
+cold-start/latency numbers.
+
 ## Warehouse backends
 
 | URI | Backend |

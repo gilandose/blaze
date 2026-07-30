@@ -53,6 +53,10 @@ async fn main() -> anyhow::Result<()> {
         elector: Arc::new(StaticElector(true)),
         table_prefix: prefix,
         worker_id: "demo".into(),
+        // This example is about the committed Puffin lifecycle, so keep the
+        // forest all-RAM and never fold.
+        base_dir: None,
+        fold_after_links: u64::MAX,
     };
 
     // --- Cycle 1: a global merge plus tenant-scoped edges ---

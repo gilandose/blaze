@@ -56,6 +56,10 @@ fn make_flusher(
         elector: Arc::new(StaticElector(leader)),
         table_prefix: prefix,
         worker_id: worker.into(),
+        // RAM mode: the memtable is the state, so there is nothing to fold
+        // into and nowhere to fold it.
+        base_dir: None,
+        fold_after_links: u64::MAX,
     });
     (flusher, catalog)
 }

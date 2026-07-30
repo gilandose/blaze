@@ -1,9 +1,11 @@
 //! In-memory graph state: types, union-find, and the multi-tenant forest.
 
+pub mod base;
 pub mod dsu;
 pub mod scoped;
 pub mod types;
 
+pub use base::{BaseStats, RoutingBase, ScopeList};
 pub use dsu::Dsu;
-pub use scoped::{ForestSnapshot, ForestStats, ScopedForest};
+pub use scoped::{ForestSnapshot, ForestStats, ScopedForest, SnapshotSink};
 pub use types::{EdgeEvent, GLOBAL_SCOPE, NodeId, ScopeId, Visibility};
