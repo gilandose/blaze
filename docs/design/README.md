@@ -35,14 +35,13 @@ Three consequences of this profile shape everything below:
 | [003](003-disk-backed-base.md) | Disk-backed routing base (LSM) | memory + cold start | **implemented** |
 | [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed |
 | [005](005-union-tier.md) | Union tier (`all` view) & shared/global naming | semantics gap | designed |
-| [006](006-tiered-compaction.md) | Size-tiered compaction + backfill sizing | write amplification, layer count | designed — **next** |
-| [007](007-compaction-execution.md) | Where compaction runs (detached / process / deployment) | compaction's cost to serving | designed — blocked on 006's format |
+| [006](006-tiered-compaction.md) | Size-tiered compaction + backfill sizing | write amplification, layer count | **implemented** |
+| [007](007-compaction-execution.md) | Where compaction runs (detached / process / deployment) | compaction's cost to serving | **implemented** (detached in-process) |
+| [008](008-rocksdb-counterfactual.md) | Could this have been built on RocksDB? | whether the storage tier had to be written | evaluation |
 
-Recommended implementation order: **006** first (it demotes 001's remaining
-storage-side compaction work off the critical path and is what keeps the layer
-stack readable at a low change rate), then the registry restructure it describes
-(55% of base bytes), then 002 folded in with 005's rename and union tier, then
-004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
+006 and 007 are in. Recommended order for what is left: the registry restructure
+006 describes (55% of base bytes), then 002 folded in with 005's rename and union
+tier, then 004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
 packed u48 to serve the "well beyond 2B" goal.
 
 Cost impact at the target profile: an all-RAM design would need ~256–512 GB
