@@ -476,7 +476,10 @@ What still scales with state, named so it is not mistaken for solved:
 Extrapolated from the measured per-unit constants above, not estimated:
 **1.068 pairs per link**, **35 B/pair** in the base file (16 B pair + ~19 B of
 registry), **0.2%** sparse index, **0.91 µs/pair** compaction, **160 B/link** if
-held in RAM instead.
+held in RAM instead, and **308k links/s** ingest.
+
+Sizing target: **~50 links/s average, ~2k/s peak**, mostly arriving as a backfill
+of historic edges.
 
 | links | pairs | base file | process RSS (disk mode) | RSS if all-RAM | compaction, 1 core | registry sort buffer |
 |---|---|---|---|---|---|---|
@@ -499,39 +502,51 @@ has as a *cache*: the SLO is met at a 0% hit rate (1–2 cold NVMe faults, ~10�
 **Local disk**: base 75 GB + 24 deltas ≈ 75 GB, but compaction needs the old and
 new base at once, so provision ~2×. An `i4i.2xlarge` (1.7 TB NVMe) is ample.
 
-### Where it actually breaks today
+### Where it actually breaks — sized to the real workload
 
-Compaction, and only compaction. Three things, in the order they bite:
+The workload is **~50 links/s average, ~2k/s peak**, with the bulk of the data
+arriving as a **backfill of historic edges**. That changes which cost hurts, and
+two conclusions an earlier draft of this section got wrong are worth stating
+directly:
 
-1. **The registry sort buffer is 41 GB at 2B links** — it must be sorted by root
-   *across* scopes, so it is buffered whole. This OOMs before anything else does.
-   Worth noting it is also **55% of the base file**: grouping by root (root once +
-   varint scope list) instead of a flat 12 B stride would cut both the buffer and
-   ~30 GB of disk.
-2. **32 minutes under the union lock** is 32 minutes of stalled ingest. Design
-   001's storage-side compaction fixes this by construction — it reads the
-   committed layers, takes no lock, and can run as a separate job. Compaction also
-   shards trivially by scope (the blobs are independent), so ~32 min on one core
-   is ~4 min on eight.
-3. **The Puffin file is buffered in RAM** before upload — 75 GB. Needs a
-   streaming writer plus multipart upload.
+- **Compaction stall duration is not the problem.** Queries never take the union
+  lock, so a stall delays only ingest. At 50/s a 30-minute compaction queues ~90k
+  events (~5 MB of Arrow buffer) and offsets are the source of truth — a lag
+  spike, not an outage. Frequency and write amplification are what matter.
+- **Low change rate is what breaks the layer stack**, not high. Compacting on
+  layer count (60) fires hourly and rewrites a 75 GB base to absorb 7.5 MB;
+  compacting on delta bytes (25% of base) fires every ~120 days, by which point
+  ~173,000 runs are in the stack. No setting fixes both, because a single flat run
+  of deltas is the wrong shape.
 
-So the honest ceiling today is set by tolerable stall and that buffer: **roughly
-50–100M links** (a 60 s stall is ~66M pairs). Deltas mean flushes stay cheap far
-beyond that, but a base you cannot compact is a base that eventually stops being
-compactable.
+So the real next step is **[size-tiered compaction](docs/design/006-tiered-compaction.md)**:
+runs grow ~10× per level, layer count stays logarithmic (~6–8 runs), and write
+amplification is O(log N) per link instead of O(state) per compaction. Full-base
+merges become months-apart events, which demotes both remaining O(state) items —
+001's storage-side compaction and the in-RAM Puffin buffer — off the critical
+path.
 
-With those three fixed, 2B is unremarkable: compaction becomes a background job
-costing minutes of CPU on a node that is not serving. [Design
-002](docs/design/002-dense-interning.md) (u32 interning) then halves pair bytes
-on top — 75 GB → ~45 GB, and compaction time with it.
+**Backfill is already tractable.** Measured single-node ingest is **357k links/s**
+through the DSU and **308k/s** with Arrow buffering (`examples/throughput.rs`), so
+2B links is **~1.8 hours**. Memory during a backfill is bounded by the fold
+trigger rather than by state: `--fold-after-links 20000000` holds ~3 GB and folds
+~100 times. Call it 2–3 hours on one node with single-digit GB of RAM.
+
+**Beyond, toward 10B+:** the registry restructure remains the best
+saving-to-effort ratio after tiering (55% of base bytes; ~30 GB at 2B, ~125 GB at
+10B). Note the shared tier is inherently single-writer — a merge can connect any
+two nodes, so union-find cannot be sharded by key range without distributed
+coordination — but 2k/s peak is ~0.6% of measured write capacity, so one writer
+serves 10B+ comfortably. [Design 002](docs/design/002-dense-interning.md)'s u32
+interning caps at 4.3B nodes and must not be used at this target; u64 or a packed
+u48. Nothing structural blocks 10B — it is tiering plus constant factors.
 
 ## Next phase
 
-Implementation-ready designs for the next phase — delta snapshots, dense id
-interning, the disk-backed routing base, and analytics enrichment — live in
-[docs/design/](docs/design/README.md), sized against the target production
-profile (~2B tracked nodes, ~3k events/s peak).
+Implementation-ready designs live in [docs/design/](docs/design/README.md).
+[006 tiered compaction](docs/design/006-tiered-compaction.md) is the current
+priority; [001 delta snapshots](docs/design/001-delta-snapshots.md) shipped its
+write path and retains storage-side compaction as follow-on work.
 
 ## Extension points
 

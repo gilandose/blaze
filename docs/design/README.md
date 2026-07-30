@@ -5,20 +5,26 @@ production profile**:
 
 | Parameter | Value |
 |---|---|
-| Tracked nodes (worst case: all participate in links) | ~2B |
-| Event rate | ~3k/s peak |
+| Tracked nodes (worst case: all participate in links) | ~2B, designed to go well beyond |
+| Link rate | **~50/s average, ~2k/s peak** |
+| Dominant workload | **backfill of historic edges**, not the live stream |
 | Tenant scopes | ~3,000 + global |
 | Query SLO | sub-millisecond component lookups |
 
-Two consequences of this profile shape everything below:
+Three consequences of this profile shape everything below:
 
-1. **Throughput is a non-problem.** 3k events/s is ~0.5% of one worker's
-   measured ingest capacity (~550k events/s). Partitioning across workers is
-   *not* on this roadmap; one HA group of 3 replicas suffices indefinitely.
-2. **State size is the whole problem.** At the measured ~200 B/link, 2B links
-   is ~400 GB — and a full snapshot would take ~8 minutes under the union
-   lock. Every design below attacks state cost, snapshot cost, or restart
-   cost.
+1. **Throughput is a non-problem, by a wide margin.** 2k/s peak is ~0.6% of one
+   worker's measured ingest capacity (357k links/s through the DSU, 308k/s with
+   Arrow). Partitioning across workers is *not* on this roadmap; one HA group of
+   3 replicas suffices indefinitely. A 2B-link backfill is ~1.8 hours.
+2. **State size is the whole problem.** At the measured 160 B/link in RAM, 2B
+   links is ~320 GB. Every design below attacks state cost, snapshot cost, or
+   restart cost.
+3. **The low change rate is itself a design constraint.** It makes full-base
+   compaction absurdly expensive per unit of change (rewriting 75 GB to absorb
+   7.5 MB), which is why [006](006-tiered-compaction.md) — not the stall fixes —
+   is the current priority. Stall *duration* is cheap here: queries never take
+   the union lock, and 50/s buffers away a 30-minute pause.
 
 ## Documents and priority order
 
@@ -29,13 +35,19 @@ Two consequences of this profile shape everything below:
 | [003](003-disk-backed-base.md) | Disk-backed routing base (LSM) | memory + cold start | **implemented** |
 | [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed |
 | [005](005-union-tier.md) | Union tier (`all` view) & shared/global naming | semantics gap | designed |
+| [006](006-tiered-compaction.md) | Size-tiered compaction + backfill sizing | write amplification, layer count | designed — **next** |
 
-Recommended implementation order: **001 and 002 together** (fold in 005's
-rename and union tier — same files) (they touch the
-same core and are jointly required to fit 2B links on sane hardware), then
-003, then 004. Cost impact at the target profile: current design would need
-~1 TB-RAM instances (~$9.5k/mo for 3 replicas); after 001+002, 128–256 GB
-instances (~$1.9–3.7k/mo); after 003, ~64 GB + NVMe (~$1.5k/mo).
+Recommended implementation order: **006** first (it demotes 001's remaining
+storage-side compaction work off the critical path and is what keeps the layer
+stack readable at a low change rate), then the registry restructure it describes
+(55% of base bytes), then 002 folded in with 005's rename and union tier, then
+004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
+packed u48 to serve the "well beyond 2B" goal.
+
+Cost impact at the target profile: an all-RAM design would need ~256–512 GB
+instances; with 003 shipped it is ~64 GB + NVMe (~$1.5k/mo for 3 replicas), and
+measured resident set is ~300 MB at 2B links, so the instance is sized by page
+cache and headroom rather than by state.
 
 ## Invariants every design must preserve
 
