@@ -107,28 +107,52 @@ only if 2 hours actually hurts; note it is a batch tool, not part of the engine.
   tier shards trivially by scope if it ever needs to.
 - **Ids.** [002](002-dense-interning.md)'s u32 interning caps at 4.3B nodes and
   must not be used at this target; u64, or packed u48 if the two bytes matter.
-- **Delta blob *shape*, which is the sharper problem at a low change rate.**
-  One Puffin blob per scope is right for a base and wrong for a delta: the footer
-  lists every blob at ~137 bytes, so per-layer overhead is O(scopes) no matter
-  how little changed. Measured (`examples/blob_overhead.rs`), a 60s delta at
+- **The registry inflates the base permanently, and that is a *read* cost.**
+  It is 55% of base bytes at a flat 12-byte `(root, scope)` stride — 41 GB of a
+  75 GB base at 2B links. Crucially it is **never touched by a query**: the only
+  caller of `scopes_for_root` is `apply_global`, so those pages are read by the
+  writer alone (~7.5/s average, ~300/s peak) while competing with queries for page
+  cache. Grouping by root, or replacing it with per-scope membership filters, takes
+  the base to ~34 GB — the difference between not fitting and comfortably fitting
+  in cache on a 64 GB box, and roughly halves compaction bytes.
+- **Delta blob shape: real, cheap, low impact.** One Puffin blob per scope means
+  per-layer overhead is O(scopes) rather than O(change), because the footer lists
+  every blob at ~137 bytes. Measured (`examples/blob_overhead.rs`), a 60s delta at
   50 links/s dusted across 3000 tenants is **74% bookkeeping** — 556 KB carrying
-  144 KB of pairs. A single combined overlay blob for delta layers,
-  `(scope u32, node u64, root u64)` sorted by `(scope, node)`, is ~4x smaller and
-  takes blob count per delta from 3002 to 2. Bases keep per-scope blobs, where
-  each is large enough for separate indexing to pay off — a format tier matching
-  the compaction tier.
-- **The registry is 55% of base bytes** at a flat 12-byte `(root, scope)` stride,
-  so grouping by root would save ~30 GB at 2B links and ~125 GB at 10B. Note this
-  is now a *space* optimization only: building it no longer needs an O(state)
-  sort (see `storage::compact`), and looking it up was always one binary search.
-  Disk is the cheapest resource here, so this ranks below the blob-shape fix
-  despite the bigger number.
+  144 KB. The fix is a single combined overlay blob for delta layers,
+  `(scope u32, node u64, root u64)` sorted by `(scope, node)`: ~4x smaller, blob
+  count per delta from 3002 to 2.
+
+  But note the ceiling on the payoff. Deltas are transient — compaction merges
+  them away, and a compacted base's 3002-blob footer is ~450 KB on a 75 GB file.
+  So this is 74% of a small number that never compounds: ~800 MB/day of writes
+  instead of ~207 MB, and ~38 ms of extra cold-start footer parse at 24 layers.
+  It also does not appear during backfill, where each delta is large and
+  concentrated (nearer the 1% row of the measured table). It bites only in the
+  specific regime of low absolute change spread thinly across many scopes.
 - **Probing per-scope blobs instead of keeping a registry** only works with
   in-RAM membership filters. Without them it is ~3 ms per global merge (3000
   binary searches), which is 2% of a core at the 50/s average but nearly a whole
   core at the 2k/s peak, and worse cold.
 - **Disk**: ~375 GB of base at 10B links before the registry fix, ~250 GB after.
   Unremarkable for local NVMe.
+
+### Which of these is a read problem, and which a write problem
+
+Worth stating plainly, because it drives the ordering above and is easy to get
+backwards:
+
+| | write cost | query latency | cold start |
+|---|---|---|---|
+| Registry blob | ~50% of delta payload, 55% of base | **none** (writer-only) | none |
+| Per-scope blob count | 74% overhead on deltas | **none** per lookup | O(scopes x layers) footer parse |
+| Layer count | trivial (append) | **~0.3 us per layer** | O(layers) files |
+
+Only layer count threatens the query SLO, which is why tiering leads. At 50
+links/s write amplification does not matter for its own sake — it matters through
+what it leaves behind for readers, which is why the registry (permanent, in the
+base) outranks blob shape (transient, in deltas) despite the smaller headline
+percentage.
 
 Nothing structural stands in the way of 10B; it is tiering plus constant factors.
 
