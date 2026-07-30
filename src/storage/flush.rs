@@ -309,13 +309,33 @@ impl Flusher {
         }
 
         let started = std::time::Instant::now();
-        let (blobs, cstats) = compact_layers(&stack, sequence);
-        let bytes = puffin::write(&blobs, puffin_metadata(watermark));
         let path = dir.join(format!(
             "routing-{}-{sequence:012}-base.puffin",
             self.worker_id
         ));
-        write_atomically(&path, &bytes)?;
+        // The merge is minutes of synchronous CPU and disk work. Left inline in
+        // an async fn it would occupy a tokio worker thread for the duration,
+        // costing the runtime a whole worker (the scheduler steals around it, so
+        // the API degrades rather than stalls, but it should not be there).
+        //
+        // Note this does *not* yet let folds proceed during a compaction — the
+        // tick is still sequential, so the memtable grows for the merge's
+        // duration. Fixing that needs the compaction to run detached, which needs
+        // the catalog to describe a *set of runs* rather than one base plus a
+        // contiguous chain: a base merged from layers 0..k cannot be expressed as
+        // a base at a later sequence without discarding the deltas committed
+        // meanwhile. That format change is design 006's anyway, so the two land
+        // together.
+        let merge_stack = stack.clone();
+        let merge_path = path.clone();
+        let meta = puffin_metadata(watermark);
+        let (bytes, cstats) = tokio::task::spawn_blocking(move || {
+            let (blobs, cstats) = compact_layers(&merge_stack, sequence);
+            let bytes = puffin::write(&blobs, meta);
+            write_atomically(&merge_path, &bytes)?;
+            anyhow::Ok((bytes, cstats))
+        })
+        .await??;
         let merged_ms = started.elapsed().as_millis() as u64;
 
         // Publish before adopting. An uncommitted base is a harmless orphan; a
@@ -371,6 +391,7 @@ impl Flusher {
             overlay_pairs = cstats.overlay_pairs,
             registry_entries = cstats.registry_entries,
             registry_corrections = cstats.registry_corrections,
+            moved_roots = cstats.moved_roots,
             merged_ms,
             "compacted the layer chain from storage; ingest was never stalled"
         );

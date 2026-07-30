@@ -20,18 +20,26 @@
 //! The only obstacle to merging them directly is that a root recorded in an
 //! older layer may since have been absorbed, and re-resolving it moves it
 //! downward, which breaks the sort. But the roots that moved are exactly the
-//! *shared keys of the newer layers* — bounded by change, not by state. So:
+//! *shared keys of the delta layers* — bounded by change, not by state. So:
 //!
-//! 1. k-way merge the layers' registry runs, resolving each root. Entries that
-//!    resolve to themselves are already in order; the rest are corrections.
-//! 2. Collect only the corrections (small), sort them, and merge the two sorted
-//!    streams.
+//! 1. k-way merge the layers' registry runs, and collect the entries whose root
+//!    moved. Those are the corrections; everything else is already in order.
+//! 2. Sort the corrections (small) and merge the two sorted streams.
 //!
 //! Two sequential passes over the registry runs, and heap proportional to the
 //! corrections rather than to the registry.
+//!
+//! # Why "did this root move?" is a hash probe, not a resolution
+//!
+//! The obvious test is `shared_parent(root).is_some()`, but at depth 8 that is
+//! eight binary searches over the mapping, per entry, twice — measured as ~73%
+//! of total compaction time (109 s of 137 s on a 68M-entry registry). See
+//! [`moved_roots`] for the equivalent test that costs one hash probe, and
+//! `moved_root_set_is_equivalent_to_probing_every_root` for the assertion that
+//! keeps the two definitions in step.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::core::{NodeId, RoutingBase, ScopeId};
 use crate::storage::codec;
@@ -49,6 +57,11 @@ pub struct CompactionStats {
     /// had to be re-sorted. Bounded by change; if this ever approaches
     /// `registry_entries` the bounded-corrections assumption has broken.
     pub registry_corrections: u64,
+    /// Size of the moved-root set used to test for those corrections. Bounded by
+    /// change × depth (the delta layers' shared keys), not by state — worth
+    /// reporting because it is the one heap allocation compaction still makes
+    /// that grows with anything.
+    pub moved_roots: u64,
 }
 
 fn table(pairs: impl Iterator<Item = (NodeId, NodeId)>) -> (Bytes, u64) {
@@ -97,13 +110,12 @@ pub fn compact_layers(layers: &LayeredBase, sequence: u64) -> (Vec<Blob>, Compac
         BTreeMap::new(),
     ));
 
-    for scope in layers.scopes() {
-        let mut pairs = Vec::new();
-        layers.for_each_overlay_pair(scope, &mut |k, v| pairs.push((k, v)));
-        if pairs.is_empty() {
-            continue;
-        }
-        let (data, count) = table(pairs.into_iter());
+    // Overlays are the bulk of the work — ~85% of pairs — and each scope's merge
+    // is completely independent of every other, so this is the one part of
+    // compaction that parallelizes for free. Output stays in ascending scope
+    // order because the scope list is sorted and chunks are recombined in order,
+    // which keeps the result byte-identical to the sequential path.
+    for (scope, data, count) in merge_overlays(layers) {
         stats.overlay_pairs += count;
         stats.scopes += 1;
         blobs.push(blob(
@@ -116,11 +128,60 @@ pub fn compact_layers(layers: &LayeredBase, sequence: u64) -> (Vec<Blob>, Compac
     let (registry, reg_stats) = compact_registry(layers);
     stats.registry_entries = reg_stats.0;
     stats.registry_corrections = reg_stats.1;
+    stats.moved_roots = reg_stats.2;
     if stats.registry_entries > 0 {
         blobs.push(blob(codec::REGISTRY_BLOB_TYPE, registry, BTreeMap::new()));
     }
 
     (blobs, stats)
+}
+
+/// Build every scope's overlay table, in ascending scope order, across threads.
+///
+/// Empty scopes are dropped, so the result is exactly the blobs to emit.
+fn merge_overlays(layers: &LayeredBase) -> Vec<(ScopeId, Bytes, u64)> {
+    let scopes = layers.scopes();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(scopes.len().max(1));
+    if threads <= 1 {
+        return scopes
+            .into_iter()
+            .filter_map(|s| one_overlay(layers, s))
+            .collect();
+    }
+
+    // Contiguous chunks, recombined in order, so the output ordering does not
+    // depend on how the work was scheduled.
+    let per = scopes.len().div_ceil(threads);
+    std::thread::scope(|scope_handle| {
+        let handles: Vec<_> = scopes
+            .chunks(per)
+            .map(|chunk| {
+                scope_handle.spawn(move || {
+                    chunk
+                        .iter()
+                        .filter_map(|&s| one_overlay(layers, s))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("overlay merge thread panicked"))
+            .collect()
+    })
+}
+
+fn one_overlay(layers: &LayeredBase, scope: ScopeId) -> Option<(ScopeId, Bytes, u64)> {
+    let mut pairs = Vec::new();
+    layers.for_each_overlay_pair(scope, &mut |k, v| pairs.push((k, v)));
+    if pairs.is_empty() {
+        return None;
+    }
+    let (data, count) = table(pairs.into_iter());
+    Some((scope, data, count))
 }
 
 /// Ordered cursor over one layer's registry run.
@@ -130,15 +191,45 @@ struct Run {
     len: usize,
 }
 
+/// Every node that some *delta* layer stores a shared parent for.
+///
+/// This is the cheap test for "has this registry root moved?", and it replaces a
+/// `shared_parent` probe per registry entry — which at depth 8 is eight binary
+/// searches over the mapping, and measured as ~73% of total compaction time.
+///
+/// It is exact, not an approximation. A registry entry recorded in layer `i`
+/// carries a root that had no parent in layers `0..=i` (that is what made it a
+/// live root when it was written). So if the root has a parent at all, it lives
+/// in some layer `j > i`, and since `i >= 0` that means `j >= 1` — a delta.
+/// Conversely any node keyed in a delta plainly has a parent. So membership in
+/// this set is equivalent to `shared_parent(root).is_some()`, and the layer
+/// index never has to be tracked.
+///
+/// Size is bounded by change × depth rather than by state: the delta layers'
+/// shared keys, not the base's.
+fn moved_roots(layers: &LayeredBase) -> HashSet<NodeId> {
+    let mut moved = HashSet::new();
+    for i in 1..layers.layers() {
+        let layer = layers.layer(i);
+        for k in 0..layer.shared_len() {
+            moved.insert(layer.shared_pair_at(k).0);
+        }
+    }
+    moved
+}
+
 /// Merge the layers' registry runs into one sorted, deduped, fully-resolved
-/// blob. Returns `(entries, corrections)`.
-fn compact_registry(layers: &LayeredBase) -> (Bytes, (u64, u64)) {
-    // Pass 1: find the entries whose root moved. Only these break sort order,
-    // and there are O(change) of them rather than O(state).
+/// blob. Returns `(entries, corrections, moved_root_set_len)`.
+fn compact_registry(layers: &LayeredBase) -> (Bytes, (u64, u64, u64)) {
+    let moved = moved_roots(layers);
+
+    // Pass 1: collect the entries whose root moved — the only ones that break
+    // sort order. Resolving is now paid for on those alone (~1% of entries)
+    // instead of on all of them.
     let mut corrections: Vec<(NodeId, ScopeId)> = Vec::new();
     for_each_registry_entry(layers, &mut |root, scope| {
-        let live = layers.shared_parent(root).unwrap_or(root);
-        if live != root {
+        if moved.contains(&root) {
+            let live = layers.shared_parent(root).unwrap_or(root);
             corrections.push((live, scope));
         }
     });
@@ -146,7 +237,8 @@ fn compact_registry(layers: &LayeredBase) -> (Bytes, (u64, u64)) {
     corrections.dedup();
     let correction_count = corrections.len() as u64;
 
-    // Pass 2: merge the in-order entries with the sorted corrections.
+    // Pass 2: merge the in-order entries with the sorted corrections. A hash
+    // probe per entry, no resolution.
     let mut buf = BytesMut::new();
     buf.put_u64_le(0);
     let mut count = 0u64;
@@ -164,15 +256,14 @@ fn compact_registry(layers: &LayeredBase) -> (Bytes, (u64, u64)) {
         *count += 1;
     };
     for_each_registry_entry(layers, &mut |root, scope| {
-        let live = layers.shared_parent(root).unwrap_or(root);
-        if live != root {
+        if moved.contains(&root) {
             return; // handled as a correction
         }
-        while ci < corrections.len() && corrections[ci] <= (live, scope) {
+        while ci < corrections.len() && corrections[ci] <= (root, scope) {
             push(corrections[ci], &mut buf, &mut count);
             ci += 1;
         }
-        push((live, scope), &mut buf, &mut count);
+        push((root, scope), &mut buf, &mut count);
     });
     while ci < corrections.len() {
         push(corrections[ci], &mut buf, &mut count);
@@ -180,7 +271,7 @@ fn compact_registry(layers: &LayeredBase) -> (Bytes, (u64, u64)) {
     }
 
     buf[..8].copy_from_slice(&count.to_le_bytes());
-    (buf.freeze(), (count, correction_count))
+    (buf.freeze(), (count, correction_count, moved.len() as u64))
 }
 
 /// Visit every registry entry across all layers in ascending `(root, scope)`
@@ -349,6 +440,94 @@ mod tests {
                 assert!(
                     originally,
                     "compaction invented a registration of scope {scope} on root {root}"
+                );
+            }
+        }
+    }
+
+    /// The optimization the registry merge now rests on: membership in the
+    /// delta layers' shared keys must be **exactly** equivalent to
+    /// `shared_parent(root).is_some()` for every root the registry carries.
+    ///
+    /// If it ever diverges, corrections are silently missed or invented and the
+    /// compacted registry is wrong — so assert the equivalence directly rather
+    /// than trusting the argument in `moved_roots`'s doc comment.
+    #[test]
+    fn moved_root_set_is_equivalent_to_probing_every_root() {
+        const NODES: u64 = 400;
+        const SCOPES: [u32; 4] = [1, 2, 3, 4];
+        let dir = tempfile::tempdir().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x0311_00AD);
+
+        let forest = ScopedForest::new();
+        let mut layers: Vec<Arc<PuffinBase>> = Vec::new();
+        for round in 0..6u64 {
+            for _ in 0..250 {
+                let visibility = if rng.random_range(0..100) < 35 {
+                    Visibility::Global
+                } else {
+                    Visibility::Scoped(smallvec::smallvec![
+                        SCOPES[rng.random_range(0..SCOPES.len())]
+                    ])
+                };
+                forest.apply(&EdgeEvent {
+                    src: rng.random_range(0..NODES),
+                    dst: rng.random_range(0..NODES),
+                    visibility,
+                    event_time_ms: 0,
+                    props: None,
+                });
+            }
+            let mut writer = codec::BlobWriter::new(round + 1);
+            let name = format!("eq-{round}");
+            let dir_path = dir.path().to_path_buf();
+            let stack = layers.clone();
+            layers = forest
+                .fold_delta(&mut writer, |w, _| {
+                    let layer = write_layer(&dir_path, &name, &w.finish());
+                    let mut next = stack;
+                    next.push(layer);
+                    let base: Arc<dyn RoutingBase> =
+                        Arc::new(LayeredBase::from_layers(next.clone()).unwrap());
+                    anyhow::Ok((base, next))
+                })
+                .unwrap();
+        }
+
+        let stack = LayeredBase::from_layers(layers).unwrap();
+        let moved = moved_roots(&stack);
+        assert!(!moved.is_empty(), "the test built no absorbed roots");
+
+        // Over every root the registry actually carries, the cheap test and the
+        // expensive one must agree.
+        let mut seen = 0usize;
+        let mut agreed_moved = 0usize;
+        for_each_registry_entry(&stack, &mut |root, _scope| {
+            let by_probe = stack.shared_parent(root).is_some();
+            let by_set = moved.contains(&root);
+            assert_eq!(
+                by_set, by_probe,
+                "root {root}: moved-set says {by_set}, shared_parent says {by_probe}"
+            );
+            seen += 1;
+            if by_probe {
+                agreed_moved += 1;
+            }
+        });
+        assert!(seen > 200, "expected a substantial registry, saw {seen}");
+        assert!(
+            agreed_moved > 0,
+            "no registry root had moved, so the equivalence was never exercised \
+             on the interesting side"
+        );
+
+        // And over the whole id space, not just roots the registry holds — the
+        // set must not claim nodes that have no parent.
+        for node in 0..NODES {
+            if moved.contains(&node) {
+                assert!(
+                    stack.shared_parent(node).is_some(),
+                    "moved set claims {node} moved but it has no parent"
                 );
             }
         }

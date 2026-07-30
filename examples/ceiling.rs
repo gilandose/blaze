@@ -155,13 +155,14 @@ fn main() {
             }
             println!(
                 "  -> compacted {} layers in {:.1}s: {} shared + {} overlay pairs, \
-                 {} registry ({} corrections), {:.2} GB",
+                 {} registry ({} corrections, {} moved-root set), {:.2} GB",
                 s.base.layers(),
                 last_compact_s,
                 cstats.shared_pairs,
                 cstats.overlay_pairs,
                 cstats.registry_entries,
                 cstats.registry_corrections,
+                cstats.moved_roots,
                 bytes.len() as f64 / 1e9
             );
             stack = Some(Stack {
