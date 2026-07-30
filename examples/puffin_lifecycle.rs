@@ -57,6 +57,8 @@ async fn main() -> anyhow::Result<()> {
         // forest all-RAM and never fold.
         base_dir: None,
         fold_after_links: u64::MAX,
+        max_delta_layers: usize::MAX,
+        layers: parking_lot::Mutex::new(None),
     };
 
     // --- Cycle 1: a global merge plus tenant-scoped edges ---

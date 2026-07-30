@@ -9,6 +9,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::BTreeMap;
 
 use crate::core::{ForestSnapshot, NodeId, ScopeId, ScopedForest, SnapshotSink};
+use crate::storage::filter::BlockedFilter;
 use crate::storage::puffin::Blob;
 
 pub const GLOBAL_BLOB_TYPE: &str = "blaze-global-dsu-v1";
@@ -21,6 +22,12 @@ pub const SCOPE_ID_PROP: &str = "scope-id";
 /// Payload: `u64 LE` entry count, then `count` × (`u64 LE` root,
 /// `u32 LE` scope), sorted by `(root, scope)` — fixed 12-byte stride.
 pub const REGISTRY_BLOB_TYPE: &str = "blaze-registry-v1";
+/// Blocked membership filters over a layer's keys, so a layer that does not hold
+/// a key can say so without a binary search. Old readers ignore these blob
+/// types, and a layer written without them still resolves correctly — the
+/// reader just falls back to searching. See `storage::filter`.
+pub const SHARED_FILTER_BLOB_TYPE: &str = "blaze-shared-filter-v1";
+pub const OVERLAY_FILTER_BLOB_TYPE: &str = "blaze-overlay-filter-v1";
 
 fn encode_pairs(pairs: &[(NodeId, NodeId)]) -> Bytes {
     let mut sorted: Vec<_> = pairs.to_vec();
@@ -131,6 +138,34 @@ pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64) -> Vec<Blob> {
             sequence_number: seq,
         });
     }
+    // Same filters the streaming writer emits, so both paths produce the same
+    // file and a snapshot-built layer is not slower to read than a folded one.
+    let overlay_keys: usize = snap.scopes.iter().map(|(_, p)| p.len()).sum();
+    for (blob_type, filter) in [
+        (
+            SHARED_FILTER_BLOB_TYPE,
+            BlockedFilter::build(snap.global.iter().map(|(k, _)| *k), snap.global.len()),
+        ),
+        (
+            OVERLAY_FILTER_BLOB_TYPE,
+            BlockedFilter::build(
+                snap.scopes.iter().flat_map(|(s, pairs)| {
+                    pairs
+                        .iter()
+                        .map(move |(k, _)| crate::storage::filter::overlay_key(*s, *k))
+                }),
+                overlay_keys,
+            ),
+        ),
+    ] {
+        blobs.push(Blob {
+            blob_type: blob_type.into(),
+            data: filter.encode(),
+            properties: BTreeMap::new(),
+            snapshot_id: seq,
+            sequence_number: seq,
+        });
+    }
     blobs
 }
 
@@ -162,6 +197,23 @@ fn open_table() -> BytesMut {
     buf
 }
 
+/// Walk a `(u64 node, u64 root)` payload. Used to derive filters from a table
+/// that has already been encoded, rather than keeping a second copy of the keys.
+pub(crate) fn table_keys(data: &[u8]) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+    let count = if data.len() >= 8 {
+        u64::from_le_bytes(data[..8].try_into().unwrap()) as usize
+    } else {
+        0
+    };
+    (0..count).map(move |i| {
+        let at = 8 + i * 16;
+        (
+            u64::from_le_bytes(data[at..at + 8].try_into().unwrap()),
+            u64::from_le_bytes(data[at + 8..at + 16].try_into().unwrap()),
+        )
+    })
+}
+
 fn close_table(mut buf: BytesMut, count: u64) -> Bytes {
     buf[..8].copy_from_slice(&count.to_le_bytes());
     buf.freeze()
@@ -190,18 +242,53 @@ impl BlobWriter {
     }
 
     /// Blob order matches [`snapshot_to_blobs`]: shared tier, scopes
-    /// ascending, then the registry index.
+    /// ascending, then the registry index, then the membership filters.
     pub fn finish(&mut self) -> Vec<Blob> {
-        let mut blobs = Vec::with_capacity(2 + self.scope_blobs.len());
+        let mut blobs = Vec::with_capacity(4 + self.scope_blobs.len());
         let shared = close_table(std::mem::take(&mut self.shared), self.shared_pairs);
+        // Filters are built by re-reading the payloads already in hand, so
+        // nothing extra is buffered and the key sets cannot drift from the
+        // tables they describe.
+        let shared_filter = BlockedFilter::build(
+            table_keys(&shared).map(|(k, _)| k),
+            self.shared_pairs as usize,
+        );
         blobs.push(self.blob(GLOBAL_BLOB_TYPE, shared, BTreeMap::new()));
+
+        let overlay_keys: usize = self
+            .scope_blobs
+            .iter()
+            .map(|b| table_keys(&b.data).count())
+            .sum();
+        let overlay_filter = BlockedFilter::build(
+            self.scope_blobs.iter().flat_map(|b| {
+                let scope: ScopeId = b
+                    .properties
+                    .get(SCOPE_ID_PROP)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                table_keys(&b.data).map(move |(k, _)| crate::storage::filter::overlay_key(scope, k))
+            }),
+            overlay_keys,
+        );
         blobs.append(&mut self.scope_blobs);
+
         self.registry.sort_unstable();
         self.registry.dedup();
         if !self.registry.is_empty() {
             let data = encode_registry(&self.registry);
             blobs.push(self.blob(REGISTRY_BLOB_TYPE, data, BTreeMap::new()));
         }
+        blobs.push(self.blob(
+            SHARED_FILTER_BLOB_TYPE,
+            shared_filter.encode(),
+            BTreeMap::new(),
+        ));
+        blobs.push(self.blob(
+            OVERLAY_FILTER_BLOB_TYPE,
+            overlay_filter.encode(),
+            BTreeMap::new(),
+        ));
         blobs
     }
 }

@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 use crate::core::base::{BaseStats, RoutingBase, ScopeList};
 use crate::core::{NodeId, ScopeId};
 use crate::storage::codec;
+use crate::storage::filter::{BlockedFilter, overlay_key};
 use crate::storage::puffin;
 
 const PAIR_STRIDE: usize = 16;
@@ -44,8 +45,9 @@ const PAGE_BYTES: usize = 4096;
 /// however the payload happens to be aligned inside the Puffin file.
 ///
 /// Cost is one `u64` per block: `8/PAGE_BYTES × stride` of the table's own
-/// size, i.e. 0.4% for pair tables (~62 MB indexing a 16 GB shared tier) and
-/// 0.3% for the registry.
+/// size — 8 bytes per 4 KiB block, i.e. **0.2%** for every table regardless of
+/// stride, so ~32 MB indexes a 16 GB shared tier. (Measured: 0.2 MB for a
+/// 113 MB base.)
 #[derive(Debug)]
 struct SparseIndex {
     /// Entries per block.
@@ -234,6 +236,15 @@ pub struct PuffinBase {
     /// Populated only when the file predates the registry blob: rebuilt at
     /// load time so runtime lookups stay O(1)-ish either way.
     fallback_registry: Option<HashMap<NodeId, ScopeList>>,
+    /// Membership filters over this layer's keys, read into the heap at open
+    /// time. They must be resident to be worth anything — the point is to answer
+    /// a miss from one cache line instead of a binary search over the mapping, so
+    /// leaving them mmap'd would just trade a page fault for a page fault.
+    ///
+    /// `None` for layers written before filters existed; a lookup then falls back
+    /// to searching, which is correct and merely slower.
+    shared_filter: Option<BlockedFilter>,
+    overlay_filter: Option<BlockedFilter>,
     sequence: u64,
 }
 
@@ -260,6 +271,8 @@ impl PuffinBase {
         let mut shared = None;
         let mut overlays = BTreeMap::new();
         let mut registry = None;
+        let mut shared_filter = None;
+        let mut overlay_filter = None;
         let mut sequence = 0u64;
         for blob in &index {
             sequence = sequence.max(blob.sequence_number.max(0) as u64);
@@ -280,6 +293,12 @@ impl PuffinBase {
                 codec::REGISTRY_BLOB_TYPE => {
                     registry = Some(RegistryTable::parse(&mmap, blob.range())?);
                 }
+                codec::SHARED_FILTER_BLOB_TYPE => {
+                    shared_filter = Some(BlockedFilter::decode(&mmap[blob.range()])?);
+                }
+                codec::OVERLAY_FILTER_BLOB_TYPE => {
+                    overlay_filter = Some(BlockedFilter::decode(&mmap[blob.range()])?);
+                }
                 // Unknown blob types are ignored (forward compatibility).
                 _ => {}
             }
@@ -291,6 +310,8 @@ impl PuffinBase {
             overlays,
             registry,
             fallback_registry: None,
+            shared_filter,
+            overlay_filter,
             sequence,
         };
         if base.registry.is_none() && !base.overlays.is_empty() {
@@ -352,9 +373,59 @@ impl PuffinBase {
         }
     }
 
-    /// Heap held by the sparse indexes — the one part of the base that is
-    /// *not* free to map, so it belongs in stats rather than in the shadows.
+    /// Number of pairs in the shared table.
+    pub fn shared_len(&self) -> usize {
+        self.shared.as_ref().map(|t| t.count).unwrap_or(0)
+    }
+
+    /// `i`th shared pair in ascending key order. Positional access is what lets
+    /// [`super::layered::LayeredBase`] k-way merge several layers without
+    /// buffering any of them.
+    pub fn shared_pair_at(&self, i: usize) -> (NodeId, NodeId) {
+        let t = self.shared.as_ref().expect("shared table");
+        (t.key_at(&self.mmap, i), t.value_at(&self.mmap, i))
+    }
+
+    pub fn overlay_len(&self, scope: ScopeId) -> usize {
+        self.overlays.get(&scope).map(|t| t.count).unwrap_or(0)
+    }
+
+    pub fn overlay_pair_at(&self, scope: ScopeId, i: usize) -> (NodeId, NodeId) {
+        let t = self.overlays.get(&scope).expect("overlay table");
+        (t.key_at(&self.mmap, i), t.value_at(&self.mmap, i))
+    }
+
+    /// Entries in this layer's `root -> scope` registry blob.
+    pub fn registry_len(&self) -> usize {
+        self.registry.as_ref().map(|t| t.count).unwrap_or(0)
+    }
+
+    /// `i`th registry entry, in the blob's stored `(root, scope)` order.
+    ///
+    /// Ordered access matters: compaction merges the layers' registries as
+    /// sorted runs rather than sorting a copy of them, which is what keeps it
+    /// off an O(state) buffer.
+    pub fn registry_at(&self, i: usize) -> (NodeId, ScopeId) {
+        let t = self.registry.as_ref().expect("registry table");
+        (t.root_at(&self.mmap, i), t.scope_at(&self.mmap, i))
+    }
+
+    /// Heap held by the sparse indexes and the membership filters — the parts of
+    /// a layer that are *not* free to map, so they belong in stats rather than in
+    /// the shadows.
     fn index_bytes(&self) -> u64 {
+        self.table_index_bytes() + self.filter_bytes()
+    }
+
+    fn filter_bytes(&self) -> u64 {
+        self.shared_filter
+            .iter()
+            .chain(self.overlay_filter.iter())
+            .map(|f| f.heap_bytes() as u64)
+            .sum()
+    }
+
+    fn table_index_bytes(&self) -> u64 {
         let pair = self
             .shared
             .iter()
@@ -369,10 +440,22 @@ impl PuffinBase {
 
 impl RoutingBase for PuffinBase {
     fn shared_parent(&self, node: NodeId) -> Option<NodeId> {
+        // A negative filter answer is definitive, and costs one cache line
+        // instead of a narrowed binary search over the mapping.
+        if let Some(f) = &self.shared_filter
+            && !f.may_contain(node)
+        {
+            return None;
+        }
         self.shared.as_ref()?.lookup(&self.mmap, node)
     }
 
     fn overlay_parent(&self, scope: ScopeId, node: NodeId) -> Option<NodeId> {
+        if let Some(f) = &self.overlay_filter
+            && !f.may_contain(overlay_key(scope, node))
+        {
+            return None;
+        }
         self.overlays.get(&scope)?.lookup(&self.mmap, node)
     }
 

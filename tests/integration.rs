@@ -60,6 +60,8 @@ fn make_flusher(
         // into and nowhere to fold it.
         base_dir: None,
         fold_after_links: u64::MAX,
+        max_delta_layers: usize::MAX,
+        layers: parking_lot::Mutex::new(None),
     });
     (flusher, catalog)
 }

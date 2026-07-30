@@ -1,12 +1,37 @@
 # 001 — Delta snapshots & compaction
 
-> **Now the top priority, and load-bearing rather than merely nice.** 003
-> shipped, which means compaction no longer materializes state (streamed) *and*
-> the memtable is folded into a fresh base while the worker runs — so heap is
-> bounded. But the fold rewrites the whole base, so it pays the exact cost this
-> design removes: measured 2.95 s of ingest stall for a 125 MB base, extrapolating
-> to tens of minutes at the target profile. Everything below applies unchanged;
-> the delta chain is what turns a fold from O(state) into O(memtable).
+> **Status: implemented** (`src/storage/layered.rs`, `ScopedForest::fold_delta`,
+> `SnapshotMeta::base_sequence`). A flush now commits only what changed, and a
+> fold appends a layer instead of rewriting the base. Measured on the 3M-link
+> probe: a fold of 300k links drops from **3113 ms / 125 MB written** to
+> **~400 ms / 12.5 MB** — 7.7× faster, 10× fewer bytes.
+>
+> **The cost it introduces, measured rather than assumed**: a lookup that misses
+> probes every layer, ~0.26 µs each on top of a ~0.8 µs base probe (0.81 µs at
+> base-only → 1.87 µs with three deltas). `--max-delta-layers` is that dial and
+> defaults to 24, i.e. ~7 µs lookups and compaction roughly every 24 minutes.
+> The fix that removes the trade rather than balancing it is a **per-layer
+> membership filter written as a Puffin blob at fold time** — a miss then costs a
+> RAM probe instead of a binary search, and building it at write time keeps cold
+> start O(blobs) rather than O(pairs). That is the next piece of work here.
+>
+> **Two deviations from the design below**, both deliberate:
+>
+> - *No `DirtySet`.* Because every fold empties the memtable, the memtable's key
+>   set already **is** the set of nodes re-rooted since the last fold, and each
+>   key's composed root is its final value. Tracking dirtiness separately would
+>   add a structure that can drift out of step with the data it describes. (Path
+>   compression adds a few keys that are semantically unchanged — redundant,
+>   never wrong.)
+> - *No new blob types.* A delta's payload is byte-identical in form to a base's
+>   — sorted, fully-resolved pairs — so `blaze-*-dsu-v1` is reused and
+>   `SnapshotMeta.base_sequence` records which commits are bases. One reader
+>   path, and old catalogs (no `base_sequence`) still read correctly as
+>   self-contained bases.
+>
+> Storage-side compaction (below) is *partly* here: `LayeredBase` k-way merges
+> the layers, so the compaction read never buffers state. It still runs under the
+> union lock on a worker rather than as a separate job.
 
 ## Problem
 

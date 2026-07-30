@@ -73,6 +73,7 @@ fn main() {
     // Streaming with a sink that counts and drops: compaction's own footprint,
     // with the unavoidable output removed. This is the allocation that goes
     // from ~57 MB here to ~32 GB at 2B links if it is not streamed.
+    #[derive(Debug)]
     struct Counting(usize);
     impl blaze::core::SnapshotSink for Counting {
         fn shared_pair(&mut self, _n: u64, _r: u64) {
@@ -243,7 +244,88 @@ fn main() {
         Q as f64 / post,
         post * 1e6 / Q as f64
     );
+
+    // --- the same drain, as a delta layer instead of a base rewrite ---
+    // Same memtable, same correctness, but the base is appended to rather than
+    // rewritten: this is the whole of design 001 in one comparison.
+    let mut layered = Arc::new(blaze::storage::LayeredBase::new(Arc::new(
+        PuffinBase::open(&path).unwrap(),
+    )));
+    let delta_forest = ScopedForest::with_base(layered.clone());
+    let mut w = StdRng::seed_from_u64(31);
+    let mut delta_dir_files = Vec::new();
+    for round in 0..3 {
+        for _ in 0..300_000 {
+            delta_forest.apply(&EdgeEvent {
+                src: w.random_range(0..NODES),
+                dst: w.random_range(0..NODES),
+                visibility: Visibility::Scoped(smallvec::smallvec![w.random_range(1..=SCOPES)]),
+                event_time_ms: 0,
+                props: None,
+            });
+        }
+        let grown = delta_forest.memtable_links();
+        let dpath = std::env::temp_dir().join(format!("blaze-probe-delta-{round}.puffin"));
+        let t = Instant::now();
+        let mut writer = codec::BlobWriter::new(10 + round);
+        let (len, next) = delta_forest
+            .fold_delta(&mut writer, |sink, _| {
+                let bytes = puffin::write(&sink.finish(), BTreeMap::new());
+                std::fs::write(&dpath, &bytes)?;
+                let mapped = Arc::new(PuffinBase::open(&dpath)?);
+                let next = Arc::new(layered.pushed(mapped));
+                anyhow::Ok((
+                    next.clone() as Arc<dyn RoutingBase>,
+                    (bytes.len(), next.clone()),
+                ))
+            })
+            .unwrap();
+        layered = next;
+        delta_dir_files.push(dpath);
+        println!(
+            "delta fold {}: {} links -> 0 in {:>5.0} ms, {:>4.1} MB written ({} layers)",
+            round,
+            grown,
+            t.elapsed().as_secs_f64() * 1000.0,
+            len as f64 / 1e6,
+            layered.layers()
+        );
+        assert_eq!(delta_forest.memtable_links(), 0);
+    }
+    let mut q = StdRng::seed_from_u64(11);
+    let t = Instant::now();
+    let mut sink = 0u64;
+    for _ in 0..Q {
+        sink += delta_forest.scope_root(q.random_range(0..=SCOPES), q.random_range(0..NODES));
+    }
+    let layered_secs = t.elapsed().as_secs_f64();
+    std::hint::black_box(sink);
+    println!(
+        "base + 3 deltas: {:>9.0} lookups/s   ({:.2} us each)",
+        Q as f64 / layered_secs,
+        layered_secs * 1e6 / Q as f64
+    );
+
+    // --- compaction through the layer stack ---
+    // This is the real compaction path now, and the one cost that still scales
+    // with total state: it k-way merges every layer and re-resolves each key.
+    let before = rss_mb();
+    let t = Instant::now();
+    let mut counting = Counting(0);
+    delta_forest.compact_into(&mut counting);
+    let layered_compact = t.elapsed().as_secs_f64();
+    println!(
+        "compaction through base + 3 deltas: {:.0} ms for {} pairs ({:.2} us/pair), +{:.0} MB heap",
+        layered_compact * 1000.0,
+        counting.0,
+        layered_compact * 1e6 / counting.0 as f64,
+        rss_mb() - before
+    );
+
     std::fs::remove_file(&fold_path).ok();
+    for f in delta_dir_files {
+        std::fs::remove_file(f).ok();
+    }
     // RAM-mode cold start for comparison: parse every blob and rebuild the
     // whole forest in the heap.
     let t = Instant::now();

@@ -348,7 +348,7 @@ one block, and only then touches the mapping — over 4 KiB of *contiguous*
 bytes, so 1–2 mapped pages regardless of how the payload is aligned inside the
 Puffin file. `narrowed_search_reads_at_most_one_block` pins that bound as a
 test, because a probe whose base fits in page cache cannot observe it. The
-index costs one `u64` per block: 0.4% of the table it indexes, so ~62 MB to
+index costs one `u64` per block: 0.2% of the table it indexes, so ~32 MB to
 index a 16 GB shared tier, reported as `index_bytes` in `/stats`. The mapping
 is also advised `MADV_RANDOM`, since default readahead prefetches pages a
 binary search will never visit — except during a compaction sweep, which
@@ -382,13 +382,77 @@ is freed when the last such reader drops it. Queries are never blocked, and
 `queries_see_no_torn_state_while_folding` runs four reader threads through a
 live fold to keep it that way.
 
-**What the fold costs, plainly:** it rewrites the whole base, so ingest stalls
-for time proportional to *total state*, not to what was folded — measured below
-at 2.95 s for a 125 MB base, and the Puffin bytes are buffered in RAM while it
-happens. That is fine for bases of a few GB and untenable at 50 GB, which is
-why a fold slower than 5 s logs a warning naming the two ways out: raise the
-trigger, or land [design 001](docs/design/001-delta-snapshots.md) so a fold
-writes only the delta and becomes O(memtable) in both time and bytes.
+### Folds append; they don't rewrite (design 001)
+
+A fold that rewrites the base costs time and bytes proportional to *total
+state* — 3113 ms and 125 MB for a 125 MB base, which extrapolates badly. So a
+fold instead writes only what the memtable itself contributes, as a **new layer**
+over the mappings already open: measured **~400 ms and 12.5 MB** for the same
+300k links. That file is also what the leader commits, so a flush publishes a
+delta rather than the whole map.
+
+**The memtable is the dirty set.** Nothing tracks what changed, because every
+fold empties the memtable — so its key set already *is* the nodes re-rooted
+since the last fold, and each key's composed root is its final value. A separate
+dirty-set structure would only add something that can drift out of step with the
+data it describes.
+
+`LayeredBase` presents base + deltas as one `RoutingBase`, and lookups stay exact
+because **layer keys are disjoint**: every layer is produced by resolving through
+everything beneath it, so its keys are composed roots of the layers below. At
+most one layer holds a parent for a node, and following that parent can only
+continue in a *newer* layer — so a resolution visits each layer at most once.
+Compaction k-way merges the layers, which is what keeps the compaction read from
+buffering anything.
+
+### What layer depth actually costs
+
+Measured on identical state, varying only the number of layers it was folded
+into (`examples/layer_depth.rs`, 8M links / 3000 scopes):
+
+| layers | ingest/s | vs 1 layer | lookup µs | vs 1 layer |
+|---|---|---|---|---|
+| 1 | 252,969 | 1.00× | 1.22 | 1.00× |
+| 2 | 170,318 | 1.49× | 2.12 | 1.73× |
+| 4 | 112,005 | 2.26× | 3.85 | 3.16× |
+| 8 | 63,733 | 3.97× | 7.44 | 6.10× |
+| 16 | 43,643 | 5.80× | 10.79 | 8.84× |
+
+Depth taxes **three** paths, not one, and an earlier draft of this document got
+two of them wrong:
+
+- **Queries**: ~+0.65 µs per layer.
+- **Ingest**: ~+1.3 µs per link per layer, because `apply` resolves its operands
+  through the composed path before touching the memtable. Appending a layer is
+  trivial; every write *after* that pays for it. This was previously described as
+  "trivial (append)".
+- **Folds**: `stream_memtable` resolves every memtable key, so a fold is
+  **O(memtable × layers)**, not O(memtable). Observed in the ceiling run as fold
+  time rising 6.5 s → 26.5 s across depth 0 → 6 for a constant 5M-link memtable
+  and a constant 185 MB of output.
+
+Both per-layer costs are linear in depth, which is what the O(layers) resolution
+predicts — but the constant is ~2× what a smaller probe suggested (0.65 vs
+0.26 µs), because a wider node space misses cache more.
+
+`--max-delta-layers` is the dial, defaulting to 24. For the production profile
+that default is fine: 50 links/s is 0.1% of even the depth-24 ingest capacity, and
+~16 µs lookups are far inside the SLO. For a **backfill**, where ingest rate is
+the whole point, it is badly wrong — see the backfill note below.
+
+The fix that removes the trade rather than balancing it is a per-layer membership
+filter, so a miss costs one probe instead of a binary search per layer. It should
+be a *blocked* filter (all of a key's bits in one cache line): a classical bloom
+with k=7 over a 6 MB filter is ~7 cache misses, no better than the binary search
+it replaces. With that, depth stops mattering much and compaction can be rare —
+which is why this now outranks tiering on ratio, though tiering is still needed to
+stop depth growing without bound.
+
+A worker whose newest layer was folded **locally but never committed** (any
+follower, or a leader that lost a commit race) must not then commit a delta: the
+committed chain would be missing those layers, and a cold start would silently
+reconstruct incomplete topology. Such a worker compacts and commits a full base
+instead — `LocalLayers::committed_through` tracks it and a test pins it.
 
 ### Compaction streams; it never materializes
 
@@ -411,8 +475,10 @@ Measured (3M links / 3000 scopes / 113 MB base, release build):
 | `scope_root` lookups/s (1 thread) | 2.78M (0.36 µs) | 1.30M (0.77 µs) |
 | Compaction, heap above the output | +57 MB (3.2M-pair snapshot) | **+0 MB** (streamed) |
 | Compaction wall time | 1432 ms (collect) | **756 ms** (stream) |
-| Fold: 300k memtable links → 0 | n/a | 2950 ms ingest stall, 125 MB rewritten |
-| Lookups/s after a fold | — | 1.37M (0.73 µs) — unchanged |
+| Fold 300k links, rewriting the base | n/a | 3113 ms, 125 MB written |
+| Fold 300k links, as a delta layer | n/a | **~400 ms, 12.5 MB written** |
+| Lookups/s, base only | — | 1.23M (0.81 µs) |
+| Lookups/s, base + 3 delta layers | — | 534k (1.87 µs); see the depth table for the attributed per-layer cost |
 
 Cold start is O(blob count) rather than O(pairs), so the gap widens linearly
 with state — the reason a multi-gigabyte base serves in milliseconds. Warm
@@ -426,23 +492,137 @@ is read-only.
 
 What still scales with state, named so it is not mistaken for solved:
 
-- **The fold's stall and write amplification** — it rewrites the whole base
-  (above). The single biggest reason to land design 001 next.
+- **Compaction**, which still rewrites everything, though it no longer holds the
+  union lock (`storage::compact` merges the committed files instead).
+- **Read *and write* amplification per delta layer** (~0.65 µs per lookup,
+  ~1.3 µs per link ingested, and folds at O(memtable × layers)) until per-layer
+  membership filters land. Measured above.
 - **The Puffin file itself**, buffered in RAM before it is written and
   uploaded. Streaming it to disk and doing a multipart upload would remove
   this; it is only invisible today because a fold already dominates.
-- **The sparse index**, ~0.4% of the base — the deliberate price of bounding
+- **The sparse index**, ~0.2% of the base — the deliberate price of bounding
   cold-page faults.
 - **The registry buffer built during compaction**, 12 bytes per overlay
   endpoint, because it must be sorted by root *across* scopes and so cannot
   stream without an external sort.
 
+## Scaling to billions of links
+
+Extrapolated from the measured per-unit constants above, not estimated:
+**1.068 pairs per link**, **35.9 B/pair** in the base file (16 B pair + ~20 B of
+registry), **0.2%** sparse index, **3.4 µs/pair** to compact at depth 8, and
+**160 B/link** if held in RAM instead. Ingest depends on layer depth — 253k
+links/s at one layer down to 44k at eight — so there is no single figure; see the
+depth table above.
+
+Sizing target: **~50 links/s average, ~2k/s peak**, mostly arriving as a backfill
+of historic edges.
+
+| links | pairs | base file | heap | RSS if all-RAM | one compaction, 1 core |
+|---|---|---|---|---|---|
+| 145M (**measured**) | 155M | 5.4 GB | ~0.9 GB | 23 GB | 6.3 min |
+| 1B | 1.07B | 38 GB | ~1 GB | 160 GB | ~1 h |
+| 2B | 2.14B | 75 GB | ~1.2 GB | 320 GB | ~2 h |
+
+The 145M row is measured (`examples/ceiling.rs`, 4-core / 15 GB / 17 GB disk box,
+fold every 5M links, compact at 8 layers); the rest extrapolate from constants it
+validated — **35.9 B/pair** on disk and **3.4 µs/pair** to compact at depth 8,
+both stable across three compactions.
+
+### The measured ceiling: flat compaction is O(N²)
+
+145M links in **56.2 minutes**, stopped by the disk guard (a compaction needs room
+for the old and new base at once). Three compactions along the way:
+
+| # | pairs merged | time | µs/pair | registry entries | corrections | output |
+|---|---|---|---|---|---|---|
+| 1 | 40.4M | 136.8 s | 3.39 | 68.0M | 359,223 (0.53%) | 1.46 GB |
+| 2 | 76.5M | 263.4 s | 3.44 | 127.5M | 1,000,104 (0.78%) | 2.75 GB |
+| 3 | 113.2M | 376.8 s | 3.33 | 187.0M | 1,658,017 (0.89%) | 4.06 GB |
+
+Per-pair cost is flat, and state grows linearly per cycle — so each compaction
+costs linearly more than the last, and **the total over a backfill is quadratic**.
+Concretely at 2B links with this configuration: ~57 compaction cycles whose costs
+sum to **~58 hours**, against ~13 hours of ingest. Compaction would be 82% of wall
+clock. That is the ceiling, and it is why
+[tiered compaction](docs/design/006-tiered-compaction.md) is not an optimization
+but a precondition: it turns O(N²) total merge work into O(N log N).
+
+Effective end-to-end throughput was **43k links/s** including folds and
+compactions — not the 308k/s the DSU sustains with no base attached.
+
+Two things the run confirmed as designed:
+
+- **Ingest at a given depth is stable as state grows** (depth 7: 46.8k → 44.3k →
+  47.0k links/s across the three cycles), so the slowdown really is depth, not
+  size — the controlled result reproduced at 3× the scale.
+- **The bounded-corrections registry merge holds.** Under 1% of entries needed
+  re-sorting, so ~20 MB was buffered where collect-and-sort would have needed
+  2.2 GB. Note the fraction is *drifting up* (0.53 → 0.78 → 0.89%) as scopes come
+  to reference more roots each; the absolute buffer stays small, but it is not a
+  constant and deserves the metric it now has.
+
+**Heap is flat; RSS is not, and the difference matters.** Anonymous memory stays
+~0.9 GB at 145M links (memtable at the fold trigger, sparse indexes, Arrow
+buffer). But measured RSS reached **8.4 GB against a 5.4 GB base**, because
+compaction reads the base end to end and those file-backed pages stay resident
+until the kernel evicts them. They are clean and reclaimable, so this is the page
+cache doing its job rather than a leak — but an earlier draft of this section
+claimed "~300 MB resident at 2B links", and that is only true of the heap. In
+practice RSS climbs toward `min(base size, available RAM)`, and a compaction will
+evict the query working set while it runs.
+
+**Steady-state writes are flat**, because they scale with change, not state:
+~7.6 MB per tick at 50 links/s whatever the base weighs, ~11 GB/day of deltas.
+
+**Local disk**: provision ~2× the base, since compaction holds both. The run
+stopped at a 5.4 GB base with 11.5 GB free for exactly that reason.
+
+### Where it actually breaks — sized to the real workload
+
+The workload is **~50 links/s average, ~2k/s peak**, with the bulk of the data
+arriving as a **backfill of historic edges**. That changes which cost hurts, and
+two conclusions an earlier draft of this section got wrong are worth stating
+directly:
+
+- **Compaction stall duration is not the problem.** Queries never take the union
+  lock, so a stall delays only ingest. At 50/s a 30-minute compaction queues ~90k
+  events (~5 MB of Arrow buffer) and offsets are the source of truth — a lag
+  spike, not an outage. Frequency and write amplification are what matter.
+- **Low change rate is what breaks the layer stack**, not high. Compacting on
+  layer count (60) fires hourly and rewrites a 75 GB base to absorb 7.5 MB;
+  compacting on delta bytes (25% of base) fires every ~120 days, by which point
+  ~173,000 runs are in the stack. No setting fixes both, because a single flat run
+  of deltas is the wrong shape.
+
+So the real next step is **[size-tiered compaction](docs/design/006-tiered-compaction.md)**:
+runs grow ~10× per level, layer count stays logarithmic (~6–8 runs), and write
+amplification is O(log N) per link instead of O(state) per compaction. Full-base
+merges become months-apart events, which demotes both remaining O(state) items —
+001's storage-side compaction and the in-RAM Puffin buffer — off the critical
+path.
+
+**Backfill is already tractable.** Measured single-node ingest is **357k links/s**
+through the DSU and **308k/s** with Arrow buffering (`examples/throughput.rs`), so
+2B links is **~1.8 hours**. Memory during a backfill is bounded by the fold
+trigger rather than by state: `--fold-after-links 20000000` holds ~3 GB and folds
+~100 times. Call it 2–3 hours on one node with single-digit GB of RAM.
+
+**Beyond, toward 10B+:** the registry restructure remains the best
+saving-to-effort ratio after tiering (55% of base bytes; ~30 GB at 2B, ~125 GB at
+10B). Note the shared tier is inherently single-writer — a merge can connect any
+two nodes, so union-find cannot be sharded by key range without distributed
+coordination — but 2k/s peak is ~0.6% of measured write capacity, so one writer
+serves 10B+ comfortably. [Design 002](docs/design/002-dense-interning.md)'s u32
+interning caps at 4.3B nodes and must not be used at this target; u64 or a packed
+u48. Nothing structural blocks 10B — it is tiering plus constant factors.
+
 ## Next phase
 
-Implementation-ready designs for the next phase — delta snapshots, dense id
-interning, the disk-backed routing base, and analytics enrichment — live in
-[docs/design/](docs/design/README.md), sized against the target production
-profile (~2B tracked nodes, ~3k events/s peak).
+Implementation-ready designs live in [docs/design/](docs/design/README.md).
+[006 tiered compaction](docs/design/006-tiered-compaction.md) is the current
+priority; [001 delta snapshots](docs/design/001-delta-snapshots.md) shipped its
+write path and retains storage-side compaction as follow-on work.
 
 ## Extension points
 
