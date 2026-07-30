@@ -251,6 +251,7 @@ impl Flusher {
             committer: self.worker_id.clone(),
             base_sequence,
             delta_chain_len: sequence - base_sequence,
+            runs: Vec::new(),
         };
         match self.catalog.commit(&meta).await? {
             CommitOutcome::Committed => {
@@ -362,6 +363,9 @@ impl Flusher {
             committer: self.worker_id.clone(),
             base_sequence: sequence,
             delta_chain_len: 0,
+            // Stage 1: the format exists, nothing populates it yet, so readers
+            // take the back-compat path and behaviour is unchanged.
+            runs: Vec::new(),
         };
         if self.catalog.commit(&meta).await? == CommitOutcome::Conflict {
             warn!(
