@@ -11,7 +11,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,7 +26,7 @@ use crate::storage::catalog::{
 };
 use crate::storage::compact::compact_layers;
 use crate::storage::layered::LayeredBase;
-use crate::storage::{codec, parquet_io, puffin};
+use crate::storage::{codec, parquet_io, puffin, tier};
 
 pub struct Flusher {
     pub forest: Arc<ScopedForest>,
@@ -43,9 +43,13 @@ pub struct Flusher {
     /// workers that are *not* committing — a leader folds every tick, since it
     /// has to produce a layer to commit anyway.
     pub fold_after_links: u64,
-    /// Compact once the base carries this many delta layers. Bounds both the
-    /// per-lookup layer scan and cold-start chain length.
+    /// Depth ceiling. Past this many runs, merge the lowest stretch available
+    /// even when no level is due — lookups and ingest both pay per run, and
+    /// cold-start fetches one file each.
     pub max_delta_layers: usize,
+    /// Runs per level before they merge into one run at the level above. See
+    /// [`tier::pick_merge`].
+    pub tier_fanout: usize,
     /// Local layer stack this worker serves from. Only the flush loop writes
     /// it, so a plain mutex around the bookkeeping is enough; the mapped state
     /// itself is shared immutably with the forest.
@@ -201,6 +205,33 @@ impl LocalLayers {
 /// cohort it chose to merge instead (design 006), at which point this goes away;
 /// until then nothing branches on `level`, which is what makes saturating at 255
 /// harmless rather than a silently wrong answer.
+/// The committed run set with `range` replaced by `merged`.
+///
+/// `None` if any run left in place is local-only, since the set would then name an
+/// object that does not exist.
+fn splice_run_set(
+    inputs: &[LocalRun],
+    range: Range<usize>,
+    merged: RunMeta,
+    sequence: u64,
+) -> Option<Vec<RunMeta>> {
+    let mut out = Vec::with_capacity(inputs.len() - range.len() + 1);
+    for run in &inputs[..range.start] {
+        out.push(run.meta(run.remote.clone()?));
+    }
+    out.push(merged);
+    for run in &inputs[range.end..] {
+        out.push(run.meta(run.remote.clone()?));
+    }
+    // This snapshot contributes no routing state of its own — no data files, the
+    // previous watermark — so whichever run ends up newest simply also describes
+    // `sequence`. Without that the set would leave a hole at its own sequence,
+    // and runs resolve by span, so a hole is a sequence belonging to no run.
+    out.last_mut()?.max_sequence = sequence;
+    Some(out)
+}
+
+/// Level for a run merged from `inputs`.
 fn merged_level(inputs: &[LocalRun]) -> u8 {
     match inputs.iter().map(|r| r.level).max() {
         // Nothing subsumed: the first fold on a fresh deployment is a level-0 run
@@ -442,21 +473,26 @@ impl Flusher {
         Ok(())
     }
 
-    /// Merge the layer chain into a single base **from storage**, and publish
-    /// it. Returns whether it did.
+    /// Merge whichever runs the tiering policy picks **from storage**, and
+    /// publish the result. Returns whether it did.
     ///
     /// This is the compaction that matters, and what makes it different from
     /// `ScopedForest::compact_and_fold` is what it does *not* touch: the inputs
     /// are immutable committed layer files that are already mapped, so no union
     /// lock is taken, the forest is never read, and ingest runs at full rate for
-    /// however many minutes the merge takes. At 2B links that is the difference
-    /// between a 32-minute ingest stall and none.
+    /// however long the merge takes. At 2B links that is the difference between a
+    /// 32-minute ingest stall and none.
+    ///
+    /// It merges a **subset** — see [`tier::pick_merge`] for the policy and
+    /// [`LayeredBase::slice`] for why a subset merge is sound — and splices the
+    /// result back at the position it came from. That is what makes total merge
+    /// work O(N log N) instead of the O(N²) a whole-base rewrite per cycle costs.
     ///
     /// It is published as its own snapshot carrying the **previous** watermark
     /// and no data files, because that is exactly what it covers: the merged
-    /// layers, not the memtable, which `swap_base` deliberately preserves. A
-    /// commit claiming this tick's watermark would tell a cold start that merges
-    /// still sitting in the memtable were durable, and replay would skip them.
+    /// runs, not the memtable, which `swap_base` deliberately preserves. A commit
+    /// claiming this tick's watermark would tell a cold start that merges still
+    /// sitting in the memtable were durable, and replay would skip them.
     async fn maybe_compact_chain(&self, sequence: u64, watermark: u64) -> anyhow::Result<bool> {
         let Some(dir) = &self.base_dir else {
             return Ok(false);
@@ -467,29 +503,35 @@ impl Flusher {
         }) else {
             return Ok(false);
         };
-        if stack.delta_count() + 1 < self.max_delta_layers {
+        // A local-only run in the stack cannot be named in a committed run set,
+        // and a partial merge would leave one there. Decline; `fold` handles that
+        // case by merging the whole stack into one self-contained run.
+        if inputs.iter().any(|r| r.remote.is_none()) {
             return Ok(false);
         }
+        let levels: Vec<u8> = inputs.iter().map(|r| r.level).collect();
+        let Some(range) = tier::pick_merge(&levels, self.tier_fanout, self.max_delta_layers) else {
+            return Ok(false);
+        };
 
         let started = std::time::Instant::now();
         let path = dir.join(format!(
-            "routing-{}-{sequence:012}-base.puffin",
-            self.worker_id
+            "routing-{}-{sequence:012}-L{}.puffin",
+            self.worker_id,
+            merged_level(&inputs[range.clone()])
         ));
-        // The merge is minutes of synchronous CPU and disk work. Left inline in
-        // an async fn it would occupy a tokio worker thread for the duration,
-        // costing the runtime a whole worker (the scheduler steals around it, so
-        // the API degrades rather than stalls, but it should not be there).
+        // The merge is synchronous CPU and disk work — minutes of it for a
+        // high-level merge. Left inline in an async fn it would occupy a tokio
+        // worker thread for the duration, costing the runtime a whole worker (the
+        // scheduler steals around it, so the API degrades rather than stalls, but
+        // it should not be there).
         //
-        // Note this does *not* yet let folds proceed during a compaction — the
-        // tick is still sequential, so the memtable grows for the merge's
-        // duration. Fixing that needs the compaction to run detached, which needs
-        // the catalog to describe a *set of runs* rather than one base plus a
-        // contiguous chain: a base merged from layers 0..k cannot be expressed as
-        // a base at a later sequence without discarding the deltas committed
-        // meanwhile. That format change is design 006's anyway, so the two land
-        // together.
-        let merge_stack = stack.clone();
+        // Note this still does not let folds proceed *during* a merge: the tick is
+        // sequential, so the memtable grows for its duration. Tiering makes that
+        // much less pressing — most merges are now L0->L1, which is megabytes —
+        // but the fix is to run the merge detached, which the run-set format has
+        // now unblocked.
+        let merge_stack = stack.slice(range.clone())?;
         let merge_path = path.clone();
         let meta = puffin_metadata(watermark);
         let (bytes, cstats) = tokio::task::spawn_blocking(move || {
@@ -502,9 +544,9 @@ impl Flusher {
         let merged_ms = started.elapsed().as_millis() as u64;
         let merged_bytes = bytes.len() as u64;
 
-        // Publish before adopting. An uncommitted base is a harmless orphan; a
-        // worker serving from a base the catalog does not know about would hand
-        // out topology that no cold start could reproduce.
+        // Publish before adopting. An uncommitted run is a harmless orphan; a
+        // worker serving from state the catalog does not know about would hand out
+        // topology that no cold start could reproduce.
         let puffin_path = self
             .table_prefix
             .clone()
@@ -515,16 +557,24 @@ impl Flusher {
             .await?;
         let merged = RunMeta {
             path: puffin_path.to_string(),
-            level: merged_level(&inputs),
-            min_sequence: inputs.first().map(|r| r.min_sequence).unwrap_or(sequence),
-            // The merge subsumes everything through the previous commit, and this
-            // snapshot contributes no routing state of its own — no data files,
-            // the previous watermark — so extending the span over `sequence`
-            // keeps run spans dense without claiming anything untrue.
-            max_sequence: sequence,
+            level: merged_level(&inputs[range.clone()]),
+            // Inherits the span of everything it subsumed, which is what fixes its
+            // place in the resolution order.
+            min_sequence: inputs[range.start].min_sequence,
+            max_sequence: inputs[range.end - 1].max_sequence,
             pairs: cstats.shared_pairs + cstats.overlay_pairs,
             bytes: merged_bytes,
         };
+        let Some(runs) = splice_run_set(&inputs, range.clone(), merged, sequence) else {
+            // Unreachable: every run was checked to have a remote above.
+            warn!(
+                sequence,
+                "run set became undescribable mid-merge; discarding"
+            );
+            let _ = std::fs::remove_file(&path);
+            return Ok(false);
+        };
+        let base_sequence = runs[0].max_sequence;
         let meta = SnapshotMeta {
             sequence,
             committed_at_ms: now_ms(),
@@ -532,9 +582,9 @@ impl Flusher {
             data_files: vec![],
             puffin_path: puffin_path.to_string(),
             committer: self.worker_id.clone(),
-            base_sequence: sequence,
-            delta_chain_len: 0,
-            runs: vec![merged.clone()],
+            base_sequence,
+            delta_chain_len: sequence - base_sequence,
+            runs: runs.clone(),
         };
         if self.catalog.commit(&meta).await? == CommitOutcome::Conflict {
             warn!(
@@ -545,31 +595,47 @@ impl Flusher {
             return Ok(false);
         }
 
-        let merged_layers = stack.layers();
-        let flat = Arc::new(LayeredBase::new(Arc::new(PuffinBase::open(&path)?)));
-        self.forest.swap_base(flat.clone());
-        let run = LocalRun::committed(&merged, path.clone(), flat.layer(0));
+        let merged_runs = range.len();
+        let merged_level = runs[range.start].level;
+        let spliced = Arc::new(stack.spliced(range.clone(), Arc::new(PuffinBase::open(&path)?))?);
+        self.forest.swap_base(spliced.clone());
+        // Local files in the spliced order: kept below, the merge, kept above.
+        let local_paths = inputs[..range.start]
+            .iter()
+            .map(|r| r.path.clone())
+            .chain(std::iter::once(path.clone()))
+            .chain(inputs[range.end..].iter().map(|r| r.path.clone()));
+        let next: Vec<LocalRun> = runs
+            .iter()
+            .zip(local_paths)
+            .enumerate()
+            .map(|(i, (meta, local))| LocalRun::committed(meta, local, spliced.layer(i)))
+            .collect();
+        let runs_now = next.len();
         *self.layers.lock() = Some(LocalLayers {
-            base: flat,
-            runs: vec![run],
+            base: spliced,
+            runs: next,
         });
-        // Unlinking a mapped file is safe: the mapping keeps the inode alive
-        // until the last query using it drops, and the space is reclaimed then.
-        for old in inputs.iter().map(|r| &r.path) {
+        // Only the runs the merge subsumed are gone. Unlinking a mapped file is
+        // safe: the mapping keeps the inode alive until the last query using it
+        // drops, and the space is reclaimed then.
+        for old in inputs[range].iter().map(|r| &r.path) {
             if let Err(e) = std::fs::remove_file(old) {
-                warn!(path = %old.display(), error = %e, "could not unlink merged layer");
+                warn!(path = %old.display(), error = %e, "could not unlink merged run");
             }
         }
         info!(
             sequence,
-            merged_layers,
+            merged_runs,
+            merged_level,
+            runs_now,
             shared_pairs = cstats.shared_pairs,
             overlay_pairs = cstats.overlay_pairs,
             registry_entries = cstats.registry_entries,
             registry_corrections = cstats.registry_corrections,
             moved_roots = cstats.moved_roots,
             merged_ms,
-            "compacted the layer chain from storage; ingest was never stalled"
+            "merged runs from storage; ingest was never stalled"
         );
         Ok(true)
     }

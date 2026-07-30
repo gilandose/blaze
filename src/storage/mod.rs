@@ -9,6 +9,7 @@ pub mod flush;
 pub mod layered;
 pub mod parquet_io;
 pub mod puffin;
+pub mod tier;
 
 pub use base::PuffinBase;
 pub use catalog::{CommitOutcome, DataFileMeta, RunMeta, RunSet, SnapshotCatalog, SnapshotMeta};
@@ -19,3 +20,4 @@ pub use flush::{
     hydrate_from_catalog, open_base_from_catalog,
 };
 pub use layered::LayeredBase;
+pub use tier::{DEFAULT_TIER_FANOUT, pick_merge};

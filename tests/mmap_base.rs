@@ -138,9 +138,9 @@ impl Warehouse {
             .await;
     }
 
-    /// One flush tick. The layer stack is carried across calls in `held`, the
-    /// way a long-lived worker's flusher carries its own — otherwise every tick
-    /// would look like a fresh worker and never produce a delta.
+    /// As `flush_tiered`, with tiering off: no level ever fills, so the only
+    /// merge trigger is the depth ceiling. That is what the flat policy did, so
+    /// tests written against it keep asserting exactly what they did before.
     async fn flush_layered(
         &self,
         forest: Arc<ScopedForest>,
@@ -149,6 +149,32 @@ impl Warehouse {
         fold_after: u64,
         leader: bool,
         max_delta_layers: usize,
+    ) {
+        self.flush_tiered(
+            forest,
+            first_offset,
+            events,
+            fold_after,
+            leader,
+            max_delta_layers,
+            usize::MAX,
+        )
+        .await;
+    }
+
+    /// One flush tick. The layer stack is carried across calls in `held`, the
+    /// way a long-lived worker's flusher carries its own — otherwise every tick
+    /// would look like a fresh worker and never produce a delta.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_tiered(
+        &self,
+        forest: Arc<ScopedForest>,
+        first_offset: u64,
+        events: &[EdgeEvent],
+        fold_after: u64,
+        leader: bool,
+        max_delta_layers: usize,
+        tier_fanout: usize,
     ) {
         let buffer = Arc::new(EdgeBuffer::new());
         for (i, e) in events.iter().enumerate() {
@@ -170,6 +196,7 @@ impl Warehouse {
             base_dir: Some(self.cache.path().to_path_buf()),
             fold_after_links: fold_after,
             max_delta_layers,
+            tier_fanout,
             layers: parking_lot::Mutex::new(self.held.lock().unwrap().take()),
         };
         flusher.tick().await.unwrap();
@@ -1023,6 +1050,124 @@ async fn a_worker_with_local_only_layers_commits_a_base_not_a_delta() {
     );
     assert!(cold.connected(GLOBAL_SCOPE, 0, 30));
     assert!(cold.connected(GLOBAL_SCOPE, 2_000, 2_005));
+}
+
+/// Runs must promote through levels, and every answer must survive it.
+///
+/// This is tiering itself. With a fanout of 3: three L0 runs merge into one L1,
+/// three L1s into one L2, and each merge takes a *contiguous subset* of the stack
+/// and splices the result back where it came from. That splice is the load-bearing
+/// part — a merged run resolves at the position its inputs held, not on top — and
+/// getting it wrong reorders resolution, which still returns plausible answers.
+///
+/// So the shape is asserted tick by tick, and then a cold start built purely from
+/// the committed run set is checked against the live forest that applied every
+/// event. Edges are chained within a tick and disjoint across ticks, so each tick
+/// forms one component and a reordered stack shows up as a wrong root.
+#[tokio::test]
+async fn runs_promote_through_levels_without_changing_answers() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+    const FANOUT: usize = 3;
+    const TICKS: u64 = 14;
+
+    let mut shapes = Vec::new();
+    for tick in 0..TICKS {
+        let events: Vec<EdgeEvent> = (0..8)
+            .map(|i| global_edge(tick * 100 + i, tick * 100 + i + 1))
+            .collect();
+        for e in &events {
+            forest.apply(e);
+        }
+        wh.flush_tiered(
+            forest.clone(),
+            offset,
+            &events,
+            u64::MAX,
+            true,
+            usize::MAX, // no depth ceiling: the level policy is what is under test
+            FANOUT,
+        )
+        .await;
+        offset += events.len() as u64;
+
+        let meta = wh.latest_meta().await;
+        let RunSet::Runs(runs) = meta.run_set() else {
+            panic!("tick {tick} committed no run set");
+        };
+        // Whatever the policy did, the set still has to be dense and cover this
+        // commit — a partial merge leaves runs above it that must stay adjacent.
+        assert_eq!(runs.first().unwrap().min_sequence, 1);
+        assert_eq!(runs.last().unwrap().max_sequence, meta.sequence);
+        for pair in runs.windows(2) {
+            assert!(
+                pair[0].adjacent_to(&pair[1]),
+                "tick {tick}: spans stopped being dense"
+            );
+        }
+        shapes.push(
+            runs.iter()
+                .map(|r| (r.level, r.min_sequence, r.max_sequence))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    assert_eq!(
+        shapes,
+        vec![
+            vec![(0, 1, 1)],
+            vec![(0, 1, 1), (0, 2, 2)],
+            vec![(0, 1, 1), (0, 2, 2), (0, 3, 3)],
+            // Three L0s are due, and the merge covers its own commit too.
+            vec![(1, 1, 4)],
+            vec![(1, 1, 4), (0, 5, 5)],
+            vec![(1, 1, 4), (0, 5, 5), (0, 6, 6)],
+            vec![(1, 1, 4), (0, 5, 5), (0, 6, 6), (0, 7, 7)],
+            // A *subset* merge: the L1 below is untouched and keeps its position.
+            vec![(1, 1, 4), (1, 5, 8)],
+            vec![(1, 1, 4), (1, 5, 8), (0, 9, 9)],
+            vec![(1, 1, 4), (1, 5, 8), (0, 9, 9), (0, 10, 10)],
+            vec![(1, 1, 4), (1, 5, 8), (0, 9, 9), (0, 10, 10), (0, 11, 11)],
+            vec![(1, 1, 4), (1, 5, 8), (1, 9, 12)],
+            // Three L1s now qualify, so they promote to one L2.
+            vec![(2, 1, 13)],
+            vec![(2, 1, 13), (0, 14, 14)],
+        ],
+        "levels must promote and merges must splice in place"
+    );
+    assert!(
+        shapes.iter().all(|s| s.len() <= 5),
+        "run count must stay bounded as commits accumulate"
+    );
+
+    // A cold start assembled from the run set alone must answer identically to
+    // the forest that applied every event.
+    let cold = tempfile::tempdir().unwrap();
+    let (base, _, local) = open_base_from_catalog(&wh.store, &wh.catalog, cold.path())
+        .await
+        .unwrap()
+        .expect("a committed snapshot");
+    assert_eq!(base.layers(), 2, "the L2 run plus one L0 delta");
+    assert!(local.fully_committed());
+    let cold = Arc::new(ScopedForest::with_base(base));
+    for tick in 0..TICKS {
+        for i in 0..=8u64 {
+            assert_eq!(
+                cold.scope_root(GLOBAL_SCOPE, tick * 100 + i),
+                forest.scope_root(GLOBAL_SCOPE, tick * 100 + i),
+                "tick {tick} node {i} diverged after promotion"
+            );
+        }
+        assert!(
+            cold.connected(GLOBAL_SCOPE, tick * 100, tick * 100 + 8),
+            "tick {tick}'s component was lost"
+        );
+        // Components must not have bled into each other across merges.
+        if tick + 1 < TICKS {
+            assert!(!cold.connected(GLOBAL_SCOPE, tick * 100, (tick + 1) * 100));
+        }
+    }
 }
 
 /// A catalog written before snapshots carried run sets must cold-start with no

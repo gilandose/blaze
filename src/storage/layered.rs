@@ -65,6 +65,54 @@ impl LayeredBase {
         self.layers.len() - 1
     }
 
+    /// The layers in `range` as a stack of their own — what a tiered merge reads.
+    ///
+    /// Merging a *subset* is sound, and the argument is worth spelling out
+    /// because it is what tiering rests on. Write `M` for the merge of
+    /// `L_i..=L_j`. Then:
+    ///
+    /// - **Order is preserved.** `M` takes position `i` in
+    ///   `[L_0..L_i-1, M, L_j+1..]`, and `M` is by construction equivalent to
+    ///   `L_i..=L_j`, so every resolution visits the same layers in the same
+    ///   order and reaches the same answer.
+    /// - **Keys stay disjoint.** `M`'s keys are the union of `L_i..=L_j`'s, which
+    ///   were already disjoint from each other and from every other layer's.
+    /// - **Resolution still advances monotonically.** A value in `M` is a
+    ///   composed root of `L_i..=L_j`, so it is some `L_m` value with `m <= j`,
+    ///   and an `L_m` value has no parent in `L_0..=L_m` — hence none in
+    ///   `L_0..=L_i-1`. Continuing at `i + 1` after a hit in `M` therefore cannot
+    ///   skip a parent.
+    ///
+    /// The third point is the one that would bite, and it is why a merged run may
+    /// be spliced back in at the position it came from rather than having to go
+    /// on top of the stack.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            range.end <= self.layers.len(),
+            "merge range {range:?} runs past the {} layers in the stack",
+            self.layers.len()
+        );
+        Self::from_layers(self.layers[range].to_vec())
+    }
+
+    /// This stack with `range` replaced by the single layer that merged it.
+    pub fn spliced(
+        &self,
+        range: std::ops::Range<usize>,
+        merged: Arc<PuffinBase>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            range.start < range.end && range.end <= self.layers.len(),
+            "splice range {range:?} does not name layers of the {} in the stack",
+            self.layers.len()
+        );
+        let mut layers = Vec::with_capacity(self.layers.len() - range.len() + 1);
+        layers.extend_from_slice(&self.layers[..range.start]);
+        layers.push(merged);
+        layers.extend_from_slice(&self.layers[range.end..]);
+        Self::from_layers(layers)
+    }
+
     pub fn layers(&self) -> usize {
         self.layers.len()
     }
@@ -344,5 +392,78 @@ mod tests {
     #[test]
     fn rejects_an_empty_layer_list() {
         assert!(LayeredBase::from_layers(vec![]).is_err());
+    }
+
+    /// A merged run spliced back in at its old position must resolve exactly as
+    /// the layers it replaced did — including when the value it hands back has a
+    /// parent in a layer *above* the splice.
+    ///
+    /// This is the case the monotonic-advance argument is for. Merging `L0..=L1`
+    /// gives `900 -> 105`, and 105 is re-rooted twice more above. Resolution has to
+    /// continue at the layer just past the splice: stopping there loses the newer
+    /// roots, and restarting from the bottom would rescan layers the merge already
+    /// composed.
+    #[test]
+    fn a_spliced_merge_resolves_like_the_layers_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = layer(dir.path(), "l0", &snap(&[(900, 500)], &[]), 1);
+        let l1 = layer(dir.path(), "l1", &snap(&[(500, 105)], &[]), 2);
+        let l2 = layer(dir.path(), "l2", &snap(&[(105, 40)], &[]), 3);
+        let l3 = layer(dir.path(), "l3", &snap(&[(40, 3)], &[]), 4);
+        let flat = LayeredBase::from_layers(vec![l0, l1, l2.clone(), l3.clone()]).unwrap();
+
+        // What merging L0..=L1 produces: every key resolved through those two.
+        let sub = flat.slice(0..2).unwrap();
+        let mut merged_pairs = Vec::new();
+        sub.for_each_shared_pair(&mut |k, v| merged_pairs.push((k, v)));
+        assert_eq!(merged_pairs, vec![(500, 105), (900, 105)]);
+        let merged = layer(
+            dir.path(),
+            "merged",
+            &snap(&merged_pairs, &[]),
+            2, // inherits the span of what it subsumed
+        );
+
+        let tiered = flat.spliced(0..2, merged).unwrap();
+        assert_eq!(tiered.layers(), 3, "two layers became one");
+        for node in [900, 500, 105, 40] {
+            assert_eq!(
+                tiered.shared_parent(node),
+                flat.shared_parent(node),
+                "node {node} resolved differently after the splice"
+            );
+            assert_eq!(tiered.shared_parent(node), Some(3));
+        }
+        assert_eq!(tiered.shared_parent(3), None);
+
+        // A splice in the *middle* keeps the layers on both sides in place, so
+        // resolution has to enter the merged run from below and leave it upward.
+        let sub = flat.slice(1..3).unwrap();
+        let mut mid_pairs = Vec::new();
+        sub.for_each_shared_pair(&mut |k, v| mid_pairs.push((k, v)));
+        assert_eq!(mid_pairs, vec![(105, 40), (500, 40)]);
+        let mid_merged = layer(dir.path(), "mid", &snap(&mid_pairs, &[]), 3);
+
+        let mid = flat.spliced(1..3, mid_merged).unwrap();
+        assert_eq!(mid.layers(), 3);
+        for node in [900, 500, 105, 40] {
+            assert_eq!(
+                mid.shared_parent(node),
+                Some(3),
+                "node {node} must still walk L0 -> merged -> L3"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slice_or_splice_past_the_stack_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = layer(dir.path(), "base", &snap(&[(900, 500)], &[]), 1);
+        let l = LayeredBase::new(base.clone());
+
+        assert!(l.slice(0..2).is_err(), "range past the end");
+        assert!(l.slice(0..0).is_err(), "empty slice has no base");
+        assert!(l.spliced(0..0, base.clone()).is_err(), "empty splice range");
+        assert!(l.spliced(0..2, base).is_err(), "range past the end");
     }
 }
