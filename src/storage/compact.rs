@@ -54,6 +54,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::core::{NodeId, RoutingBase, ScopeId};
 use crate::storage::codec;
+use crate::storage::filter::{self, BlockedFilter};
 use crate::storage::layered::LayeredBase;
 use crate::storage::puffin::Blob;
 
@@ -115,9 +116,10 @@ pub fn compact_layers(layers: &LayeredBase, sequence: u64) -> (Vec<Blob>, Compac
         stats.shared_pairs += 1;
     });
     shared[..8].copy_from_slice(&stats.shared_pairs.to_le_bytes());
+    let shared_payload = shared.freeze();
     blobs.push(blob(
         codec::GLOBAL_BLOB_TYPE,
-        shared.freeze(),
+        shared_payload.clone(),
         BTreeMap::new(),
     ));
 
@@ -126,12 +128,13 @@ pub fn compact_layers(layers: &LayeredBase, sequence: u64) -> (Vec<Blob>, Compac
     // compaction that parallelizes for free. Output stays in ascending scope
     // order because the scope list is sorted and chunks are recombined in order,
     // which keeps the result byte-identical to the sequential path.
-    for (scope, data, count) in merge_overlays(layers) {
+    let overlay_payloads = merge_overlays(layers);
+    for (scope, data, count) in &overlay_payloads {
         stats.overlay_pairs += count;
         stats.scopes += 1;
         blobs.push(blob(
             codec::SCOPE_BLOB_TYPE,
-            data,
+            data.clone(),
             BTreeMap::from([(codec::SCOPE_ID_PROP.into(), scope.to_string())]),
         ));
     }
@@ -143,6 +146,32 @@ pub fn compact_layers(layers: &LayeredBase, sequence: u64) -> (Vec<Blob>, Compac
     if stats.registry_entries > 0 {
         blobs.push(blob(codec::REGISTRY_BLOB_TYPE, registry, BTreeMap::new()));
     }
+
+    // A compacted base needs its own filters, or every lookup against it
+    // regresses to a binary search — the merged layer would be the one layer
+    // that cannot answer a miss cheaply. Built from the payloads just written,
+    // so the key sets cannot drift from the tables.
+    let shared_filter = BlockedFilter::build(
+        codec::table_keys(&shared_payload).map(|(k, _)| k),
+        stats.shared_pairs as usize,
+    );
+    let overlay_filter = BlockedFilter::build(
+        overlay_payloads.iter().flat_map(|(scope, data, _)| {
+            let scope = *scope;
+            codec::table_keys(data).map(move |(k, _)| filter::overlay_key(scope, k))
+        }),
+        stats.overlay_pairs as usize,
+    );
+    blobs.push(blob(
+        codec::SHARED_FILTER_BLOB_TYPE,
+        shared_filter.encode(),
+        BTreeMap::new(),
+    ));
+    blobs.push(blob(
+        codec::OVERLAY_FILTER_BLOB_TYPE,
+        overlay_filter.encode(),
+        BTreeMap::new(),
+    ));
 
     (blobs, stats)
 }
