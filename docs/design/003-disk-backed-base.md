@@ -1,5 +1,16 @@
 # 003 — Disk-backed routing base (LSM-in-time)
 
+> **Status: implemented** (`--routing-base disk`, `src/storage/base.rs`,
+> `src/core/base.rs`). Shipped: mmap'd base with binary-search lookups, the
+> composed base+memtable read *and* write paths, a `blaze-registry-v1` index
+> so fix-ups against base-resident roots cost one probe, local read-through
+> caching from object storage, and compaction that re-emits composed state.
+> Deferred: bloom filters over overlay membership (the registry blob covers
+> the same need for now) and pruning the memtable at compaction boundaries
+> beyond what a fresh base already does. Measured results are in
+> ARCHITECTURE.md; note this landed *before* 001/002, so the memtable is
+> bounded by flush cadence rather than by delta chains.
+
 ## Problem
 
 Even after 002, 2B links costs ~100 GB RAM, and cold start means
@@ -25,19 +36,25 @@ over base), now layered across the RAM/disk boundary:
 
 ```text
 scope_root(s, x):
-  g  = mem.global.find_ro(x)            # memtable first (newest info)
-  if g == x:                            # unknown to memtable ->
-      g = base.global.lookup(x) or x    #   consult base
-      g = mem.global.find_ro(g)         #   re-resolve: base root may have
-                                        #   merged further since compaction
-  ... same two-step for the scope overlay ...
+  g = mem.shared.find_ro(x)             # memtable first (newest info)
+  if g == x:                            # memtable knows nothing about x ->
+      g = mem.shared.find_ro(base.shared_parent(x) or x)   # probe base, then
+                                                           # refine downward
+  ... same two-step within scope s's overlay ...
 ```
 
-The re-resolve step is what makes the composition exact: a base pair gives
-the root *as of compaction*; the memtable knows anything newer. Roots only
-decrease (I2), so the chain is monotone: base answer → memtable refinement.
-This is the same stale-root reasoning already proven for scope fix-ups,
-applied in time.
+As implemented, one base probe plus one memtable walk is exact — no
+re-probing loop. Two facts make that true:
+
+1. **Every mutation composes before writing** (`apply_*`, merge fix-ups and
+   `snapshot`), so a memtable key is always a *composed root*: a node the
+   base stores no parent for. Hence a node that already has a memtable parent
+   cannot also be in the base — the base probe is skippable in that case, and
+   a memtable walk can never land on a node needing another base probe.
+2. **Roots only decrease** (I2), so the base answer is a valid earlier
+   representative and the memtable refines it downward, never the reverse —
+   the same stale-root reasoning already proven for scope fix-ups, applied in
+   time rather than across tenants.
 
 ### Memtable contents & trimming
 

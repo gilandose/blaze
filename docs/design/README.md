@@ -26,7 +26,7 @@ Two consequences of this profile shape everything below:
 |---|---|---|---|
 | [001](001-delta-snapshots.md) | Delta snapshots & compaction | snapshot stall + payload | designed |
 | [002](002-dense-interning.md) | Dense id interning | memory (200→~45 B/link) | designed |
-| [003](003-disk-backed-base.md) | Disk-backed routing base (LSM) | memory + cold start | designed |
+| [003](003-disk-backed-base.md) | Disk-backed routing base (LSM) | memory + cold start | **implemented** |
 | [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed |
 | [005](005-union-tier.md) | Union tier (`all` view) & shared/global naming | semantics gap | designed |
 

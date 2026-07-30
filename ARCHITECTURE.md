@@ -306,6 +306,53 @@ Measured on the reference workload (15M events, 30M node space, 3000 scopes,
   snapshot with periodic full compaction, removing both the stall and the
   rewrite. That, or shard workers by node-id range.
 
+## Disk-backed routing base (`--routing-base disk`)
+
+Committed routing state can be served from an **mmap'd Puffin file on local
+disk** instead of the heap, making RAM cost O(hot window) instead of O(state).
+The Puffin payloads the flusher already writes are sorted, fixed-stride
+`(node, root)` tables, so the same file is directly usable as an on-disk
+index: map it once, answer a lookup with a binary search over a byte range.
+
+```mermaid
+flowchart LR
+    OS[(Object storage<br/>committed Puffin)] -->|read-through cache| NV[["local NVMe<br/>routing-base-N.puffin"]]
+    NV -->|mmap, binary search| BASE["<b>base</b> (immutable)<br/>shared + per-scope + registry blobs"]
+    ING[Ingest since compaction] --> MEM["<b>memtable</b><br/>ScopedForest DSU maps"]
+    BASE --> C{{"composed_root(x) =<br/>memtable.find(base_root(x))"}}
+    MEM --> C
+    C --> Q[Query API]
+    MEM -->|compaction re-emits<br/>composed state| OS
+```
+
+**The invariant that makes it exact:** every mutation resolves its operands
+through the composed path *before* touching the memtable, so a memtable key is
+always a composed root — a node the base stores no parent for. That is why one
+base probe plus one memtable walk settles a lookup with no re-probing, and why
+a node that already has a memtable parent can skip the base entirely. It also
+means merge fix-ups must consult the base: a scope whose overlay class lives
+only on disk still has to be notified when a shared root it references is
+absorbed, which the base's `blaze-registry-v1` blob (`root -> scopes`, sorted,
+binary-searchable) answers in one probe. Snapshots taken from a base-backed
+forest re-resolve base pairs through the memtable, so each compaction emits the
+complete composed state and the next base subsumes both layers.
+
+Measured (3M links / 3000 scopes / 113 MB base, release build):
+
+| | all-RAM | mmap base |
+|---|---|---|
+| Cold start (to first correct answer) | 4374 ms (read+parse+hydrate) | **2.8 ms** (mmap + footer index) |
+| Resident for committed state | 479 MB | **51 MB** (touched pages; OS-reclaimable) |
+| `scope_root` lookups/s (1 thread) | 2.83M (0.35 µs) | 1.29M (0.78 µs) |
+
+Cold start is O(blob count) rather than O(pairs), so the gap widens linearly
+with state — the reason a multi-gigabyte base serves in milliseconds. The
+lookup cost roughly doubles on page-cached data and rises to ~10–50 µs on a
+cold NVMe page: still well inside the sub-millisecond SLO. Durability is
+unchanged (invariant I4): the local file is only ever a read-through cache of
+an object-storage snapshot, written to a temp path and renamed so a torn
+download can never be mapped, and the mapping is read-only.
+
 ## Next phase
 
 Implementation-ready designs for the next phase — delta snapshots, dense id

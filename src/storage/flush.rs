@@ -14,9 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use crate::core::ScopedForest;
+use crate::core::{RoutingBase, ScopedForest};
 use crate::ha::LeaderElector;
 use crate::ingest::EdgeBuffer;
+use crate::storage::base::PuffinBase;
 use crate::storage::catalog::{CommitOutcome, DataFileMeta, SnapshotCatalog, SnapshotMeta};
 use crate::storage::{codec, parquet_io, puffin};
 
@@ -143,6 +144,57 @@ impl Flusher {
         }
         Ok(())
     }
+}
+
+/// Open the latest committed routing snapshot as an mmap'd base on local
+/// disk, returning the base and the watermark to resume offsets from.
+///
+/// The Puffin object is cached under `data_dir` (a read-through cache of
+/// object storage — invariant I4 unchanged: losing the disk costs a
+/// re-download, never data). Startup cost is O(number of blobs), not
+/// O(pairs), so a multi-gigabyte base is serving queries in milliseconds
+/// instead of after a full hydration.
+pub async fn open_base_from_catalog(
+    store: &Arc<dyn ObjectStore>,
+    catalog: &SnapshotCatalog,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Option<(Arc<PuffinBase>, u64)>> {
+    let Some(latest) = catalog.latest().await? else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(data_dir)?;
+    // Snapshot artifacts are immutable, so a cached file for this sequence is
+    // always the right bytes; name it by sequence to keep that obvious.
+    let local = data_dir.join(format!("routing-base-{:012}.puffin", latest.sequence));
+    if !local.exists() {
+        let bytes = store
+            .get(&Path::from(latest.puffin_path.clone()))
+            .await?
+            .bytes()
+            .await?;
+        // Write to a temp path and rename so a torn download can never be
+        // mapped as a base.
+        let tmp = local.with_extension("puffin.partial");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &local)?;
+        info!(
+            sequence = latest.sequence,
+            bytes = bytes.len(),
+            path = %local.display(),
+            "cached routing base from object storage"
+        );
+    }
+    let base = Arc::new(PuffinBase::open(&local)?);
+    let stats = base.stats();
+    info!(
+        sequence = latest.sequence,
+        watermark = latest.watermark,
+        shared_pairs = stats.shared_pairs,
+        overlay_pairs = stats.overlay_pairs,
+        mapped_mb = stats.mapped_bytes / (1024 * 1024),
+        "opened mmap routing base"
+    );
+    Ok(Some((base, latest.watermark)))
 }
 
 /// Load the latest committed snapshot and hydrate in-memory state from its
