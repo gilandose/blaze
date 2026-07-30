@@ -253,7 +253,12 @@ impl Warehouse {
                 .join(format!("snap-{sequence:012}.json"));
             let bytes = self.store.get(&path).await.unwrap().bytes().await.unwrap();
             let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            json.as_object_mut().unwrap().remove("runs");
+            let obj = json.as_object_mut().unwrap();
+            obj.remove("runs");
+            // An old writer emitted no version either, and leaving one behind
+            // would make the snapshot claim a run set it does not carry — which
+            // the reader is now right to reject.
+            obj.remove("format_version");
             let payload = PutPayload::from(serde_json::to_vec(&json).unwrap());
             ObjectStoreExt::put(&*self.store, &path, payload)
                 .await
@@ -808,14 +813,16 @@ async fn compaction_fires_on_the_layer_trigger_and_resets_the_chain() {
             (1, 1, 0), // no base yet -> base
             (2, 1, 1), // delta
             (3, 1, 2), // delta
-            (4, 4, 0), // chain would hit MAX_LAYERS -> compact
-            (5, 4, 1), // delta on the new base
+            // Tick 4 hits MAX_LAYERS, so it merges at sequence 4 and then still
+            // commits its batch at 5 rather than holding it a whole interval.
+            (5, 4, 1),
+            (6, 4, 2), // delta on the merged run
         ],
         "chain must reset when compaction fires"
     );
 
-    // Every chain up to here is still readable, and the compacted base really
-    // did absorb the deltas below it.
+    // Every chain up to here is still readable, and the merged run really did
+    // absorb the deltas below it.
     let (cold, _) = wh.open_base_backed().await;
     for tick in 0..5u64 {
         assert!(
@@ -824,8 +831,8 @@ async fn compaction_fires_on_the_layer_trigger_and_resets_the_chain() {
         );
         assert_eq!(cold.scope_root(GLOBAL_SCOPE, tick * 100 + 20), tick * 100);
     }
-    // Only base + one delta are mapped after the reset.
-    assert_eq!(cold.base_stats().unwrap().sequence, 5);
+    // The merged run plus the two deltas committed after it.
+    assert_eq!(cold.base_stats().unwrap().sequence, 6);
 }
 
 /// Every commit must describe its state as a run set whose spans are dense and
@@ -861,7 +868,7 @@ async fn run_spans_stay_dense_across_a_compaction_cycle() {
         offset += events.len() as u64;
 
         let meta = wh.latest_meta().await;
-        let RunSet::Runs(runs) = meta.run_set() else {
+        let RunSet::Runs(runs) = meta.run_set().unwrap() else {
             panic!("tick {tick} committed no run set");
         };
 
@@ -909,10 +916,12 @@ async fn run_spans_stay_dense_across_a_compaction_cycle() {
             (1, vec![(0, 1, 1)]),
             (2, vec![(0, 1, 1), (0, 2, 2)]),
             (3, vec![(0, 1, 1), (0, 2, 2), (0, 3, 3)]),
-            // The merge inherits 1..=3 and extends over its own commit, so the
-            // set stays dense with no run left behind at 4.
-            (4, vec![(1, 1, 4)]),
+            // The merge inherits 1..=3 and extends over its own commit at 4, so
+            // the set stays dense with no run left behind at it. The tick then
+            // carries on and commits its batch at 5, which is why the sequence
+            // jumps: a merge no longer costs a whole interval of watermark.
             (5, vec![(1, 1, 4), (0, 5, 5)]),
+            (6, vec![(1, 1, 4), (0, 5, 5), (0, 6, 6)]),
         ],
         "run levels and spans across a merge"
     );
@@ -960,24 +969,45 @@ async fn storage_side_compaction_preserves_the_memtable() {
     wh.flush_layered(forest.clone(), offset, &orphans, u64::MAX, true, MAX_LAYERS)
         .await;
 
-    // The compaction happened, and it did *not* fold.
+    // The merge is its own commit at sequence 4, carrying no data: it covers the
+    // runs it read, not the memtable.
+    let merge = wh.catalog.get(4).await.unwrap();
+    assert!(merge.data_files.is_empty(), "a merge commits no data");
+    let RunSet::Runs(merged) = merge.run_set().unwrap() else {
+        panic!("the merge must publish a run set");
+    };
+    assert_eq!(
+        merged
+            .iter()
+            .map(|r| (r.level, r.min_sequence, r.max_sequence))
+            .collect::<Vec<_>>(),
+        vec![(1, 1, 4)],
+        "the merge subsumed the whole chain into one run"
+    );
+
+    // The tick then *continues* and commits this batch at sequence 5, so exactly
+    // one fold happened — the ordinary end-of-tick one, after the merge, never
+    // as part of it. Two folds, or a memtable already empty at merge time, would
+    // mean the merge had swept it.
     let meta = wh.latest_meta().await;
     assert_eq!(
         (meta.sequence, meta.base_sequence, meta.delta_chain_len),
-        (4, 4, 0),
-        "the chain should have been compacted into a fresh base"
+        (5, 4, 1),
+        "the batch follows the merge rather than waiting a whole interval"
     );
     assert_eq!(
         forest.stats().folds,
-        folds_before,
-        "storage-side compaction must not fold the memtable"
+        folds_before + 1,
+        "storage-side compaction must not fold; only the tick's own fold may"
     );
-    assert_eq!(
-        forest.memtable_links(),
-        pending,
-        "the memtable must survive compaction untouched"
+    assert!(
+        !meta.data_files.is_empty(),
+        "the merge tick must not hold the batch back"
     );
-    assert!(meta.data_files.is_empty(), "a compaction commits no data");
+    // The orphan merges reached storage in that delta rather than being lost,
+    // which is what would happen if the merge had drained the memtable and then
+    // lost its commit race.
+    assert_eq!(pending, 10);
 
     // Both halves still answer: the compacted base, and the preserved memtable.
     for tick in 0..3u64 {
@@ -1093,7 +1123,7 @@ async fn runs_promote_through_levels_without_changing_answers() {
         offset += events.len() as u64;
 
         let meta = wh.latest_meta().await;
-        let RunSet::Runs(runs) = meta.run_set() else {
+        let RunSet::Runs(runs) = meta.run_set().unwrap() else {
             panic!("tick {tick} committed no run set");
         };
         // Whatever the policy did, the set still has to be dense and cover this
@@ -1119,20 +1149,23 @@ async fn runs_promote_through_levels_without_changing_answers() {
             vec![(0, 1, 1)],
             vec![(0, 1, 1), (0, 2, 2)],
             vec![(0, 1, 1), (0, 2, 2), (0, 3, 3)],
-            // Three L0s are due, and the merge covers its own commit too.
-            vec![(1, 1, 4)],
+            // Three L0s are due. The merge takes sequence 4 and covers its own
+            // commit; the tick then commits its batch as a delta at 5.
             vec![(1, 1, 4), (0, 5, 5)],
             vec![(1, 1, 4), (0, 5, 5), (0, 6, 6)],
             vec![(1, 1, 4), (0, 5, 5), (0, 6, 6), (0, 7, 7)],
             // A *subset* merge: the L1 below is untouched and keeps its position.
-            vec![(1, 1, 4), (1, 5, 8)],
             vec![(1, 1, 4), (1, 5, 8), (0, 9, 9)],
             vec![(1, 1, 4), (1, 5, 8), (0, 9, 9), (0, 10, 10)],
             vec![(1, 1, 4), (1, 5, 8), (0, 9, 9), (0, 10, 10), (0, 11, 11)],
-            vec![(1, 1, 4), (1, 5, 8), (1, 9, 12)],
-            // Three L1s now qualify, so they promote to one L2.
-            vec![(2, 1, 13)],
-            vec![(2, 1, 13), (0, 14, 14)],
+            vec![(1, 1, 4), (1, 5, 8), (1, 9, 12), (0, 13, 13)],
+            // Three L1s now qualify, so they promote to one L2. Note the run
+            // above the merge takes the span extension: it did not move, but it
+            // is now the newest, so it is the one that covers sequence 14.
+            vec![(2, 1, 12), (0, 13, 14), (0, 15, 15)],
+            vec![(2, 1, 12), (0, 13, 14), (0, 15, 15), (0, 16, 16)],
+            vec![(2, 1, 12), (1, 13, 17), (0, 18, 18)],
+            vec![(2, 1, 12), (1, 13, 17), (0, 18, 18), (0, 19, 19)],
         ],
         "levels must promote and merges must splice in place"
     );
@@ -1148,7 +1181,7 @@ async fn runs_promote_through_levels_without_changing_answers() {
         .await
         .unwrap()
         .expect("a committed snapshot");
-    assert_eq!(base.layers(), 2, "the L2 run plus one L0 delta");
+    assert_eq!(base.layers(), 4, "the L2 run, an L1, and two L0 deltas");
     assert!(local.fully_committed());
     let cold = Arc::new(ScopedForest::with_base(base));
     for tick in 0..TICKS {
@@ -1199,7 +1232,7 @@ async fn a_pre_run_set_catalog_still_cold_starts() {
     wh.downgrade_to_base_plus_chain(3).await;
     assert!(
         matches!(
-            wh.latest_meta().await.run_set(),
+            wh.latest_meta().await.run_set().unwrap(),
             RunSet::SequencesOnly(chain) if chain == (1..=3)
         ),
         "the downgraded catalog must read as a base plus a chain"
@@ -1254,7 +1287,7 @@ async fn a_missing_run_is_a_hard_error() {
     }
     let latest = wh.latest_meta().await;
     assert_eq!(latest.delta_chain_len, 2);
-    let RunSet::Runs(runs) = latest.run_set() else {
+    let RunSet::Runs(runs) = latest.run_set().unwrap() else {
         panic!("the run set is what this test is about");
     };
     assert_eq!(runs.len(), 3);

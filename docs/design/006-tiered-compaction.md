@@ -189,6 +189,41 @@ no parent in `L_0..=L_m` and hence none below the splice. The third is the one
 that would bite — without it, resolution would have to restart from the bottom
 after every hit, making lookups O(layers²).
 
+### The upgrade is one-way, and that is deliberate
+
+Old catalogs read on the new binary with no migration — an absent `runs` field
+synthesises a run set from `base_sequence` + `delta_chain_len`, and there is a
+test for it. **The reverse does not work, and cannot be made to.**
+
+A cold review of the implementation caught this, and it is worth stating exactly
+rather than softening. `base_sequence` + `delta_chain_len` describe one base
+followed by a contiguous chain. That is not a lossy description of a tiered stack;
+it is not a description of one at all, so there is no value of those fields a
+pre-run-set reader resolves correctly. Concretely: a merge that lands *below* the
+top of the stack keeps the span it subsumed, so it is published at a later
+sequence than its span ends. An old reader follows `chain()` to that sequence's
+`puffin_path`, gets a different and already-subsumed object, assembles the stack
+in the wrong order, and reports two merged components as disconnected. No error —
+`#[serde(default)]` makes the new JSON parse cleanly.
+
+Nor can an old reader be made to fail *loudly*. The obvious trick — a
+`base_sequence` past `sequence`, giving an empty chain — makes
+`open_base_from_catalog` error on an empty layer list, but makes
+`hydrate_from_catalog` iterate zero times and return a healthy watermark over an
+empty DSU. Silently worse. There is no single value that trips both paths.
+
+So the fields are written best-effort for a chain-shaped stack,
+`SnapshotMeta::format_version` marks the boundary, and the operational rule is:
+**once a tiered merge has been committed, roll forward, not back.** Nothing in
+this build reads the compatibility fields.
+
+What *is* now checked, on every read, is the run set's own shape.
+`SnapshotMeta::run_set` is fallible and rejects gaps, overlaps, backwards spans,
+and a newest run that does not cover the snapshot's own sequence. That validator
+existed as `RunMeta::adjacent_to`, was documented as guarding "the property that
+breaks quietly", was asserted in three tests — and was called from no production
+path at all until the review pointed it out.
+
 Two smaller decisions worth recording:
 
 - **Spans, not commit order, fix a run's place.** A merged run inherits the span
@@ -199,6 +234,19 @@ Two smaller decisions worth recording:
 - **The depth ceiling now merges the lowest stretch available**, rather than
   falling back to a full-base rewrite. It stays a bounded merge: any stretch of
   `fanout` or more would have been caught by the level rule first.
+- **A merge tick still commits its data batch**, at the sequence after the merge.
+  It used to return early, which was tolerable when a merge fired roughly one tick
+  in twenty-four; under tiering it fires on ~10% of ticks and up to three in a row,
+  so each early return was holding the watermark back for a whole interval — a 3x
+  worse worst-case recovery point, bought for a merge that took no lock and
+  touched no buffered data. Also from the review.
+- **Puffin objects carry a UUID**, as Parquet data files always have. Two workers
+  can both believe they hold the lease for a sequence — that is the race
+  `CommitOutcome::Conflict` settles — and both upload before either learns who
+  won. Sharing a key lets the loser overwrite the winner's object *after* the
+  winning commit, leaving a snapshot naming a run composed over a different stack.
+  The flat policy healed that within a compaction cycle; a tiered high-level run
+  can stay referenced for far longer.
 
 ## Backfill — corrected by measurement
 

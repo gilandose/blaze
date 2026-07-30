@@ -66,7 +66,25 @@ pub struct SnapshotMeta {
     /// [`SnapshotMeta::run_set`] rather than reading it directly.
     #[serde(default)]
     pub runs: Vec<RunMeta>,
+    /// Catalog format generation, `0` for anything written before run sets.
+    ///
+    /// **Reading a run-set catalog with a pre-run-set binary is not safe**, and
+    /// this field exists to name that rather than fix it. It cannot fix it: a
+    /// tiered stack is runs at several levels, which `base_sequence` +
+    /// `delta_chain_len` simply cannot describe, so there is no value of those
+    /// fields that an old reader resolves correctly. They are written on a
+    /// best-effort basis for a chain-shaped stack and are wrong for any other.
+    ///
+    /// An old binary ignores this field — that is the whole problem, and why the
+    /// upgrade is one-way. Once a tiered merge has been committed, roll forward,
+    /// not back. A new reader treats `format_version >= FORMAT_RUN_SETS` as a
+    /// promise that `runs` is populated and well-formed, and fails loudly if not.
+    #[serde(default)]
+    pub format_version: u32,
 }
+
+/// `format_version` for snapshots that describe themselves as a set of runs.
+pub const FORMAT_RUN_SETS: u32 = 1;
 
 /// One immutable run of routing pairs — a folded memtable, or the output of
 /// merging several runs.
@@ -127,13 +145,63 @@ impl SnapshotMeta {
     /// paths, because the old format only recorded the *newest* commit's Puffin
     /// path and a reader has to fetch each sequence's own snapshot to learn the
     /// rest; `sequences_only` says so explicitly rather than inventing paths.
-    pub fn run_set(&self) -> RunSet {
-        if !self.runs.is_empty() {
-            let mut runs = self.runs.clone();
-            runs.sort_by_key(|r| r.min_sequence);
-            return RunSet::Runs(runs);
+    ///
+    /// Fallible because the span structure is checked here, and it is checked here
+    /// because this is the one place every reader passes through. Runs resolve
+    /// oldest-span-first, so a gap means some sequence's state belongs to no run
+    /// and an overlap means two runs claim it — either way resolution order stops
+    /// being total, and the disjoint-keys argument stops holding. Nothing else
+    /// would notice: a malformed set assembles and answers just as cleanly as a
+    /// correct one, only wrongly. The cost is a walk of a handful of runs, once
+    /// per commit or cold start.
+    pub fn run_set(&self) -> anyhow::Result<RunSet> {
+        if self.format_version >= FORMAT_RUN_SETS {
+            anyhow::ensure!(
+                !self.runs.is_empty(),
+                "snapshot {} claims the run-set format but lists no runs",
+                self.sequence
+            );
         }
-        RunSet::SequencesOnly(self.chain())
+        if self.runs.is_empty() {
+            return Ok(RunSet::SequencesOnly(self.chain()));
+        }
+
+        let mut runs = self.runs.clone();
+        runs.sort_by_key(|r| r.min_sequence);
+        for run in &runs {
+            anyhow::ensure!(
+                run.min_sequence <= run.max_sequence,
+                "snapshot {}: run {} spans backwards ({}..={})",
+                self.sequence,
+                run.path,
+                run.min_sequence,
+                run.max_sequence
+            );
+        }
+        for pair in runs.windows(2) {
+            anyhow::ensure!(
+                pair[0].adjacent_to(&pair[1]),
+                "snapshot {}: runs {}..={} and {}..={} are not adjacent, so sequence order is \
+                 ambiguous",
+                self.sequence,
+                pair[0].min_sequence,
+                pair[0].max_sequence,
+                pair[1].min_sequence,
+                pair[1].max_sequence
+            );
+        }
+        // Note the *oldest* run is deliberately not required to start at 1: a
+        // worker that cold-started from a pre-run-set catalog inherits that
+        // catalog's base sequence, and everything below it is already inside that
+        // base.
+        let newest = runs.last().expect("non-empty");
+        anyhow::ensure!(
+            newest.max_sequence == self.sequence,
+            "snapshot {}: newest run ends at {}, so this commit's own sequence is in no run",
+            self.sequence,
+            newest.max_sequence
+        );
+        Ok(RunSet::Runs(runs))
     }
 }
 
@@ -276,6 +344,7 @@ mod tests {
             puffin_path: format!("puffin/dsu-{seq}.puffin"),
             committer: "test".into(),
             runs: Vec::new(),
+            format_version: 0,
             base_sequence: seq,
             delta_chain_len: 0,
         }
@@ -309,7 +378,7 @@ mod tests {
         }"#;
         let meta: SnapshotMeta = serde_json::from_str(json).unwrap();
         assert!(meta.runs.is_empty());
-        assert_eq!(meta.run_set(), RunSet::SequencesOnly(4..=7));
+        assert_eq!(meta.run_set().unwrap(), RunSet::SequencesOnly(4..=7));
     }
 
     /// Pre-delta snapshots recorded no `base_sequence` at all; each was its own
@@ -326,7 +395,7 @@ mod tests {
             "committer": "ancient"
         }"#;
         let meta: SnapshotMeta = serde_json::from_str(json).unwrap();
-        assert_eq!(meta.run_set(), RunSet::SequencesOnly(3..=3));
+        assert_eq!(meta.run_set().unwrap(), RunSet::SequencesOnly(3..=3));
     }
 
     /// Resolution order is by span, not by the order the runs happen to be
@@ -337,7 +406,7 @@ mod tests {
         let mut meta = snap(9, 900);
         meta.runs = vec![run(0, 9, 9), run(2, 1, 6), run(1, 7, 8)];
 
-        let RunSet::Runs(runs) = meta.run_set() else {
+        let RunSet::Runs(runs) = meta.run_set().unwrap() else {
             panic!("explicit runs must not fall back to the chain");
         };
         assert_eq!(
@@ -364,6 +433,54 @@ mod tests {
         assert!(!run(0, 1, 4).adjacent_to(&run(0, 4, 6)));
     }
 
+    /// A malformed run set must fail loudly, because nothing downstream would
+    /// notice. Runs resolve by span, so a gap leaves a sequence owned by no run
+    /// and an overlap has two runs claiming one — either way the order stops being
+    /// total, and the stack still assembles and still answers, just wrongly.
+    #[test]
+    fn a_malformed_run_set_is_rejected() {
+        let mut meta = snap(9, 900);
+        meta.format_version = FORMAT_RUN_SETS;
+
+        meta.runs = vec![run(0, 1, 4), run(0, 6, 9)];
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(err.contains("not adjacent"), "gap not caught: {err}");
+
+        meta.runs = vec![run(0, 1, 5), run(0, 4, 9)];
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(err.contains("not adjacent"), "overlap not caught: {err}");
+
+        meta.runs = vec![run(0, 1, 4), run(0, 5, 7)];
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(
+            err.contains("own sequence is in no run"),
+            "short set not caught: {err}"
+        );
+
+        meta.runs = vec![run(0, 6, 2)];
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(err.contains("spans backwards"), "got: {err}");
+
+        // The well-formed set it was nearly.
+        meta.runs = vec![run(1, 1, 4), run(0, 5, 9)];
+        assert!(meta.run_set().is_ok());
+    }
+
+    /// The format marker is the only thing distinguishing "written before run
+    /// sets" from "written by a run-set writer that emitted none", and those need
+    /// opposite handling: read the chain, or refuse.
+    #[test]
+    fn claiming_the_run_set_format_without_runs_is_corruption() {
+        let mut meta = snap(3, 300);
+        meta.format_version = FORMAT_RUN_SETS;
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(err.contains("lists no runs"), "got: {err}");
+
+        // Without the marker the same snapshot is simply an old one.
+        meta.format_version = 0;
+        assert_eq!(meta.run_set().unwrap(), RunSet::SequencesOnly(3..=3));
+    }
+
     #[tokio::test]
     async fn runs_survive_a_commit_round_trip() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -378,7 +495,7 @@ mod tests {
 
         let read = catalog.get(2).await.unwrap();
         assert_eq!(read.runs, meta.runs);
-        assert_eq!(read.run_set(), RunSet::Runs(meta.runs));
+        assert_eq!(read.run_set().unwrap(), RunSet::Runs(meta.runs));
     }
 
     #[tokio::test]

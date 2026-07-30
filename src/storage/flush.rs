@@ -135,16 +135,23 @@ impl LocalRun {
 }
 
 impl LocalLayers {
-    /// What the compatibility `SnapshotMeta::base_sequence` field reports.
+    /// Best-effort value for the compatibility `SnapshotMeta::base_sequence`
+    /// field. **It is not always truthful, and cannot be made so.**
     ///
-    /// Note this is the oldest run's `max_sequence`, not its `min_sequence`: the
-    /// old field names the sequence the base was *committed at*, while a span
-    /// says which sequences a run *covers*. The two agree because a run's span
-    /// always ends at the sequence it was committed at — a fold covers only its
-    /// own sequence, and a merge extends its span forward to the commit that
-    /// publishes it. Reading `min_sequence` here would report a merged base as
-    /// living at the first sequence it subsumed, which the old format takes to
-    /// mean the chain above it was never merged away.
+    /// The old field names the sequence a base was *committed at*, while a span
+    /// says which sequences a run *covers*. Those agree only while the stack is
+    /// chain-shaped: a fold covers its own sequence, and a merge that reaches the
+    /// top of the stack extends its span to the commit that publishes it. A
+    /// **tiered merge below the top** keeps the span it subsumed and is published
+    /// at a later sequence than its span ends, so the oldest run's `max_sequence`
+    /// is then not where that run lives, and an old reader following `chain()`
+    /// fetches a different, already-subsumed object.
+    ///
+    /// There is no value that fixes this, because `base_sequence` +
+    /// `delta_chain_len` cannot describe runs at several levels at all — see
+    /// [`SnapshotMeta::format_version`]. Nothing in this build reads these
+    /// fields; they are written so a chain-shaped catalog stays readable, and
+    /// `format_version` marks the point past which they should not be trusted.
     pub fn base_sequence(&self) -> u64 {
         self.runs.first().map(|r| r.max_sequence).unwrap_or(0)
     }
@@ -159,12 +166,6 @@ impl LocalLayers {
     /// therefore merge and commit a self-contained run instead.
     pub fn fully_committed(&self) -> bool {
         self.runs.iter().all(|r| r.remote.is_some())
-    }
-
-    /// Files backing the stack, oldest first — kept so a merge can unlink what
-    /// it subsumes.
-    pub fn paths(&self) -> Vec<PathBuf> {
-        self.runs.iter().map(|r| r.path.clone()).collect()
     }
 
     /// How the catalog should describe this stack, with `newest_remote` supplying
@@ -198,13 +199,53 @@ impl LocalLayers {
     }
 }
 
-/// Level for a run merged from `inputs`.
+/// `format_version` for a commit carrying `runs`.
 ///
-/// Flat compaction merges *everything*, so there is no cohort being promoted and
-/// this only counts merge generations. A tiered policy assigns the level from the
-/// cohort it chose to merge instead (design 006), at which point this goes away;
-/// until then nothing branches on `level`, which is what makes saturating at 255
-/// harmless rather than a silently wrong answer.
+/// Zero when the run set is empty — RAM mode, where the memtable *is* the state
+/// and every commit is a self-contained snapshot — so that a non-zero version is
+/// a reliable promise that `runs` is populated, and `SnapshotMeta::run_set` can
+/// treat a violation as corruption rather than as an old snapshot.
+fn run_set_format(runs: &[RunMeta]) -> u32 {
+    if runs.is_empty() {
+        0
+    } else {
+        crate::storage::catalog::FORMAT_RUN_SETS
+    }
+}
+
+/// Where a run's bytes live in object storage.
+///
+/// The UUID is not decoration. Two workers can each believe they hold the lease
+/// for the same sequence — that is exactly the race `CommitOutcome::Conflict`
+/// exists to settle — and both upload before either learns who won. Without a
+/// unique suffix they write the same key, so the loser can overwrite the winner's
+/// object *after* the winning commit, leaving a snapshot that names a run composed
+/// over a different stack. Parquet data files have always been named this way; this
+/// closes the same hole for Puffin.
+fn run_object_path(table_prefix: &Path, sequence: u64) -> Path {
+    table_prefix.clone().join("puffin").join(format!(
+        "dsu-{sequence:012}-{}.puffin",
+        uuid::Uuid::new_v4()
+    ))
+}
+
+/// Local cache filename for a run.
+///
+/// Keyed on the object path, not only the span, so two runs that cover the same
+/// sequences but hold different bytes — divergent local stacks after a lost commit
+/// race — cannot alias onto one cached file.
+fn run_cache_name(run: &RunMeta) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in run.path.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!(
+        "routing-run-{:012}-{:012}-{hash:016x}.puffin",
+        run.min_sequence, run.max_sequence
+    )
+}
+
 /// The committed run set with `range` replaced by `merged`.
 ///
 /// `None` if any run left in place is local-only, since the set would then name an
@@ -334,13 +375,14 @@ impl Flusher {
             }
         }
 
-        let sequence = latest.as_ref().map(|s| s.sequence + 1).unwrap_or(1);
+        let mut sequence = latest.as_ref().map(|s| s.sequence + 1).unwrap_or(1);
 
         if !self.elector.is_leader() {
             // Followers serve queries from the same structures the leader
             // does, so their memtable grows at exactly the same rate. Folding
             // only on the leader would relocate the leak, not fix it. These
-            // folds are local-only, which is why `committed_through` exists.
+            // folds are never committed, which is what `LocalLayers::
+            // fully_committed` exists to detect.
             self.fold(
                 sequence,
                 latest.as_ref().map(|s| s.watermark).unwrap_or(0),
@@ -349,15 +391,24 @@ impl Flusher {
             return Ok(());
         }
 
-        // Before anything else: if the layer chain has grown long, merge it
+        // Before anything else: if the tiering policy has a merge due, do it
         // from storage and publish the result as its own snapshot. That takes no
-        // union lock, so ingest runs throughout; this tick then ends and the
-        // next one commits its delta on top of the fresh base.
+        // union lock, so ingest runs throughout.
+        //
+        // The tick then *continues* and commits this batch at the next sequence.
+        // It used to return here, which was fine when a merge fired roughly one
+        // tick in twenty-four; under tiering it fires on ~10% of ticks and up to
+        // three in a row, and each one that returned early held back the
+        // watermark for a whole interval. Retained segments and a stalled
+        // watermark are the recovery-point objective, so a 3x worse worst case is
+        // not something to pay for a merge that took no lock and touched no
+        // buffered data.
         if self
             .maybe_compact_chain(sequence, latest.as_ref().map(|s| s.watermark).unwrap_or(0))
             .await?
         {
-            return Ok(());
+            // The merge took this sequence; the data batch follows at the next.
+            sequence += 1;
         }
 
         let segments = self.buffer.sealed_segments();
@@ -394,11 +445,7 @@ impl Flusher {
                 Layer::Base,
             ),
         };
-        let puffin_path = self
-            .table_prefix
-            .clone()
-            .join("puffin")
-            .join(format!("dsu-{sequence:012}.puffin"));
+        let puffin_path = run_object_path(&self.table_prefix, sequence);
         self.store
             .put(&puffin_path, PutPayload::from(puffin_bytes))
             .await?;
@@ -440,6 +487,7 @@ impl Flusher {
             committer: self.worker_id.clone(),
             base_sequence,
             delta_chain_len: sequence - base_sequence,
+            format_version: run_set_format(&runs),
             runs,
         };
         match self.catalog.commit(&meta).await? {
@@ -547,11 +595,7 @@ impl Flusher {
         // Publish before adopting. An uncommitted run is a harmless orphan; a
         // worker serving from state the catalog does not know about would hand out
         // topology that no cold start could reproduce.
-        let puffin_path = self
-            .table_prefix
-            .clone()
-            .join("puffin")
-            .join(format!("dsu-{sequence:012}.puffin"));
+        let puffin_path = run_object_path(&self.table_prefix, sequence);
         self.store
             .put(&puffin_path, PutPayload::from(bytes))
             .await?;
@@ -584,6 +628,7 @@ impl Flusher {
             committer: self.worker_id.clone(),
             base_sequence,
             delta_chain_len: sequence - base_sequence,
+            format_version: run_set_format(&runs),
             runs: runs.clone(),
         };
         if self.catalog.commit(&meta).await? == CommitOutcome::Conflict {
@@ -651,7 +696,7 @@ impl Flusher {
     /// base is appended to rather than rewritten. It becomes a full base when
     /// the chain is long enough to compact, when nothing has been mapped yet, or
     /// when this worker's newest layer is local-only (see
-    /// [`LocalLayers::committed_through`]).
+    /// [`LocalLayers::fully_committed`]).
     ///
     /// `force` = the caller is a leader that needs a layer to commit; otherwise
     /// the memtable-size trigger decides. Returns the Puffin bytes and how to
@@ -662,7 +707,7 @@ impl Flusher {
     /// A fold precedes the catalog commit, so a lost race leaves a local layer
     /// that was never committed. That is harmless — it encodes this worker's
     /// own composed state, which is correct regardless of who won — and the
-    /// `committed_through` check keeps it from being built on.
+    /// `fully_committed` check keeps it from being built on.
     fn fold(
         &self,
         sequence: u64,
@@ -905,7 +950,7 @@ async fn committed_runs(
     catalog: &SnapshotCatalog,
     latest: &SnapshotMeta,
 ) -> anyhow::Result<Vec<RunMeta>> {
-    match latest.run_set() {
+    match latest.run_set()? {
         RunSet::Runs(runs) => Ok(runs),
         RunSet::SequencesOnly(chain) => {
             let mut out = Vec::new();
@@ -929,22 +974,6 @@ async fn committed_runs(
             }
             Ok(out)
         }
-    }
-}
-
-/// Local cache filename for a run.
-///
-/// Single-sequence runs keep the historic name, so upgrading a worker does not
-/// invalidate its warm cache. Runs spanning several sequences only exist in the
-/// new format, so they are free to be named by their span.
-fn run_cache_name(run: &RunMeta) -> String {
-    if run.min_sequence == run.max_sequence {
-        format!("routing-layer-{:012}.puffin", run.min_sequence)
-    } else {
-        format!(
-            "routing-layer-{:012}-{:012}.puffin",
-            run.min_sequence, run.max_sequence
-        )
     }
 }
 
