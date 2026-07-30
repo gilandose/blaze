@@ -85,6 +85,8 @@ struct Warehouse {
     prefix: StorePath,
     _dir: tempfile::TempDir,
     cache: tempfile::TempDir,
+    /// The worker's layer stack, carried between ticks.
+    held: std::sync::Mutex<Option<blaze::storage::LocalLayers>>,
 }
 
 impl Warehouse {
@@ -100,6 +102,7 @@ impl Warehouse {
             prefix,
             _dir: dir,
             cache: tempfile::tempdir().unwrap(),
+            held: std::sync::Mutex::new(None),
         }
     }
 
@@ -131,6 +134,22 @@ impl Warehouse {
         fold_after: u64,
         leader: bool,
     ) {
+        self.flush_layered(forest, first_offset, events, fold_after, leader, usize::MAX)
+            .await;
+    }
+
+    /// One flush tick. The layer stack is carried across calls in `held`, the
+    /// way a long-lived worker's flusher carries its own — otherwise every tick
+    /// would look like a fresh worker and never produce a delta.
+    async fn flush_layered(
+        &self,
+        forest: Arc<ScopedForest>,
+        first_offset: u64,
+        events: &[EdgeEvent],
+        fold_after: u64,
+        leader: bool,
+        max_delta_layers: usize,
+    ) {
         let buffer = Arc::new(EdgeBuffer::new());
         for (i, e) in events.iter().enumerate() {
             buffer.append(first_offset + i as u64, e);
@@ -150,18 +169,48 @@ impl Warehouse {
             .into(),
             base_dir: Some(self.cache.path().to_path_buf()),
             fold_after_links: fold_after,
+            max_delta_layers,
+            layers: parking_lot::Mutex::new(self.held.lock().unwrap().take()),
         };
         flusher.tick().await.unwrap();
+        *self.held.lock().unwrap() = flusher.layers.lock().take();
     }
 
     /// Cold-start a base-backed forest from the latest committed snapshot.
     async fn open_base_backed(&self) -> (Arc<ScopedForest>, u64) {
-        let (base, watermark) =
+        let (base, watermark, local) =
             open_base_from_catalog(&self.store, &self.catalog, self.cache.path())
                 .await
                 .unwrap()
                 .expect("a committed snapshot");
+        *self.held.lock().unwrap() = Some(local);
         (Arc::new(ScopedForest::with_base(base)), watermark)
+    }
+
+    async fn latest_meta(&self) -> blaze::storage::SnapshotMeta {
+        self.catalog.latest().await.unwrap().expect("a snapshot")
+    }
+
+    async fn puffin_len(&self, path: &str) -> usize {
+        use object_store::ObjectStoreExt;
+        self.store
+            .get(&StorePath::from(path))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .len()
+    }
+
+    async fn delete_snapshot_meta(&self, sequence: u64) {
+        use object_store::ObjectStoreExt;
+        let path = self
+            .prefix
+            .clone()
+            .join("metadata")
+            .join(format!("snap-{sequence:012}.json"));
+        ObjectStoreExt::delete(&*self.store, &path).await.unwrap();
     }
 }
 
@@ -569,6 +618,253 @@ async fn queries_see_no_torn_state_while_folding() {
     }
     assert_eq!(forest.stats().folds, 1);
     assert_eq!(forest.memtable_links(), 0);
+}
+
+/// The point of delta snapshots: successive flushes commit only what changed,
+/// so a tick's Puffin payload is a fraction of the base — and a cold start
+/// still reconstructs identical topology from base + chain.
+#[tokio::test]
+async fn flushes_commit_deltas_not_whole_bases() {
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    const NODES: u64 = 3_000;
+    let mut rng = StdRng::seed_from_u64(0xDE17A);
+    let wh = Warehouse::new();
+    let mut model = RefModel::default();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+
+    let batch = |rng: &mut StdRng, model: &mut RefModel, n: usize| {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (u, v) = (rng.random_range(0..NODES), rng.random_range(0..NODES));
+            let e = if rng.random_range(0..100) < 30 {
+                model.global_edges.push((u, v));
+                global_edge(u, v)
+            } else {
+                let s = rng.random_range(1..=12u32);
+                model.scope_edges.push((s, u, v));
+                scoped_edge(u, v, &[s])
+            };
+            forest.apply(&e);
+            out.push(e);
+        }
+        out
+    };
+
+    // Tick 1 has no base to layer over, so it must be a full base.
+    let first = batch(&mut rng, &mut model, 4_000);
+    wh.flush_layered(forest.clone(), offset, &first, u64::MAX, true, 60)
+        .await;
+    offset += first.len() as u64;
+    let base_meta = wh.latest_meta().await;
+    assert_eq!(base_meta.base_sequence, 1, "first commit is its own base");
+    assert_eq!(base_meta.delta_chain_len, 0);
+    let base_bytes = wh.puffin_len(&base_meta.puffin_path).await;
+
+    // Subsequent ticks add small deltas on top.
+    let mut delta_bytes = Vec::new();
+    for tick in 2..=5u64 {
+        let more = batch(&mut rng, &mut model, 60);
+        wh.flush_layered(forest.clone(), offset, &more, u64::MAX, true, 60)
+            .await;
+        offset += more.len() as u64;
+        let meta = wh.latest_meta().await;
+        assert_eq!(meta.sequence, tick);
+        assert_eq!(meta.base_sequence, 1, "tick {tick} must layer on base 1");
+        assert_eq!(meta.delta_chain_len, tick - 1);
+        delta_bytes.push(wh.puffin_len(&meta.puffin_path).await);
+    }
+
+    // A delta covering 60 events must be far smaller than a base covering
+    // thousands. This is the entire cost argument, so assert it rather than
+    // trusting it.
+    let biggest = *delta_bytes.iter().max().unwrap();
+    assert!(
+        biggest * 10 < base_bytes,
+        "delta {biggest} B should be an order of magnitude under base {base_bytes} B"
+    );
+
+    // Cold start over base + 4 deltas must agree with the model everywhere.
+    let (cold, watermark) = wh.open_base_backed().await;
+    assert_eq!(watermark, offset - 1);
+    for _ in 0..400 {
+        let (a, b) = (rng.random_range(0..NODES), rng.random_range(0..NODES));
+        let s = if rng.random_range(0..4) == 0 {
+            GLOBAL_SCOPE
+        } else {
+            rng.random_range(1..=12u32)
+        };
+        assert_eq!(
+            cold.connected(s, a, b),
+            model.connected(s, a, b),
+            "chain cold start diverged in scope {s} ({a},{b})"
+        );
+        assert_eq!(
+            cold.scope_root(s, a),
+            model.component_min(s, a),
+            "chain cold start root({a}) in scope {s} is not the component min"
+        );
+    }
+
+    // RAM mode replays the same chain by applying deltas in sequence order.
+    let ram = Arc::new(ScopedForest::new());
+    let ram_watermark = blaze::storage::hydrate_from_catalog(&ram, &wh.store, &wh.catalog)
+        .await
+        .unwrap();
+    assert_eq!(ram_watermark, watermark);
+    for _ in 0..400 {
+        let (a, b) = (rng.random_range(0..NODES), rng.random_range(0..NODES));
+        let s = rng.random_range(1..=12u32);
+        assert_eq!(ram.connected(s, a, b), model.connected(s, a, b));
+        assert_eq!(ram.scope_root(s, a), model.component_min(s, a));
+    }
+}
+
+/// Compaction has to fire on the layer trigger and reset the chain, or lookups
+/// pay an unbounded layer scan and cold starts an unbounded fetch.
+#[tokio::test]
+async fn compaction_fires_on_the_layer_trigger_and_resets_the_chain() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+    // Base at 1, deltas at 2 and 3, then tick 4 must compact.
+    const MAX_LAYERS: usize = 3;
+
+    let mut sequences = Vec::new();
+    for tick in 0..5u64 {
+        let events: Vec<EdgeEvent> = (0..20)
+            .map(|i| global_edge(tick * 100 + i, tick * 100 + i + 1))
+            .collect();
+        for e in &events {
+            forest.apply(e);
+        }
+        wh.flush_layered(forest.clone(), offset, &events, u64::MAX, true, MAX_LAYERS)
+            .await;
+        offset += events.len() as u64;
+        let meta = wh.latest_meta().await;
+        sequences.push((meta.sequence, meta.base_sequence, meta.delta_chain_len));
+    }
+
+    assert_eq!(
+        sequences,
+        vec![
+            (1, 1, 0), // no base yet -> base
+            (2, 1, 1), // delta
+            (3, 1, 2), // delta
+            (4, 4, 0), // chain would hit MAX_LAYERS -> compact
+            (5, 4, 1), // delta on the new base
+        ],
+        "chain must reset when compaction fires"
+    );
+
+    // Every chain up to here is still readable, and the compacted base really
+    // did absorb the deltas below it.
+    let (cold, _) = wh.open_base_backed().await;
+    for tick in 0..5u64 {
+        assert!(
+            cold.connected(GLOBAL_SCOPE, tick * 100, tick * 100 + 20),
+            "tick {tick}'s chain was lost across compaction"
+        );
+        assert_eq!(cold.scope_root(GLOBAL_SCOPE, tick * 100 + 20), tick * 100);
+    }
+    // Only base + one delta are mapped after the reset.
+    assert_eq!(cold.base_stats().unwrap().sequence, 5);
+}
+
+/// A worker that folded locally without committing must not then commit a
+/// delta: the committed chain would be missing those layers, and a cold start
+/// would silently reconstruct incomplete topology.
+#[tokio::test]
+async fn a_worker_with_local_only_layers_commits_a_base_not_a_delta() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+
+    // Establish a committed base.
+    let first: Vec<EdgeEvent> = (0..30u64).map(|i| global_edge(i, i + 1)).collect();
+    for e in &first {
+        forest.apply(e);
+    }
+    wh.flush_layered(forest.clone(), 1, &first, u64::MAX, true, 60)
+        .await;
+    assert_eq!(wh.latest_meta().await.base_sequence, 1);
+
+    // Now fold as a *follower*: a local layer that the catalog never saw.
+    let hidden: Vec<EdgeEvent> = (0..30u64)
+        .map(|i| global_edge(1_000 + i, 1_001 + i))
+        .collect();
+    for e in &hidden {
+        forest.apply(e);
+    }
+    wh.flush_layered(forest.clone(), 31, &hidden, 1, false, 60)
+        .await;
+    assert_eq!(forest.stats().folds, 2, "the follower folded locally");
+    assert_eq!(
+        wh.latest_meta().await.sequence,
+        1,
+        "a follower must not commit"
+    );
+
+    // Becoming leader, the next commit must be a full base — not a delta whose
+    // chain is missing the local-only layer.
+    let more: Vec<EdgeEvent> = (0..5u64)
+        .map(|i| global_edge(2_000 + i, 2_001 + i))
+        .collect();
+    for e in &more {
+        forest.apply(e);
+    }
+    wh.flush_layered(forest.clone(), 61, &more, u64::MAX, true, 60)
+        .await;
+    let meta = wh.latest_meta().await;
+    assert_eq!(meta.sequence, 2);
+    assert_eq!(
+        meta.base_sequence, 2,
+        "must self-describe as a base after local-only folds"
+    );
+    assert_eq!(meta.delta_chain_len, 0);
+
+    // The proof that matters: a cold start sees the state that only ever
+    // existed in the local-only layer.
+    let (cold, _) = wh.open_base_backed().await;
+    assert!(
+        cold.connected(GLOBAL_SCOPE, 1_000, 1_030),
+        "local-only state was lost"
+    );
+    assert!(cold.connected(GLOBAL_SCOPE, 0, 30));
+    assert!(cold.connected(GLOBAL_SCOPE, 2_000, 2_005));
+}
+
+/// A hole in the chain must fail loudly (I5). Skipping a delta would serve
+/// stale topology as though it were current, which is worse than not starting.
+#[tokio::test]
+async fn a_missing_chain_link_is_a_hard_error() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+    for tick in 0..3u64 {
+        let events: Vec<EdgeEvent> = (0..10)
+            .map(|i| global_edge(tick * 50 + i, tick * 50 + i + 1))
+            .collect();
+        for e in &events {
+            forest.apply(e);
+        }
+        wh.flush_layered(forest.clone(), offset, &events, u64::MAX, true, 60)
+            .await;
+        offset += events.len() as u64;
+    }
+    assert_eq!(wh.latest_meta().await.delta_chain_len, 2);
+
+    // Delete the middle link's metadata and read from a cache-cold worker.
+    wh.delete_snapshot_meta(2).await;
+    let cold = tempfile::tempdir().unwrap();
+    let err = open_base_from_catalog(&wh.store, &wh.catalog, cold.path())
+        .await
+        .expect_err("a hole in the chain must not be silently skipped");
+    assert!(
+        err.to_string().contains("missing snapshot 2"),
+        "error should name the missing link, got: {err}"
+    );
 }
 
 /// A base-backed forest holds only post-snapshot merges in the heap: that is

@@ -51,6 +51,13 @@ struct Args {
     #[arg(long, default_value_t = blaze::storage::DEFAULT_FOLD_AFTER_LINKS)]
     fold_after_links: u64,
 
+    /// Compact once the routing base carries this many delta layers
+    /// (--routing-base disk only). Higher means cheaper flushes and rarer
+    /// rewrites, at the cost of more layers to probe per lookup and a longer
+    /// chain to fetch on cold start.
+    #[arg(long, default_value_t = blaze::storage::DEFAULT_MAX_DELTA_LAYERS)]
+    max_delta_layers: usize,
+
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
     flush_interval_secs: u64,
@@ -156,6 +163,9 @@ async fn main() -> anyhow::Result<()> {
     // Committed routing state: either hydrated into the heap, or mmap'd from
     // a local cache of the latest Puffin snapshot.
     let base_dir = (args.routing_base == "disk").then(|| std::path::PathBuf::from(&args.data_dir));
+    // Layer stack the flusher folds onto, seeded from whatever the catalog
+    // already has so the first fold can be a delta rather than a rewrite.
+    let mut local_layers = None;
     let (forest, watermark) = match args.routing_base.as_str() {
         "ram" => {
             let forest = Arc::new(ScopedForest::new());
@@ -165,7 +175,10 @@ async fn main() -> anyhow::Result<()> {
         "disk" => {
             let dir = base_dir.clone().expect("set for disk mode");
             match open_base_from_catalog(&store, &catalog, &dir).await? {
-                Some((base, watermark)) => (Arc::new(ScopedForest::with_base(base)), watermark),
+                Some((base, watermark, local)) => {
+                    local_layers = Some(local);
+                    (Arc::new(ScopedForest::with_base(base)), watermark)
+                }
                 None => {
                     info!("no committed snapshot yet; starting with an empty memtable");
                     (Arc::new(ScopedForest::new()), 0)
@@ -223,6 +236,8 @@ async fn main() -> anyhow::Result<()> {
         worker_id: worker_id.clone(),
         base_dir,
         fold_after_links: args.fold_after_links,
+        max_delta_layers: args.max_delta_layers,
+        layers: parking_lot::Mutex::new(local_layers),
     });
     let flush_handle = tokio::spawn(
         flusher

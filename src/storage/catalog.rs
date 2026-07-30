@@ -35,9 +35,41 @@ pub struct SnapshotMeta {
     /// Highest event offset covered by this snapshot (inclusive).
     pub watermark: u64,
     pub data_files: Vec<DataFileMeta>,
-    /// Puffin sidecar carrying the DSU routing maps as of `watermark`.
+    /// Puffin sidecar for *this* commit. A base layer when
+    /// `base_sequence == sequence`, otherwise a delta over the chain below it.
     pub puffin_path: String,
     pub committer: String,
+    /// Sequence of the newest full base. Routing state as of this snapshot is
+    /// that base plus every delta in `base_sequence+1..=sequence`, applied in
+    /// order.
+    #[serde(default = "default_base_sequence")]
+    pub base_sequence: u64,
+    /// Deltas layered on the base, i.e. `sequence - base_sequence`. Stored
+    /// rather than derived so a reader can see at a glance how much chain a
+    /// cold start has to fetch.
+    #[serde(default)]
+    pub delta_chain_len: u64,
+}
+
+/// Snapshots written before delta support had no `base_sequence`; every one of
+/// them was a full base, so treating a missing field as "this commit is its own
+/// base" reads old catalogs correctly.
+fn default_base_sequence() -> u64 {
+    0
+}
+
+impl SnapshotMeta {
+    /// Sequences whose Puffin files must be read, oldest first, to reconstruct
+    /// routing state as of this snapshot.
+    pub fn chain(&self) -> std::ops::RangeInclusive<u64> {
+        // `base_sequence == 0` means a pre-delta snapshot: it is its own base.
+        let base = if self.base_sequence == 0 {
+            self.sequence
+        } else {
+            self.base_sequence
+        };
+        base..=self.sequence
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +123,21 @@ impl SnapshotCatalog {
         self.cached_seq.fetch_max(seq, Ordering::AcqRel);
         let bytes = self.store.get(&self.snap_path(seq)).await?.bytes().await?;
         Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    /// One specific snapshot by sequence. Hydration walks a delta chain and
+    /// needs each link's Puffin path; a missing link is a hard error (I5) —
+    /// skipping it would silently serve stale topology.
+    pub async fn get(&self, sequence: u64) -> anyhow::Result<SnapshotMeta> {
+        let path = self.snap_path(sequence);
+        let bytes = self
+            .store
+            .get(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("delta chain is missing snapshot {sequence}: {e}"))?
+            .bytes()
+            .await?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     async fn exists(&self, sequence: u64) -> anyhow::Result<bool> {
@@ -153,6 +200,8 @@ mod tests {
             data_files: vec![],
             puffin_path: format!("puffin/dsu-{seq}.puffin"),
             committer: "test".into(),
+            base_sequence: seq,
+            delta_chain_len: 0,
         }
     }
 

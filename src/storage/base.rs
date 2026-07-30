@@ -352,6 +352,28 @@ impl PuffinBase {
         }
     }
 
+    /// Number of pairs in the shared table.
+    pub fn shared_len(&self) -> usize {
+        self.shared.as_ref().map(|t| t.count).unwrap_or(0)
+    }
+
+    /// `i`th shared pair in ascending key order. Positional access is what lets
+    /// [`super::layered::LayeredBase`] k-way merge several layers without
+    /// buffering any of them.
+    pub fn shared_pair_at(&self, i: usize) -> (NodeId, NodeId) {
+        let t = self.shared.as_ref().expect("shared table");
+        (t.key_at(&self.mmap, i), t.value_at(&self.mmap, i))
+    }
+
+    pub fn overlay_len(&self, scope: ScopeId) -> usize {
+        self.overlays.get(&scope).map(|t| t.count).unwrap_or(0)
+    }
+
+    pub fn overlay_pair_at(&self, scope: ScopeId, i: usize) -> (NodeId, NodeId) {
+        let t = self.overlays.get(&scope).expect("overlay table");
+        (t.key_at(&self.mmap, i), t.value_at(&self.mmap, i))
+    }
+
     /// Heap held by the sparse indexes — the one part of the base that is
     /// *not* free to map, so it belongs in stats rather than in the shadows.
     fn index_bytes(&self) -> u64 {

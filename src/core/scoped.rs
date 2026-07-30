@@ -420,6 +420,72 @@ impl ScopedForest {
         Ok(out)
     }
 
+    /// Fold the memtable out as a **delta layer** rather than rewriting the
+    /// base, then adopt the result and drop the memtable.
+    ///
+    /// This is the cheap fold, and the reason design 001 exists.
+    /// [`ScopedForest::compact_and_fold`] streams the whole composed state, so
+    /// it costs O(state) in time and bytes every time the memtable needs
+    /// draining. This streams only what the memtable itself contributes, so
+    /// both are O(memtable) — the base is appended to, never rewritten.
+    ///
+    /// **The memtable is the dirty set.** No side structure tracks what
+    /// changed: because every fold empties the memtable, its key set *is*
+    /// exactly the nodes re-rooted since the last one, and each key's composed
+    /// root is its final value. That is stronger than tracking dirtiness
+    /// separately, which can drift out of step with the data it describes.
+    ///
+    /// Path-compression writes add a few keys that are semantically unchanged
+    /// (`(node, its current root)`), which is redundant but never wrong.
+    ///
+    /// `build` receives the streamed delta and the base it layers over, and
+    /// must return a base that composes the two — see
+    /// `storage::layered::LayeredBase::pushed`. Everything happens under the
+    /// union lock, so nothing can be applied between the stream and the swap
+    /// and then be lost by it.
+    pub fn fold_delta<S: SnapshotSink + ?Sized, T, E>(
+        &self,
+        sink: &mut S,
+        build: impl FnOnce(
+            &mut S,
+            Option<&Arc<dyn RoutingBase>>,
+        ) -> Result<(Arc<dyn RoutingBase>, T), E>,
+    ) -> Result<T, E> {
+        let _g = self.union_lock.lock();
+        let previous = self.tier.load();
+        self.stream_memtable(&previous, sink);
+        let (base, out) = build(sink, previous.base.as_ref())?;
+        self.tier.store(Arc::new(Tier {
+            base: Some(base),
+            ..Tier::default()
+        }));
+        self.folds.fetch_add(1, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    /// Stream the memtable's own `(node, composed root)` pairs, in the order
+    /// [`SnapshotSink`] requires. Unlike compaction this never touches the
+    /// base's key space — only the keys the memtable itself holds.
+    fn stream_memtable(&self, t: &Tier, sink: &mut (impl SnapshotSink + ?Sized)) {
+        let mut keys = t.global.keys();
+        keys.sort_unstable();
+        for k in keys {
+            Self::emit_shared(t, sink, k);
+        }
+
+        let mut scope_ids: Vec<ScopeId> = t.overlays.iter().map(|e| *e.key()).collect();
+        scope_ids.sort_unstable();
+        for scope in scope_ids {
+            sink.scope_start(scope);
+            let mut keys = t.overlays.get(&scope).map(|o| o.keys()).unwrap_or_default();
+            keys.sort_unstable();
+            for k in keys {
+                Self::emit_overlay(t, sink, scope, k);
+            }
+            sink.scope_end(scope);
+        }
+    }
+
     fn compact_locked(&self, sink: &mut (impl SnapshotSink + ?Sized)) {
         let t = self.tier.load();
         let base = t.base();

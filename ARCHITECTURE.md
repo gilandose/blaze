@@ -382,13 +382,42 @@ is freed when the last such reader drops it. Queries are never blocked, and
 `queries_see_no_torn_state_while_folding` runs four reader threads through a
 live fold to keep it that way.
 
-**What the fold costs, plainly:** it rewrites the whole base, so ingest stalls
-for time proportional to *total state*, not to what was folded — measured below
-at 2.95 s for a 125 MB base, and the Puffin bytes are buffered in RAM while it
-happens. That is fine for bases of a few GB and untenable at 50 GB, which is
-why a fold slower than 5 s logs a warning naming the two ways out: raise the
-trigger, or land [design 001](docs/design/001-delta-snapshots.md) so a fold
-writes only the delta and becomes O(memtable) in both time and bytes.
+### Folds append; they don't rewrite (design 001)
+
+A fold that rewrites the base costs time and bytes proportional to *total
+state* — 3113 ms and 125 MB for a 125 MB base, which extrapolates badly. So a
+fold instead writes only what the memtable itself contributes, as a **new layer**
+over the mappings already open: measured **~400 ms and 12.5 MB** for the same
+300k links. That file is also what the leader commits, so a flush publishes a
+delta rather than the whole map.
+
+**The memtable is the dirty set.** Nothing tracks what changed, because every
+fold empties the memtable — so its key set already *is* the nodes re-rooted
+since the last fold, and each key's composed root is its final value. A separate
+dirty-set structure would only add something that can drift out of step with the
+data it describes.
+
+`LayeredBase` presents base + deltas as one `RoutingBase`, and lookups stay exact
+because **layer keys are disjoint**: every layer is produced by resolving through
+everything beneath it, so its keys are composed roots of the layers below. At
+most one layer holds a parent for a node, and following that parent can only
+continue in a *newer* layer — so a resolution visits each layer at most once.
+Compaction k-way merges the layers, which is what keeps the compaction read from
+buffering anything.
+
+**What it costs:** a lookup that misses probes every layer — ~0.26 µs each on top
+of a ~0.8 µs base probe (0.81 µs base-only → 1.87 µs with three deltas).
+`--max-delta-layers` is the dial, defaulting to 24: ~7 µs lookups, compaction
+roughly every 24 minutes at a 60s flush interval. Removing that trade rather than
+balancing it needs a per-layer membership filter, written as a Puffin blob at fold
+time so cold start stays O(blobs) — design 001's remaining work. A fold slower
+than 5 s still logs a warning; at this point only a compaction reaches that.
+
+A worker whose newest layer was folded **locally but never committed** (any
+follower, or a leader that lost a commit race) must not then commit a delta: the
+committed chain would be missing those layers, and a cold start would silently
+reconstruct incomplete topology. Such a worker compacts and commits a full base
+instead — `LocalLayers::committed_through` tracks it and a test pins it.
 
 ### Compaction streams; it never materializes
 
@@ -411,8 +440,10 @@ Measured (3M links / 3000 scopes / 113 MB base, release build):
 | `scope_root` lookups/s (1 thread) | 2.78M (0.36 µs) | 1.30M (0.77 µs) |
 | Compaction, heap above the output | +57 MB (3.2M-pair snapshot) | **+0 MB** (streamed) |
 | Compaction wall time | 1432 ms (collect) | **756 ms** (stream) |
-| Fold: 300k memtable links → 0 | n/a | 2950 ms ingest stall, 125 MB rewritten |
-| Lookups/s after a fold | — | 1.37M (0.73 µs) — unchanged |
+| Fold 300k links, rewriting the base | n/a | 3113 ms, 125 MB written |
+| Fold 300k links, as a delta layer | n/a | **~400 ms, 12.5 MB written** |
+| Lookups/s, base only | — | 1.23M (0.81 µs) |
+| Lookups/s, base + 3 delta layers | — | 534k (1.87 µs) — ~0.26 µs per layer |
 
 Cold start is O(blob count) rather than O(pairs), so the gap widens linearly
 with state — the reason a multi-gigabyte base serves in milliseconds. Warm
@@ -426,8 +457,11 @@ is read-only.
 
 What still scales with state, named so it is not mistaken for solved:
 
-- **The fold's stall and write amplification** — it rewrites the whole base
-  (above). The single biggest reason to land design 001 next.
+- **Compaction**, which still rewrites everything and still runs under the union
+  lock on a serving worker. Now amortized to roughly every 24 minutes instead of
+  every fold, but the honest fix is to run it as a separate storage-side job.
+- **Read amplification per delta layer** (~0.26 µs), until per-layer membership
+  filters land.
 - **The Puffin file itself**, buffered in RAM before it is written and
   uploaded. Streaming it to disk and doing a multipart upload would remove
   this; it is only invisible today because a fold already dominates.
