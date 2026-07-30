@@ -13,7 +13,7 @@ use object_store::path::Path as StorePath;
 use blaze::core::{EdgeEvent, GLOBAL_SCOPE, ScopedForest, Visibility};
 use blaze::ha::StaticElector;
 use blaze::ingest::EdgeBuffer;
-use blaze::storage::{Flusher, SnapshotCatalog, open_base_from_catalog};
+use blaze::storage::{Flusher, RunSet, SnapshotCatalog, open_base_from_catalog};
 
 fn global_edge(src: u64, dst: u64) -> EdgeEvent {
     EdgeEvent {
@@ -771,6 +771,96 @@ async fn compaction_fires_on_the_layer_trigger_and_resets_the_chain() {
     }
     // Only base + one delta are mapped after the reset.
     assert_eq!(cold.base_stats().unwrap().sequence, 5);
+}
+
+/// Every commit must describe its state as a run set whose spans are dense and
+/// contiguous from the first sequence to its own.
+///
+/// This is the property the format exists for, and the one that breaks quietly.
+/// Runs resolve oldest-span-first, so a gap means some sequence's state belongs
+/// to no run, and an overlap means two runs claim it — either way resolution
+/// order stops being total and the disjoint-keys argument (a run's keys are
+/// composed roots of every run with an earlier span) no longer holds. Nothing
+/// else notices: lookups would still return *an* answer.
+///
+/// The interesting tick is the merge, where the output has to inherit the span
+/// of everything it subsumed instead of taking the sequence it was committed at.
+#[tokio::test]
+async fn run_spans_stay_dense_across_a_compaction_cycle() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+    // Base at 1, deltas at 2 and 3, then tick 4 must merge.
+    const MAX_LAYERS: usize = 3;
+
+    let mut shapes = Vec::new();
+    for tick in 0..5u64 {
+        let events: Vec<EdgeEvent> = (0..20)
+            .map(|i| global_edge(tick * 100 + i, tick * 100 + i + 1))
+            .collect();
+        for e in &events {
+            forest.apply(e);
+        }
+        wh.flush_layered(forest.clone(), offset, &events, u64::MAX, true, MAX_LAYERS)
+            .await;
+        offset += events.len() as u64;
+
+        let meta = wh.latest_meta().await;
+        let RunSet::Runs(runs) = meta.run_set() else {
+            panic!("tick {tick} committed no run set");
+        };
+
+        assert_eq!(
+            runs.first().unwrap().min_sequence,
+            1,
+            "tick {tick}: the run set must reach back to the first sequence"
+        );
+        assert_eq!(
+            runs.last().unwrap().max_sequence,
+            meta.sequence,
+            "tick {tick}: the newest run must cover this commit"
+        );
+        for pair in runs.windows(2) {
+            assert!(
+                pair[0].adjacent_to(&pair[1]),
+                "tick {tick}: {}..{} and {}..{} are not adjacent",
+                pair[0].min_sequence,
+                pair[0].max_sequence,
+                pair[1].min_sequence,
+                pair[1].max_sequence
+            );
+        }
+        // Every run names a distinct object; a repeated path would mean two runs
+        // resolving the same bytes at different positions in the stack.
+        let mut paths: Vec<&str> = runs.iter().map(|r| r.path.as_str()).collect();
+        paths.sort_unstable();
+        let distinct = paths.len();
+        paths.dedup();
+        assert_eq!(paths.len(), distinct, "tick {tick}: duplicate run path");
+
+        shapes.push((
+            meta.sequence,
+            runs.iter()
+                .map(|r| (r.level, r.min_sequence, r.max_sequence))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    assert_eq!(
+        shapes,
+        vec![
+            // No stack yet, so tick 1 folds a self-contained run — but it
+            // subsumes nothing, so it is still level 0.
+            (1, vec![(0, 1, 1)]),
+            (2, vec![(0, 1, 1), (0, 2, 2)]),
+            (3, vec![(0, 1, 1), (0, 2, 2), (0, 3, 3)]),
+            // The merge inherits 1..=3 and extends over its own commit, so the
+            // set stays dense with no run left behind at 4.
+            (4, vec![(1, 1, 4)]),
+            (5, vec![(1, 1, 4), (0, 5, 5)]),
+        ],
+        "run levels and spans across a merge"
+    );
 }
 
 /// Compaction merges the *committed layer files*, taking no union lock and

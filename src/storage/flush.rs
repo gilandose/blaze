@@ -11,6 +11,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,7 +21,9 @@ use crate::core::{RoutingBase, ScopedForest};
 use crate::ha::LeaderElector;
 use crate::ingest::EdgeBuffer;
 use crate::storage::base::PuffinBase;
-use crate::storage::catalog::{CommitOutcome, DataFileMeta, SnapshotCatalog, SnapshotMeta};
+use crate::storage::catalog::{
+    CommitOutcome, DataFileMeta, RunMeta, SnapshotCatalog, SnapshotMeta,
+};
 use crate::storage::compact::compact_layers;
 use crate::storage::layered::LayeredBase;
 use crate::storage::{codec, parquet_io, puffin};
@@ -54,21 +57,155 @@ pub struct Flusher {
 #[derive(Debug)]
 pub struct LocalLayers {
     pub base: Arc<LayeredBase>,
-    /// Files backing `base`, oldest first — kept so compaction can unlink what
-    /// it subsumes.
-    pub paths: Vec<PathBuf>,
-    /// Catalog sequence of the base layer.
-    pub base_sequence: u64,
-    /// Catalog sequence the newest layer was committed as, or `None` when the
-    /// newest layer exists only on this worker's disk.
+    /// One entry per layer in `base`, in the same order — oldest span first.
+    pub runs: Vec<LocalRun>,
+}
+
+/// One run in this worker's local stack: the file it is mapped from, plus the
+/// catalog identity it has, or will have once committed.
+#[derive(Debug, Clone)]
+pub struct LocalRun {
+    /// Local file backing this run. Mapped now; unlinked once a merge subsumes
+    /// it.
+    pub path: PathBuf,
+    /// Where the same bytes live in object storage. `None` while the run exists
+    /// only on this worker's disk — see [`LocalLayers::fully_committed`].
+    pub remote: Option<String>,
+    /// Size tier; see [`RunMeta::level`].
+    pub level: u8,
+    /// Catalog sequences this run covers, inclusive.
+    ///
+    /// Provisional while `remote` is `None`. A follower folds whenever its
+    /// memtable fills, whether or not the catalog advanced, so two of its
+    /// local-only runs can claim the same span; `fully_committed` is what stops
+    /// a provisional span from reaching the catalog.
+    pub min_sequence: u64,
+    pub max_sequence: u64,
+    pub pairs: u64,
+    pub bytes: u64,
+}
+
+impl LocalRun {
+    /// Describe a run from the mapped file itself, so the counts are what is
+    /// actually on disk rather than what the writer believed it wrote.
+    fn written(path: PathBuf, mapped: &PuffinBase, level: u8, span: RangeInclusive<u64>) -> Self {
+        let stats = mapped.stats();
+        Self {
+            path,
+            remote: None,
+            level,
+            min_sequence: *span.start(),
+            max_sequence: *span.end(),
+            pairs: stats.shared_pairs + stats.overlay_pairs,
+            bytes: stats.mapped_bytes,
+        }
+    }
+
+    /// A run this worker holds locally that the catalog already knows about.
+    fn committed(meta: &RunMeta, path: PathBuf) -> Self {
+        Self {
+            path,
+            remote: Some(meta.path.clone()),
+            level: meta.level,
+            min_sequence: meta.min_sequence,
+            max_sequence: meta.max_sequence,
+            pairs: meta.pairs,
+            bytes: meta.bytes,
+        }
+    }
+
+    fn meta(&self, path: String) -> RunMeta {
+        RunMeta {
+            path,
+            level: self.level,
+            min_sequence: self.min_sequence,
+            max_sequence: self.max_sequence,
+            pairs: self.pairs,
+            bytes: self.bytes,
+        }
+    }
+}
+
+impl LocalLayers {
+    /// What the compatibility `SnapshotMeta::base_sequence` field reports.
+    ///
+    /// Note this is the oldest run's `max_sequence`, not its `min_sequence`: the
+    /// old field names the sequence the base was *committed at*, while a span
+    /// says which sequences a run *covers*. The two agree because a run's span
+    /// always ends at the sequence it was committed at — a fold covers only its
+    /// own sequence, and a merge extends its span forward to the commit that
+    /// publishes it. Reading `min_sequence` here would report a merged base as
+    /// living at the first sequence it subsumed, which the old format takes to
+    /// mean the chain above it was never merged away.
+    pub fn base_sequence(&self) -> u64 {
+        self.runs.first().map(|r| r.max_sequence).unwrap_or(0)
+    }
+
+    /// Whether every run in this stack is in the catalog.
     ///
     /// This is what makes it safe for a worker to commit a delta at all. A
     /// follower folds locally without committing, so its stack can run ahead of
     /// the catalog; if it then became leader and committed a delta, the
-    /// committed chain would be missing those layers and a cold start would
-    /// reconstruct incomplete topology. A worker whose newest layer is
-    /// local-only must therefore compact and commit a full base instead.
-    pub committed_through: Option<u64>,
+    /// committed run set would be missing those runs and a cold start would
+    /// reconstruct incomplete topology. A worker holding a local-only run must
+    /// therefore merge and commit a self-contained run instead.
+    pub fn fully_committed(&self) -> bool {
+        self.runs.iter().all(|r| r.remote.is_some())
+    }
+
+    /// Files backing the stack, oldest first — kept so a merge can unlink what
+    /// it subsumes.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.runs.iter().map(|r| r.path.clone()).collect()
+    }
+
+    /// How the catalog should describe this stack, with `newest_remote` supplying
+    /// the object-store path of a run that has been uploaded but not yet
+    /// committed.
+    ///
+    /// `None` when an *older* run is still local-only, which is a stack that
+    /// cannot be described as a committed run set at all. `fold` forces a
+    /// self-contained merge in exactly that case, so this is unreachable from the
+    /// delta path; returning `None` rather than asserting means a bug there
+    /// degrades to the base+chain format instead of taking down the flush loop.
+    pub fn run_metas(&self, newest_remote: &str) -> Option<Vec<RunMeta>> {
+        let (newest, older) = self.runs.split_last()?;
+        let mut out = Vec::with_capacity(self.runs.len());
+        for run in older {
+            out.push(run.meta(run.remote.clone()?));
+        }
+        let remote = newest
+            .remote
+            .clone()
+            .unwrap_or_else(|| newest_remote.to_string());
+        out.push(newest.meta(remote));
+        Some(out)
+    }
+
+    /// Record that the newest run is now in the catalog at `remote`.
+    pub fn mark_committed(&mut self, remote: String) {
+        if let Some(newest) = self.runs.last_mut() {
+            newest.remote = Some(remote);
+        }
+    }
+}
+
+/// Level for a run merged from `inputs`.
+///
+/// Flat compaction merges *everything*, so there is no cohort being promoted and
+/// this only counts merge generations. A tiered policy assigns the level from the
+/// cohort it chose to merge instead (design 006), at which point this goes away;
+/// until then nothing branches on `level`, which is what makes saturating at 255
+/// harmless rather than a silently wrong answer.
+fn merged_level(inputs: &[LocalRun]) -> u8 {
+    match inputs.iter().map(|r| r.level).max() {
+        // Nothing subsumed: the first fold on a fresh deployment is a level-0 run
+        // like any other, it just happens to be self-contained. Calling it a
+        // promoted merge output would leave a tiered policy with a lone L1 that
+        // never participates in the first L0 cohort.
+        None => 0,
+        Some(highest) => highest.saturating_add(1),
+    }
 }
 
 /// Links a memtable may hold before a non-committing worker folds (~50 MB of
@@ -236,6 +373,23 @@ impl Flusher {
             Layer::Base => sequence,
             Layer::Delta { base_sequence } => base_sequence,
         };
+        // The run set names the file we just uploaded, but does *not* mark it
+        // committed on the local stack: that only happens if the commit below
+        // wins, or a lost race would leave a local-only run looking committed and
+        // the next tick would layer a delta on a chain the catalog never saw.
+        let runs = match self.layers.lock().as_ref() {
+            // RAM mode: the memtable is the state, so there is no run structure
+            // to describe.
+            None => Vec::new(),
+            Some(local) => local.run_metas(puffin_path.as_ref()).unwrap_or_else(|| {
+                warn!(
+                    sequence,
+                    "stack holds a local-only run below the newest; describing \
+                         this commit in the base+chain format only"
+                );
+                Vec::new()
+            }),
+        };
         let meta = SnapshotMeta {
             sequence,
             committed_at_ms: now_ms(),
@@ -251,15 +405,15 @@ impl Flusher {
             committer: self.worker_id.clone(),
             base_sequence,
             delta_chain_len: sequence - base_sequence,
-            runs: Vec::new(),
+            runs,
         };
         match self.catalog.commit(&meta).await? {
             CommitOutcome::Committed => {
                 self.buffer.drop_committed(watermark);
-                // The layer we just folded is now part of the committed chain,
+                // The layer we just folded is now part of the committed run set,
                 // so a delta may be layered on it next tick.
                 if let Some(local) = self.layers.lock().as_mut() {
-                    local.committed_through = Some(sequence);
+                    local.mark_committed(puffin_path.to_string());
                 }
                 info!(
                     sequence,
@@ -274,10 +428,10 @@ impl Flusher {
                 // Someone else committed this sequence (leadership handoff
                 // race). Our data/puffin files are orphans — harmless, like
                 // uncommitted Iceberg files — and sealed segments stay for
-                // re-flush after re-observing the catalog. `committed_through`
-                // stays as it was, so the layer we just folded is local-only
-                // and the next tick will compact rather than commit a delta
-                // whose chain the catalog never saw.
+                // re-flush after re-observing the catalog. The run we just
+                // folded keeps `remote: None`, so it stays local-only and the
+                // next tick will merge rather than commit a delta whose chain
+                // the catalog never saw.
                 warn!(sequence, "commit conflict; deferring to next tick");
             }
         }
@@ -303,9 +457,9 @@ impl Flusher {
         let Some(dir) = &self.base_dir else {
             return Ok(false);
         };
-        let Some((stack, paths)) = ({
+        let Some((stack, inputs)) = ({
             let held = self.layers.lock();
-            held.as_ref().map(|l| (l.base.clone(), l.paths.clone()))
+            held.as_ref().map(|l| (l.base.clone(), l.runs.clone()))
         }) else {
             return Ok(false);
         };
@@ -342,6 +496,7 @@ impl Flusher {
         })
         .await??;
         let merged_ms = started.elapsed().as_millis() as u64;
+        let merged_bytes = bytes.len() as u64;
 
         // Publish before adopting. An uncommitted base is a harmless orphan; a
         // worker serving from a base the catalog does not know about would hand
@@ -354,6 +509,18 @@ impl Flusher {
         self.store
             .put(&puffin_path, PutPayload::from(bytes))
             .await?;
+        let merged = RunMeta {
+            path: puffin_path.to_string(),
+            level: merged_level(&inputs),
+            min_sequence: inputs.first().map(|r| r.min_sequence).unwrap_or(sequence),
+            // The merge subsumes everything through the previous commit, and this
+            // snapshot contributes no routing state of its own — no data files,
+            // the previous watermark — so extending the span over `sequence`
+            // keeps run spans dense without claiming anything untrue.
+            max_sequence: sequence,
+            pairs: cstats.shared_pairs + cstats.overlay_pairs,
+            bytes: merged_bytes,
+        };
         let meta = SnapshotMeta {
             sequence,
             committed_at_ms: now_ms(),
@@ -363,9 +530,7 @@ impl Flusher {
             committer: self.worker_id.clone(),
             base_sequence: sequence,
             delta_chain_len: 0,
-            // Stage 1: the format exists, nothing populates it yet, so readers
-            // take the back-compat path and behaviour is unchanged.
-            runs: Vec::new(),
+            runs: vec![merged.clone()],
         };
         if self.catalog.commit(&meta).await? == CommitOutcome::Conflict {
             warn!(
@@ -381,14 +546,12 @@ impl Flusher {
         self.forest.swap_base(flat.clone());
         *self.layers.lock() = Some(LocalLayers {
             base: flat,
-            paths: vec![path],
-            base_sequence: sequence,
-            committed_through: Some(sequence),
+            runs: vec![LocalRun::committed(&merged, path.clone())],
         });
         // Unlinking a mapped file is safe: the mapping keeps the inode alive
         // until the last query using it drops, and the space is reclaimed then.
-        for old in paths {
-            if let Err(e) = std::fs::remove_file(&old) {
+        for old in inputs.iter().map(|r| &r.path) {
+            if let Err(e) = std::fs::remove_file(old) {
                 warn!(path = %old.display(), error = %e, "could not unlink merged layer");
             }
         }
@@ -448,24 +611,18 @@ impl Flusher {
         // work and nothing else.
         let current = {
             let held = self.layers.lock();
-            held.as_ref().map(|l| {
-                (
-                    l.base.clone(),
-                    l.paths.clone(),
-                    l.base_sequence,
-                    l.committed_through,
-                )
-            })
+            held.as_ref()
+                .map(|l| (l.base.clone(), l.runs.clone(), l.fully_committed()))
         };
-        // Captured now: compaction unlinks exactly the layers it read.
-        let superseded: Vec<PathBuf> = current
+        // Captured now: a merge unlinks exactly the runs it read.
+        let inputs: Vec<LocalRun> = current
             .as_ref()
-            .map(|(_, paths, _, _)| paths.clone())
+            .map(|(_, runs, _)| runs.clone())
             .unwrap_or_default();
         let compact = match &current {
             None => true,
-            Some((base, _, _, committed_through)) => {
-                base.delta_count() + 1 >= self.max_delta_layers || committed_through.is_none()
+            Some((base, _, fully_committed)) => {
+                base.delta_count() + 1 >= self.max_delta_layers || !fully_committed
             }
         };
 
@@ -483,56 +640,65 @@ impl Flusher {
             // No committed chain to merge (the first commit in disk mode):
             // stream the live forest under the lock. Every other compaction goes
             // through `maybe_compact_chain`, which takes no lock at all.
-            let out = self.forest.compact_and_fold(&mut writer, |w| {
+            let (bytes, layered) = self.forest.compact_and_fold(&mut writer, |w| {
                 let bytes = puffin::write(&w.finish(), puffin_metadata(watermark));
                 write_atomically(&path, &bytes)?;
                 let mapped = Arc::new(PuffinBase::open(&path)?);
                 let layered = Arc::new(LayeredBase::new(mapped));
                 anyhow::Ok((layered.clone() as Arc<dyn RoutingBase>, (bytes, layered)))
             })?;
+            // Subsumes everything below it, so it inherits the whole span.
+            let span = inputs.first().map(|r| r.min_sequence).unwrap_or(sequence)..=sequence;
+            let run =
+                LocalRun::written(path.clone(), layered.layer(0), merged_level(&inputs), span);
             (
-                out.0,
+                bytes,
                 LocalLayers {
-                    base: out.1,
-                    paths: vec![path.clone()],
-                    base_sequence: sequence,
-                    committed_through: None,
+                    base: layered,
+                    runs: vec![run],
                 },
             )
         } else {
-            let (base, paths, base_sequence, _) = current.expect("checked above");
+            let (base, mut runs, _) = current.expect("checked above");
             // Delta: stream only the memtable's own pairs and append them as a
             // new layer over the mappings already open.
-            let out = self.forest.fold_delta(&mut writer, |w, _| {
+            let (bytes, layered) = self.forest.fold_delta(&mut writer, |w, _| {
                 let bytes = puffin::write(&w.finish(), puffin_metadata(watermark));
                 write_atomically(&path, &bytes)?;
                 let mapped = Arc::new(PuffinBase::open(&path)?);
                 let layered = Arc::new(base.pushed(mapped));
                 anyhow::Ok((layered.clone() as Arc<dyn RoutingBase>, (bytes, layered)))
             })?;
-            let mut paths = paths;
-            paths.push(path.clone());
+            let newest = layered.layers() - 1;
+            runs.push(LocalRun::written(
+                path.clone(),
+                layered.layer(newest),
+                0,
+                sequence..=sequence,
+            ));
             (
-                out.0,
+                bytes,
                 LocalLayers {
-                    base: out.1,
-                    paths,
-                    base_sequence,
-                    committed_through: None,
+                    base: layered,
+                    runs,
                 },
             )
         };
 
-        // Compaction subsumed the layers it read, so unlink them. Unlinking a
-        // mapped file is safe: the mapping keeps the inode alive until the last
-        // query using it drops, and the space is reclaimed then. A delta added
-        // to the stack supersedes nothing.
-        let superseded = if compact { superseded } else { Vec::new() };
+        // A merge subsumed the runs it read, so unlink them. Unlinking a mapped
+        // file is safe: the mapping keeps the inode alive until the last query
+        // using it drops, and the space is reclaimed then. A delta added to the
+        // stack supersedes nothing.
+        let superseded: Vec<PathBuf> = if compact {
+            inputs.iter().map(|r| r.path.clone()).collect()
+        } else {
+            Vec::new()
+        };
         let layer = if compact {
             Layer::Base
         } else {
             Layer::Delta {
-                base_sequence: next.base_sequence,
+                base_sequence: next.base_sequence(),
             }
         };
         let stalled_ms = started.elapsed().as_millis() as u64;
@@ -604,7 +770,7 @@ pub async fn open_base_from_catalog(
     // and `catalog.get` fails loudly on a hole rather than skipping it (I5) —
     // a skipped delta would serve stale topology as if it were current.
     let chain = latest.chain();
-    let mut paths = Vec::new();
+    let mut runs = Vec::new();
     let mut layers = Vec::new();
     for sequence in chain.clone() {
         let meta = if sequence == latest.sequence {
@@ -631,8 +797,17 @@ pub async fn open_base_from_catalog(
                 "cached routing layer from object storage"
             );
         }
-        layers.push(Arc::new(PuffinBase::open(&local)?));
-        paths.push(local);
+        let mapped = Arc::new(PuffinBase::open(&local)?);
+        // The chain describes one commit per link, so each is its own span. The
+        // run set the snapshot carries knows better — a merged run spans
+        // everything it subsumed — but walking the chain cannot recover that, so
+        // synthesise the conservative shape and let the next merge relabel it.
+        let mut run = LocalRun::written(local, &mapped, 0, sequence..=sequence);
+        // Every layer here came from the catalog, so a delta may be layered on
+        // top immediately.
+        run.remote = Some(meta.puffin_path.clone());
+        layers.push(mapped);
+        runs.push(run);
     }
 
     let base = Arc::new(LayeredBase::from_layers(layers)?);
@@ -649,11 +824,7 @@ pub async fn open_base_from_catalog(
     );
     let local = LocalLayers {
         base: base.clone(),
-        paths,
-        base_sequence: *chain.start(),
-        // Every layer we just mapped came from the catalog, so a delta may be
-        // layered on top immediately.
-        committed_through: Some(latest.sequence),
+        runs,
     };
     Ok(Some((base, latest.watermark, local)))
 }
