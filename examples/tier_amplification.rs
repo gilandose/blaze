@@ -35,6 +35,27 @@ struct Run {
     level: u8,
 }
 
+enum Policy {
+    /// Rewrite the entire stack once it reaches the ceiling — what the flat
+    /// base+delta compactor did, and the O(N²) baseline.
+    ///
+    /// Note this is *not* the same as running `pick_merge` with an unreachable
+    /// fanout: that falls through to the depth-ceiling branch, which merges the
+    /// lowest stretch rather than everything, and so is already tiered.
+    Flat { ceiling: usize },
+    /// Size-tiered: merge `fanout` runs at the lowest full level.
+    Tiered { fanout: usize, ceiling: usize },
+}
+
+impl Policy {
+    fn pick(&self, levels: &[u8]) -> Option<std::ops::Range<usize>> {
+        match *self {
+            Policy::Flat { ceiling } => (levels.len() >= ceiling).then_some(0..levels.len()),
+            Policy::Tiered { fanout, ceiling } => pick_merge(levels, fanout, ceiling),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Totals {
     merges: u64,
@@ -47,18 +68,14 @@ struct Totals {
     biggest_merge_pairs: u64,
 }
 
-/// Ingest `links` links, folding every `fold_links`, merging by the given policy.
-///
-/// `fanout = usize::MAX` never fills a level, so the only trigger is the depth
-/// ceiling and every merge takes the whole stack: that is the flat policy.
+/// Ingest `links` links, folding every `fold_links`, merging by `policy`.
 fn drive(
     dir: &Path,
     links: u64,
     nodes: u64,
     scopes: u32,
     fold_links: u64,
-    max_runs: usize,
-    fanout: usize,
+    policy: &Policy,
 ) -> Totals {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
@@ -96,16 +113,13 @@ fn drive(
         done += batch;
 
         // --- merge whatever the policy picks, before folding on top ---
-        loop {
-            let Some((base, runs)) = stack.as_ref() else {
-                break;
-            };
-            let levels: Vec<u8> = runs.iter().map(|r| r.level).collect();
-            let Some(range) = pick_merge(&levels, fanout, max_runs) else {
-                break;
-            };
+        while let Some(range) = stack
+            .as_ref()
+            .and_then(|(_, runs)| policy.pick(&runs.iter().map(|r| r.level).collect::<Vec<_>>()))
+        {
+            let (base, runs) = stack.as_ref().expect("picked from a stack");
             seq += 1;
-            let level = levels[range.clone()].iter().max().unwrap() + 1;
+            let level = runs[range.clone()].iter().map(|r| r.level).max().unwrap() + 1;
             let path = dir.join(format!("run-{seq:06}-L{level}.puffin"));
             let sub = base.slice(range.clone()).unwrap();
 
@@ -197,22 +211,35 @@ fn main() {
         links / fold_links
     );
     println!(
-        "{:<8} {:>7} {:>12} {:>9} {:>10} {:>9} {:>7} {:>12}",
+        "{:<10} {:>7} {:>12} {:>9} {:>10} {:>9} {:>7} {:>12}",
         "policy", "merges", "pairs merged", "amp", "GB written", "merge s", "runs", "biggest"
     );
 
-    for (name, f) in [("flat", usize::MAX), ("tiered", fanout)] {
+    // Every arm holds the same depth ceiling, so this compares what each policy
+    // costs to *write* at a matched read cost. Comparing at different depths
+    // proves nothing: the flat policy can always cut its write cost by carrying
+    // more runs, which is exactly the trade tiering is meant to break.
+    let arms: Vec<(String, Policy)> = vec![
+        ("flat".into(), Policy::Flat { ceiling: max_runs }),
+        (
+            format!("tier T={fanout}"),
+            Policy::Tiered {
+                fanout,
+                ceiling: max_runs,
+            },
+        ),
+    ];
+    for (name, policy) in &arms {
         let t = drive(
-            &dir.join(name),
+            &dir.join(name.replace(' ', "-")),
             links,
             nodes,
             scopes,
             fold_links,
-            max_runs,
-            f,
+            policy,
         );
         println!(
-            "{:<8} {:>7} {:>12} {:>8.2}x {:>10.2} {:>9.1} {:>7} {:>12}",
+            "{:<10} {:>7} {:>12} {:>8.2}x {:>10.2} {:>9.1} {:>7} {:>12}",
             name,
             t.merges,
             t.pairs_merged,
