@@ -101,6 +101,33 @@ Mostly already handled, which is worth stating so nobody re-solves it:
   serving degrades smoothly rather than failing. That makes **chain length an
   SLI** — it should be alerted on, since nothing else will notice.
 
+## Page-cache pollution, and why it is not a one-line fix
+
+Attempted and backed out, because it is worth recording why. A compaction reads
+each page of a layer exactly once and leaves all of them resident — measured,
+8.4 GB RSS against a 5.4 GB base — and since those pages are the most recently
+touched, LRU prefers to evict the query working set over them. Recency inversion,
+not a leak.
+
+- **`MADV_COLD`** is exactly right: deprioritize for reclaim without freeing
+  anything or changing an observable byte, so it is safe to issue while other
+  threads read the mapping. memmap2 0.9.11 does not expose it.
+- **`MADV_DONTNEED`** is exposed, but only through `unsafe
+  unchecked_advise_range`, and it is unsound here. Queries hold `&[u8]` borrows
+  into the same mapping concurrently with a sweep, and freeing pages under a live
+  borrow is UB in Rust's model — even though a read-only mapping of an immutable
+  file would refault identical bytes. The precondition cannot be established, so
+  the unsafe block cannot be justified.
+- **The safe fix is to stop sweeping through the mapping**: have compaction read
+  layers with ordinary buffered file I/O and `posix_fadvise(POSIX_FADV_DONTNEED)`
+  on the descriptor, which involves no borrows at all. That is a real change to
+  the compaction reader rather than an advice call, and it composes well with
+  running compaction in a separate process — which would not have the serving
+  node's page cache to pollute in the first place.
+
+Note this ranks *below* tiering for the same reason everything else does: once
+merges stop touching the whole base, there is far less cache to pollute.
+
 ## Recommendation
 
 1. **Tiering plus the run-set format** (006). It is the unlock for every option

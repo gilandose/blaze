@@ -360,17 +360,39 @@ impl PuffinBase {
     /// would cost one fault per page instead of one per readahead window.
     fn scan(&self, table: &PairTable, f: &mut dyn FnMut(NodeId, NodeId)) {
         let len = table.count * PAIR_STRIDE;
-        if len > 0 {
-            let _ = self
-                .mmap
-                .advise_range(memmap2::Advice::Sequential, table.start, len);
+        if len == 0 {
+            return;
         }
+        let _ = self
+            .mmap
+            .advise_range(memmap2::Advice::Sequential, table.start, len);
         table.for_each(&self.mmap, f);
-        if len > 0 {
-            let _ = self
-                .mmap
-                .advise_range(memmap2::Advice::Random, table.start, len);
-        }
+        let _ = self
+            .mmap
+            .advise_range(memmap2::Advice::Random, table.start, len);
+        // Deliberately *not* dropping the swept range, despite it being pure
+        // cache pollution: a compaction reads each of these pages exactly once
+        // and leaves all of them resident (measured, 8.4 GB RSS against a 5.4 GB
+        // base), and because they are the most recently touched, LRU prefers to
+        // evict the query working set over them. Recency inversion, not a leak.
+        //
+        // The right tool is `MADV_COLD`, which deprioritizes pages for reclaim
+        // without freeing them or changing any observable byte — safe to issue
+        // while other threads read the mapping. memmap2 0.9.11 does not expose
+        // it.
+        //
+        // `MADV_DONTNEED` *is* exposed, but only via `unsafe
+        // unchecked_advise_range`, and it is genuinely unsound here: queries hold
+        // `&[u8]` borrows into this same mapping concurrently with a compaction
+        // sweep, and freeing pages under a live borrow is UB in Rust's model even
+        // though a read-only mapping of an immutable file would refault identical
+        // bytes. Not worth an unsafe block whose precondition we cannot
+        // establish.
+        //
+        // The safe fix is to stop sweeping through the mapping at all — have
+        // compaction read layers with ordinary buffered file I/O and
+        // `posix_fadvise(DONTNEED)` the fd, which involves no borrows. That is a
+        // real change to the compaction reader, tracked in docs/design/007.
     }
 
     /// Number of pairs in the shared table.
