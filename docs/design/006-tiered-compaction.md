@@ -55,8 +55,10 @@ At 50 links/s, with a 60s flush interval and ~126 KB per delta:
 Consequences:
 
 - **Layer count is logarithmic**, ~6–8 runs total instead of thousands, so a
-  lookup stays at a handful of probes. This is what keeps the read path inside
-  the SLO without bloom filters (which remain a later option).
+  lookup stays at a handful of probes. Note this bounds depth but does not make
+  depth cheap: measured, 8 layers still costs 3.97x ingest throughput and 6.1x
+  lookup latency versus one. Tiering and per-layer filters solve different halves
+  of the problem and both are wanted.
 - **Write amplification is O(log N) per link**, not O(state) per compaction. Each
   link is rewritten ~once per level it passes through: ~6 times over its life,
   versus a full-base rewrite that costs 600,000× that at this change rate.
@@ -81,22 +83,40 @@ there is no single base, just runs with levels, so `LocalLayers` needs to carry 
 level per run and the catalog needs to list the run set rather than a single
 `base_sequence` + chain length.
 
-## Backfill
+## Backfill — corrected by measurement
 
-Measured single-node ingest: **357k links/s** through the DSU, **308k/s** with
-Arrow buffering (`examples/throughput.rs`). So 2B links is **~1.8 hours** of
-ingest — the backfill is not compute-bound, and no new mechanism is needed to
-make it feasible.
+An earlier version of this section claimed 2B links in ~1.8 hours, from the
+**357k links/s** the DSU sustains with no base attached (`examples/throughput.rs`).
+That figure does not survive contact with a layer stack, and the correction is
+large.
 
-Memory during backfill is bounded by the fold trigger, not by the state: set
-`--fold-after-links` to ~20M (~3 GB resident) and a 2B backfill folds ~100 times,
-writing ~75 GB of runs that tiering then collapses. Total ~2–3 hours on one node
-with single-digit GB of RAM.
+Measured end to end (`examples/ceiling.rs`, 4-core / 15 GB box, fold every 5M
+links, compact at 8 layers): **40M links in ~8.8 minutes including folds — ~76k
+links/s effective**, with instantaneous ingest falling 385k → 62k/s as depth went
+0 → 7. Extrapolating that rate alone puts 2B links at **~7 hours**, before
+counting the compactions a real run of that size would do. Call it most of a day
+on one node rather than an afternoon.
 
-A dedicated bulk path — sort the historic edges, run external-memory union-find,
-emit one finished base — would cut that to perhaps 20–30 minutes, because it
-skips per-event DSU work and writes the base exactly once. It is worth building
-only if 2 hours actually hurts; note it is a batch tool, not part of the engine.
+Two reasons, both from the depth measurements above:
+
+- Ingest resolves through the stack, so it slows as the stack deepens.
+- A fold is O(memtable × layers), not O(memtable) — the observed fold time rose
+  6.5 s → 26.5 s for a constant 5M-link memtable.
+
+Memory is still bounded by the fold trigger rather than by state, which was the
+main claim and holds: RSS tracked ~2.5 GB at 40M links with a 5M-link trigger.
+
+**This changes the verdict on a dedicated bulk path.** Sorting the historic edges,
+running external-memory union-find and emitting one finished base skips per-event
+DSU work *and* never builds a layer stack to fight, so it stays near the
+layer-free rate throughout. Previously dismissed as "not worth building until 2
+hours hurts"; at most-of-a-day it is worth building. It remains a batch tool
+rather than part of the engine.
+
+Alternatively, backfill through the streaming path with **depth kept low** (2–4)
+and a large fold trigger, accepting more frequent compaction to keep ingest near
+its ceiling. That is a tuning choice available today, and worth measuring before
+building anything.
 
 ## Beyond: what limits 10B+
 
@@ -146,7 +166,7 @@ backwards:
 |---|---|---|---|
 | Registry blob | ~50% of delta payload, 55% of base | **none** (writer-only) | none |
 | Per-scope blob count | 74% overhead on deltas | **none** per lookup | O(scopes x layers) footer parse |
-| Layer count | trivial (append) | **~0.3 us per layer** | O(layers) files |
+| Layer count | **~1.3 us per link ingested per layer**, and folds at O(memtable x layers) | **~0.65 us per layer** | O(layers) files |
 
 Only layer count threatens the query SLO, which is why tiering leads. At 50
 links/s write amplification does not matter for its own sake — it matters through

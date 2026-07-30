@@ -77,16 +77,24 @@ pub const DEFAULT_FOLD_AFTER_LINKS: u64 = 1_000_000;
 
 /// Delta layers to carry before compacting.
 ///
-/// This is a read/write amplification dial, and both sides are measured. A
-/// delta fold costs ~400 ms and 12.5 MB where rewriting the base costs ~3.1 s
-/// and 125 MB, so more layers means cheaper flushes. But a lookup that misses
-/// has to probe every layer: ~0.26 µs each on top of a ~0.8 µs base probe. At
-/// 24 layers that is ~7 µs — comfortably inside the sub-millisecond SLO — and a
-/// compaction roughly every 24 minutes at a 60s flush interval.
+/// This is a read *and write* amplification dial, and depth is more expensive
+/// than it looks. Measured on identical state
+/// (`examples/layer_depth.rs`), going from 1 layer to 8 costs **3.97x ingest
+/// throughput** and **6.1x lookup latency**; 16 layers costs 5.8x and 8.8x.
+/// Depth taxes three paths, because all of them resolve through the stack:
+/// queries (~+0.65 µs per layer), `apply` (~+1.3 µs per link per layer), and
+/// folds, which are O(memtable × layers) rather than O(memtable).
 ///
-/// Raising this much above ~100 starts to trade the SLO away; the fix that
-/// removes the trade is a per-layer membership filter, so a miss costs a RAM
-/// probe instead of a binary search (see docs/design/001).
+/// The default of 24 suits *serving*: at ~50 links/s the ingest cost is
+/// irrelevant and ~16 µs lookups are far inside the SLO. It is a poor choice
+/// while **backfilling**, where ingest rate is the entire objective — prefer 2-4
+/// with a large `fold_after_links`, and accept more frequent compaction.
+///
+/// The fix that removes the trade instead of balancing it is a per-layer
+/// membership filter, so a miss costs one probe rather than a binary search per
+/// layer. It must be a *blocked* filter — all of a key's bits in one cache line
+/// — since a classical bloom with k=7 over a multi-megabyte filter is ~7 cache
+/// misses and no cheaper than the search it replaces.
 pub const DEFAULT_MAX_DELTA_LAYERS: usize = 24;
 
 /// Warn when a fold stalls ingest for longer than this.

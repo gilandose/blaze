@@ -405,13 +405,48 @@ continue in a *newer* layer — so a resolution visits each layer at most once.
 Compaction k-way merges the layers, which is what keeps the compaction read from
 buffering anything.
 
-**What it costs:** a lookup that misses probes every layer — ~0.26 µs each on top
-of a ~0.8 µs base probe (0.81 µs base-only → 1.87 µs with three deltas).
-`--max-delta-layers` is the dial, defaulting to 24: ~7 µs lookups, compaction
-roughly every 24 minutes at a 60s flush interval. Removing that trade rather than
-balancing it needs a per-layer membership filter, written as a Puffin blob at fold
-time so cold start stays O(blobs) — design 001's remaining work. A fold slower
-than 5 s still logs a warning; at this point only a compaction reaches that.
+### What layer depth actually costs
+
+Measured on identical state, varying only the number of layers it was folded
+into (`examples/layer_depth.rs`, 8M links / 3000 scopes):
+
+| layers | ingest/s | vs 1 layer | lookup µs | vs 1 layer |
+|---|---|---|---|---|
+| 1 | 252,969 | 1.00× | 1.22 | 1.00× |
+| 2 | 170,318 | 1.49× | 2.12 | 1.73× |
+| 4 | 112,005 | 2.26× | 3.85 | 3.16× |
+| 8 | 63,733 | 3.97× | 7.44 | 6.10× |
+| 16 | 43,643 | 5.80× | 10.79 | 8.84× |
+
+Depth taxes **three** paths, not one, and an earlier draft of this document got
+two of them wrong:
+
+- **Queries**: ~+0.65 µs per layer.
+- **Ingest**: ~+1.3 µs per link per layer, because `apply` resolves its operands
+  through the composed path before touching the memtable. Appending a layer is
+  trivial; every write *after* that pays for it. This was previously described as
+  "trivial (append)".
+- **Folds**: `stream_memtable` resolves every memtable key, so a fold is
+  **O(memtable × layers)**, not O(memtable). Observed in the ceiling run as fold
+  time rising 6.5 s → 26.5 s across depth 0 → 6 for a constant 5M-link memtable
+  and a constant 185 MB of output.
+
+Both per-layer costs are linear in depth, which is what the O(layers) resolution
+predicts — but the constant is ~2× what a smaller probe suggested (0.65 vs
+0.26 µs), because a wider node space misses cache more.
+
+`--max-delta-layers` is the dial, defaulting to 24. For the production profile
+that default is fine: 50 links/s is 0.1% of even the depth-24 ingest capacity, and
+~16 µs lookups are far inside the SLO. For a **backfill**, where ingest rate is
+the whole point, it is badly wrong — see the backfill note below.
+
+The fix that removes the trade rather than balancing it is a per-layer membership
+filter, so a miss costs one probe instead of a binary search per layer. It should
+be a *blocked* filter (all of a key's bits in one cache line): a classical bloom
+with k=7 over a 6 MB filter is ~7 cache misses, no better than the binary search
+it replaces. With that, depth stops mattering much and compaction can be rare —
+which is why this now outranks tiering on ratio, though tiering is still needed to
+stop depth growing without bound.
 
 A worker whose newest layer was folded **locally but never committed** (any
 follower, or a leader that lost a commit race) must not then commit a delta: the
@@ -443,7 +478,7 @@ Measured (3M links / 3000 scopes / 113 MB base, release build):
 | Fold 300k links, rewriting the base | n/a | 3113 ms, 125 MB written |
 | Fold 300k links, as a delta layer | n/a | **~400 ms, 12.5 MB written** |
 | Lookups/s, base only | — | 1.23M (0.81 µs) |
-| Lookups/s, base + 3 delta layers | — | 534k (1.87 µs) — ~0.26 µs per layer |
+| Lookups/s, base + 3 delta layers | — | 534k (1.87 µs); see the depth table for the attributed per-layer cost |
 
 Cold start is O(blob count) rather than O(pairs), so the gap widens linearly
 with state — the reason a multi-gigabyte base serves in milliseconds. Warm
@@ -457,11 +492,11 @@ is read-only.
 
 What still scales with state, named so it is not mistaken for solved:
 
-- **Compaction**, which still rewrites everything and still runs under the union
-  lock on a serving worker. Now amortized to roughly every 24 minutes instead of
-  every fold, but the honest fix is to run it as a separate storage-side job.
-- **Read amplification per delta layer** (~0.26 µs), until per-layer membership
-  filters land.
+- **Compaction**, which still rewrites everything, though it no longer holds the
+  union lock (`storage::compact` merges the committed files instead).
+- **Read *and write* amplification per delta layer** (~0.65 µs per lookup,
+  ~1.3 µs per link ingested, and folds at O(memtable × layers)) until per-layer
+  membership filters land. Measured above.
 - **The Puffin file itself**, buffered in RAM before it is written and
   uploaded. Streaming it to disk and doing a multipart upload would remove
   this; it is only invisible today because a fold already dominates.
