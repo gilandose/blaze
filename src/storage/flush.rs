@@ -50,6 +50,17 @@ pub struct Flusher {
     /// Runs per level before they merge into one run at the level above. See
     /// [`tier::pick_merge`].
     pub tier_fanout: usize,
+    /// Await each merge inside the tick that starts it, instead of letting it run
+    /// in the background.
+    ///
+    /// Off in production: the whole point of a detached merge is that folds keep
+    /// draining the memtable while it works. Worth having because a detached merge
+    /// makes a tick no longer a complete unit of work, which matters when you want
+    /// ingest to be unable to outrun compaction — during a backfill, say — or when
+    /// you want each tick to be deterministic.
+    pub inline_merges: bool,
+    /// A merge running in the background, waiting to be spliced in.
+    pub pending_merge: Mutex<Option<PendingMerge>>,
     /// Local layer stack this worker serves from. Only the flush loop writes
     /// it, so a plain mutex around the bookkeeping is enough; the mapped state
     /// itself is shared immutably with the forest.
@@ -211,6 +222,51 @@ fn run_set_format(runs: &[RunMeta]) -> u32 {
     } else {
         crate::storage::catalog::FORMAT_RUN_SETS
     }
+}
+
+/// A merge running on a blocking thread, and what is needed to splice it in when
+/// it lands.
+pub struct PendingMerge {
+    handle: Option<tokio::task::JoinHandle<anyhow::Result<MergeResult>>>,
+    /// Set once the task has been awaited, so the result survives being polled.
+    finished: Option<anyhow::Result<MergeResult>>,
+    /// Local paths of the runs being merged, in order.
+    inputs: Vec<PathBuf>,
+    level: u8,
+    span: (u64, u64),
+    /// Where the merged run was written locally.
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for PendingMerge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingMerge")
+            .field("level", &self.level)
+            .field("span", &self.span)
+            .field("runs", &self.inputs.len())
+            .finish()
+    }
+}
+
+struct MergeResult {
+    bytes: bytes::Bytes,
+    cstats: crate::storage::compact::CompactionStats,
+    merged_ms: u64,
+}
+
+/// Where the runs at `inputs` sit in `runs` now, as a contiguous window.
+///
+/// By identity rather than by remembered indices, because a background merge
+/// outlives the stack it was planned against: folds append below it, and a
+/// full-stack fold can replace it outright. `None` means the window is gone and
+/// the merge no longer describes this stack.
+fn locate_run_window(runs: &[LocalRun], inputs: &[PathBuf]) -> Option<Range<usize>> {
+    if inputs.is_empty() || inputs.len() > runs.len() {
+        return None;
+    }
+    runs.windows(inputs.len())
+        .position(|w| w.iter().map(|r| &r.path).eq(inputs.iter()))
+        .map(|i| i..i + inputs.len())
 }
 
 /// Where a run's bytes live in object storage.
@@ -391,24 +447,36 @@ impl Flusher {
             return Ok(());
         }
 
-        // Before anything else: if the tiering policy has a merge due, do it
-        // from storage and publish the result as its own snapshot. That takes no
-        // union lock, so ingest runs throughout.
+        let prev_watermark = latest.as_ref().map(|s| s.watermark).unwrap_or(0);
+
+        // Adopt a merge started on an earlier tick, if one is ready, then start
+        // whatever the policy has due now. Adopting first means a merge is never
+        // published by the tick that launched it, so "detached" really is
+        // detached — the alternative ordering would quietly behave like the inline
+        // path whenever a merge happened to finish quickly.
         //
-        // The tick then *continues* and commits this batch at the next sequence.
-        // It used to return here, which was fine when a merge fired roughly one
-        // tick in twenty-four; under tiering it fires on ~10% of ticks and up to
-        // three in a row, and each one that returned early held back the
-        // watermark for a whole interval. Retained segments and a stalled
-        // watermark are the recovery-point objective, so a 3x worse worst case is
-        // not something to pay for a merge that took no lock and touched no
-        // buffered data.
-        if self
-            .maybe_compact_chain(sequence, latest.as_ref().map(|s| s.watermark).unwrap_or(0))
-            .await?
-        {
+        // Either way the tick *continues* and commits this batch at the next
+        // sequence. It used to return here, which was fine when a merge fired
+        // roughly one tick in twenty-four; under tiering it fires on ~10% of ticks
+        // and up to three in a row, and each early return held the watermark back
+        // for a whole interval. Retained segments and a stalled watermark are the
+        // recovery-point objective, and that is not worth paying for a merge that
+        // took no lock and touched no buffered data.
+        if self.adopt_merge(sequence, prev_watermark).await? {
             // The merge took this sequence; the data batch follows at the next.
             sequence += 1;
+        }
+        // Returns immediately: the merge runs on a blocking thread, so the fold
+        // below keeps draining the memtable while it works. That is the whole
+        // point — a high-level merge is minutes of CPU, and awaiting it inside the
+        // tick let the memtable grow for the duration, unbounded by the fold
+        // trigger.
+        self.start_merge(sequence, prev_watermark)?;
+        if self.inline_merges {
+            self.wait_for_merge().await;
+            if self.adopt_merge(sequence, prev_watermark).await? {
+                sequence += 1;
+            }
         }
 
         let segments = self.buffer.sealed_segments();
@@ -521,101 +589,209 @@ impl Flusher {
         Ok(())
     }
 
-    /// Merge whichever runs the tiering policy picks **from storage**, and
-    /// publish the result. Returns whether it did.
+    /// Start a merge of whichever runs the tiering policy picks, if one is due
+    /// and none is already in flight.
     ///
-    /// This is the compaction that matters, and what makes it different from
-    /// `ScopedForest::compact_and_fold` is what it does *not* touch: the inputs
-    /// are immutable committed layer files that are already mapped, so no union
-    /// lock is taken, the forest is never read, and ingest runs at full rate for
-    /// however long the merge takes. At 2B links that is the difference between a
-    /// 32-minute ingest stall and none.
+    /// Returns immediately. The merge runs on a blocking thread and is picked up
+    /// by [`Flusher::adopt_merge`] on a later tick, so **folds and commits
+    /// continue while it works** — which is the point. Merges are minutes of CPU
+    /// and disk for a high-level run, and awaiting one inside the tick meant the
+    /// memtable grew for its whole duration, unbounded by the fold trigger.
     ///
-    /// It merges a **subset** — see [`tier::pick_merge`] for the policy and
-    /// [`LayeredBase::slice`] for why a subset merge is sound — and splices the
-    /// result back at the position it came from. That is what makes total merge
-    /// work O(N log N) instead of the O(N²) a whole-base rewrite per cycle costs.
-    ///
-    /// It is published as its own snapshot carrying the **previous** watermark
-    /// and no data files, because that is exactly what it covers: the merged
-    /// runs, not the memtable, which `swap_base` deliberately preserves. A commit
-    /// claiming this tick's watermark would tell a cold start that merges still
-    /// sitting in the memtable were durable, and replay would skip them.
-    async fn maybe_compact_chain(&self, sequence: u64, watermark: u64) -> anyhow::Result<bool> {
+    /// What makes this possible at all is that the merge is pure storage-side: the
+    /// inputs are immutable committed layer files that are already mapped, so it
+    /// takes no union lock, never reads the forest, and cannot conflict with
+    /// ingest. It merges a **subset** — see [`tier::pick_merge`] for the policy and
+    /// [`LayeredBase::slice`] for why a subset merge is sound.
+    fn start_merge(&self, sequence: u64, watermark: u64) -> anyhow::Result<()> {
         let Some(dir) = &self.base_dir else {
-            return Ok(false);
+            return Ok(());
         };
+        // One at a time. Two concurrent merges could pick overlapping ranges, and
+        // the second to finish would splice over a stack the first had already
+        // rewritten.
+        if self.pending_merge.lock().is_some() {
+            return Ok(());
+        }
         let Some((stack, inputs)) = ({
             let held = self.layers.lock();
             held.as_ref().map(|l| (l.base.clone(), l.runs.clone()))
         }) else {
-            return Ok(false);
+            return Ok(());
         };
         // A local-only run in the stack cannot be named in a committed run set,
         // and a partial merge would leave one there. Decline; `fold` handles that
         // case by merging the whole stack into one self-contained run.
         if inputs.iter().any(|r| r.remote.is_none()) {
-            return Ok(false);
+            return Ok(());
         }
         let levels: Vec<u8> = inputs.iter().map(|r| r.level).collect();
         let Some(range) = tier::pick_merge(&levels, self.tier_fanout, self.max_delta_layers) else {
-            return Ok(false);
+            return Ok(());
         };
 
-        let started = std::time::Instant::now();
+        let level = merged_level(&inputs[range.clone()]);
         let path = dir.join(format!(
-            "routing-{}-{sequence:012}-L{}.puffin",
-            self.worker_id,
-            merged_level(&inputs[range.clone()])
+            "routing-{}-{sequence:012}-L{level}.puffin",
+            self.worker_id
         ));
-        // The merge is synchronous CPU and disk work — minutes of it for a
-        // high-level merge. Left inline in an async fn it would occupy a tokio
-        // worker thread for the duration, costing the runtime a whole worker (the
-        // scheduler steals around it, so the API degrades rather than stalls, but
-        // it should not be there).
-        //
-        // Note this still does not let folds proceed *during* a merge: the tick is
-        // sequential, so the memtable grows for its duration. Tiering makes that
-        // much less pressing — most merges are now L0->L1, which is megabytes —
-        // but the fix is to run the merge detached, which the run-set format has
-        // now unblocked.
         let merge_stack = stack.slice(range.clone())?;
         let merge_path = path.clone();
         let meta = puffin_metadata(watermark);
-        let (bytes, cstats) = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        // `sequence` here is only what the run's blob metadata records; the
+        // sequence it is actually *committed* at is decided at adoption, which may
+        // be several ticks later. Nothing resolves by that number — spans do that.
+        let handle = tokio::task::spawn_blocking(move || {
             let (blobs, cstats) = compact_layers(&merge_stack, sequence);
             let bytes = puffin::write(&blobs, meta);
             write_atomically(&merge_path, &bytes)?;
-            anyhow::Ok((bytes, cstats))
-        })
-        .await??;
-        let merged_ms = started.elapsed().as_millis() as u64;
-        let merged_bytes = bytes.len() as u64;
+            anyhow::Ok(MergeResult {
+                bytes,
+                cstats,
+                merged_ms: started.elapsed().as_millis() as u64,
+            })
+        });
+        info!(
+            level,
+            runs = range.len(),
+            spans = format!(
+                "{}..={}",
+                inputs[range.start].min_sequence,
+                inputs[range.end - 1].max_sequence
+            ),
+            "started a background merge; ingest and folds continue"
+        );
+        *self.pending_merge.lock() = Some(PendingMerge {
+            handle: Some(handle),
+            finished: None,
+            // Identity, not indices: the stack may have grown by the time this
+            // lands, and a run that moved means the merge no longer describes a
+            // contiguous window of it.
+            inputs: inputs[range.clone()]
+                .iter()
+                .map(|r| r.path.clone())
+                .collect(),
+            level,
+            span: (
+                inputs[range.start].min_sequence,
+                inputs[range.end - 1].max_sequence,
+            ),
+            path,
+        });
+        Ok(())
+    }
 
+    /// Wait for an in-flight merge to finish, leaving its result ready for the
+    /// next [`Flusher::adopt_merge`].
+    ///
+    /// For a graceful shutdown, and for `--inline-merges`, where a tick is
+    /// supposed to be a complete unit of work.
+    pub async fn wait_for_merge(&self) {
+        let handle = {
+            let mut held = self.pending_merge.lock();
+            held.as_mut().and_then(|p| p.handle.take())
+        };
+        let Some(handle) = handle else { return };
+        let result = match handle.await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("merge task failed: {e}")),
+        };
+        if let Some(pending) = self.pending_merge.lock().as_mut() {
+            pending.finished = Some(result);
+        }
+    }
+
+    /// Publish a finished merge and splice it into the stack. Returns whether it
+    /// did, i.e. whether it consumed `sequence`.
+    ///
+    /// The merge covers an **earlier span** than commits made while it ran, which
+    /// is precisely what the run-set format exists to express: the result is
+    /// spliced back at the position its inputs held, and the deltas committed
+    /// meanwhile stay above it.
+    ///
+    /// Published as its own snapshot carrying the **previous** watermark and no
+    /// data files, because that is what it covers: the merged runs, not the
+    /// memtable, which `swap_base` deliberately preserves. A commit claiming this
+    /// tick's watermark would tell a cold start that merges still sitting in the
+    /// memtable were durable, and replay would skip them.
+    async fn adopt_merge(&self, sequence: u64, watermark: u64) -> anyhow::Result<bool> {
+        // Take it only if it is ready, so a tick never blocks on the merge.
+        let pending = {
+            let mut held = self.pending_merge.lock();
+            let ready = held.as_ref().is_some_and(|p| {
+                p.finished.is_some() || p.handle.as_ref().is_some_and(|h| h.is_finished())
+            });
+            if ready { held.take() } else { None }
+        };
+        let Some(mut pending) = pending else {
+            return Ok(false);
+        };
+        let result = match pending.finished.take() {
+            Some(r) => r,
+            None => match pending.handle.take() {
+                // Already finished, so this resolves without waiting.
+                Some(h) => h.await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))),
+                None => return Ok(false),
+            },
+        };
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "background merge failed; will retry next cycle");
+                let _ = std::fs::remove_file(&pending.path);
+                return Ok(false);
+            }
+        };
+
+        let Some((stack, current)) = ({
+            let held = self.layers.lock();
+            held.as_ref().map(|l| (l.base.clone(), l.runs.clone()))
+        }) else {
+            return Ok(false);
+        };
+        // Where the merged runs sit *now*. Folds only append, so the window is
+        // normally still where it was — but `fold` can also rebuild the whole
+        // stack into one self-contained run, and then this merge describes state
+        // that no longer exists in that shape. Discarding is the right answer, and
+        // finding the window by identity is what detects it.
+        let Some(range) = locate_run_window(&current, &pending.inputs) else {
+            warn!("the stack changed under a background merge; discarding it");
+            let _ = std::fs::remove_file(&pending.path);
+            return Ok(false);
+        };
+        if current.iter().any(|r| r.remote.is_none()) {
+            // A local-only run appeared while we merged, so the set cannot be
+            // described. Keep the merged file: the next tick may be able to use it.
+            return Ok(false);
+        }
+
+        let merged_bytes = result.bytes.len() as u64;
+        let cstats = result.cstats;
         // Publish before adopting. An uncommitted run is a harmless orphan; a
         // worker serving from state the catalog does not know about would hand out
         // topology that no cold start could reproduce.
         let puffin_path = run_object_path(&self.table_prefix, sequence);
         self.store
-            .put(&puffin_path, PutPayload::from(bytes))
+            .put(&puffin_path, PutPayload::from(result.bytes))
             .await?;
         let merged = RunMeta {
             path: puffin_path.to_string(),
-            level: merged_level(&inputs[range.clone()]),
+            level: pending.level,
             // Inherits the span of everything it subsumed, which is what fixes its
-            // place in the resolution order.
-            min_sequence: inputs[range.start].min_sequence,
-            max_sequence: inputs[range.end - 1].max_sequence,
+            // place in the resolution order — and why it can be published at a
+            // sequence well past the span it covers.
+            min_sequence: pending.span.0,
+            max_sequence: pending.span.1,
             pairs: cstats.shared_pairs + cstats.overlay_pairs,
             bytes: merged_bytes,
         };
-        let Some(runs) = splice_run_set(&inputs, range.clone(), merged, sequence) else {
-            // Unreachable: every run was checked to have a remote above.
+        let Some(runs) = splice_run_set(&current, range.clone(), merged, sequence) else {
             warn!(
                 sequence,
                 "run set became undescribable mid-merge; discarding"
             );
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&pending.path);
             return Ok(false);
         };
         let base_sequence = runs[0].max_sequence;
@@ -636,20 +812,20 @@ impl Flusher {
                 sequence,
                 "compaction lost the commit race; discarding the merge"
             );
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&pending.path);
             return Ok(false);
         }
 
         let merged_runs = range.len();
-        let merged_level = runs[range.start].level;
-        let spliced = Arc::new(stack.spliced(range.clone(), Arc::new(PuffinBase::open(&path)?))?);
+        let spliced =
+            Arc::new(stack.spliced(range.clone(), Arc::new(PuffinBase::open(&pending.path)?))?);
         self.forest.swap_base(spliced.clone());
         // Local files in the spliced order: kept below, the merge, kept above.
-        let local_paths = inputs[..range.start]
+        let local_paths = current[..range.start]
             .iter()
             .map(|r| r.path.clone())
-            .chain(std::iter::once(path.clone()))
-            .chain(inputs[range.end..].iter().map(|r| r.path.clone()));
+            .chain(std::iter::once(pending.path.clone()))
+            .chain(current[range.end..].iter().map(|r| r.path.clone()));
         let next: Vec<LocalRun> = runs
             .iter()
             .zip(local_paths)
@@ -664,7 +840,7 @@ impl Flusher {
         // Only the runs the merge subsumed are gone. Unlinking a mapped file is
         // safe: the mapping keeps the inode alive until the last query using it
         // drops, and the space is reclaimed then.
-        for old in inputs[range].iter().map(|r| &r.path) {
+        for old in current[range].iter().map(|r| &r.path) {
             if let Err(e) = std::fs::remove_file(old) {
                 warn!(path = %old.display(), error = %e, "could not unlink merged run");
             }
@@ -672,14 +848,14 @@ impl Flusher {
         info!(
             sequence,
             merged_runs,
-            merged_level,
+            merged_level = pending.level,
             runs_now,
             shared_pairs = cstats.shared_pairs,
             overlay_pairs = cstats.overlay_pairs,
             registry_entries = cstats.registry_entries,
             registry_corrections = cstats.registry_corrections,
             moved_roots = cstats.moved_roots,
-            merged_ms,
+            merged_ms = result.merged_ms,
             "merged runs from storage; ingest was never stalled"
         );
         Ok(true)
@@ -693,10 +869,19 @@ impl Flusher {
     ///
     /// Normally the layer is a **delta** — only what the memtable itself
     /// contributes — so the fold costs O(memtable) in time and bytes and the
-    /// base is appended to rather than rewritten. It becomes a full base when
-    /// the chain is long enough to compact, when nothing has been mapped yet, or
-    /// when this worker's newest layer is local-only (see
-    /// [`LocalLayers::fully_committed`]).
+    /// base is appended to rather than rewritten. It becomes a self-contained run
+    /// only when nothing has been mapped yet, or when this worker holds a
+    /// local-only run (see [`LocalLayers::fully_committed`]), which is a stack
+    /// that cannot be described as a committed run set.
+    ///
+    /// It deliberately does **not** compact on depth. That was the only depth
+    /// control before tiering, and leaving it in place would preempt the policy:
+    /// with a merge in flight the stack still looks deep, so the fold would
+    /// rewrite the whole thing inline under the union lock — doing the merge's
+    /// work synchronously, which is exactly what detaching it was for. Depth is
+    /// [`tier::pick_merge`]'s job now, via its ceiling branch. A stack that stays
+    /// over the ceiling means merges are not completing, which degrades smoothly
+    /// and should be alerted on rather than papered over here.
     ///
     /// `force` = the caller is a leader that needs a layer to commit; otherwise
     /// the memtable-size trigger decides. Returns the Puffin bytes and how to
@@ -737,10 +922,18 @@ impl Flusher {
             .unwrap_or_default();
         let compact = match &current {
             None => true,
-            Some((base, _, fully_committed)) => {
-                base.delta_count() + 1 >= self.max_delta_layers || !fully_committed
-            }
+            Some((_, _, fully_committed)) => !fully_committed,
         };
+        if let Some((base, _, _)) = &current
+            && base.layers() > self.max_delta_layers
+        {
+            warn!(
+                runs = base.layers(),
+                max_delta_layers = self.max_delta_layers,
+                "run count is over the ceiling; merges are not keeping up, so lookups \
+                 and ingest are both paying for the depth"
+            );
+        }
 
         // Layer files accumulate, so each needs its own name — unlike a single
         // rewritten base, the older ones are still mapped and still consulted.

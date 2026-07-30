@@ -17,7 +17,7 @@ pub use compact::{CompactionStats, compact_layers};
 pub use filter::BlockedFilter;
 pub use flush::{
     DEFAULT_FOLD_AFTER_LINKS, DEFAULT_MAX_DELTA_LAYERS, Flusher, LocalLayers, LocalRun,
-    hydrate_from_catalog, open_base_from_catalog,
+    PendingMerge, hydrate_from_catalog, open_base_from_catalog,
 };
 pub use layered::LayeredBase;
 pub use tier::{DEFAULT_TIER_FANOUT, pick_merge};

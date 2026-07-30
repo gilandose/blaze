@@ -60,6 +60,8 @@ async fn main() -> anyhow::Result<()> {
         max_delta_layers: usize::MAX,
         // No level ever fills and the ceiling is never reached, so nothing merges.
         tier_fanout: usize::MAX,
+        inline_merges: true,
+        pending_merge: parking_lot::Mutex::new(None),
         layers: parking_lot::Mutex::new(None),
     };
 

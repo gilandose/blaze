@@ -87,6 +87,8 @@ struct Warehouse {
     cache: tempfile::TempDir,
     /// The worker's layer stack, carried between ticks.
     held: std::sync::Mutex<Option<blaze::storage::LocalLayers>>,
+    /// Likewise an in-flight merge, so a detached one survives to be adopted.
+    held_merge: std::sync::Mutex<Option<blaze::storage::PendingMerge>>,
 }
 
 impl Warehouse {
@@ -103,6 +105,7 @@ impl Warehouse {
             _dir: dir,
             cache: tempfile::tempdir().unwrap(),
             held: std::sync::Mutex::new(None),
+            held_merge: std::sync::Mutex::new(None),
         }
     }
 
@@ -176,6 +179,55 @@ impl Warehouse {
         max_delta_layers: usize,
         tier_fanout: usize,
     ) {
+        self.flush_full(
+            forest,
+            first_offset,
+            events,
+            fold_after,
+            leader,
+            max_delta_layers,
+            tier_fanout,
+            true,
+        )
+        .await;
+    }
+
+    /// One flush tick with merges detached, the production default: a merge
+    /// started here lands in a later tick.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_detached(
+        &self,
+        forest: Arc<ScopedForest>,
+        first_offset: u64,
+        events: &[EdgeEvent],
+        max_delta_layers: usize,
+        tier_fanout: usize,
+    ) {
+        self.flush_full(
+            forest,
+            first_offset,
+            events,
+            u64::MAX,
+            true,
+            max_delta_layers,
+            tier_fanout,
+            false,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_full(
+        &self,
+        forest: Arc<ScopedForest>,
+        first_offset: u64,
+        events: &[EdgeEvent],
+        fold_after: u64,
+        leader: bool,
+        max_delta_layers: usize,
+        tier_fanout: usize,
+        inline_merges: bool,
+    ) {
         let buffer = Arc::new(EdgeBuffer::new());
         for (i, e) in events.iter().enumerate() {
             buffer.append(first_offset + i as u64, e);
@@ -197,10 +249,13 @@ impl Warehouse {
             fold_after_links: fold_after,
             max_delta_layers,
             tier_fanout,
+            inline_merges,
             layers: parking_lot::Mutex::new(self.held.lock().unwrap().take()),
+            pending_merge: parking_lot::Mutex::new(self.held_merge.lock().unwrap().take()),
         };
         flusher.tick().await.unwrap();
         *self.held.lock().unwrap() = flusher.layers.lock().take();
+        *self.held_merge.lock().unwrap() = flusher.pending_merge.lock().take();
     }
 
     /// Cold-start a base-backed forest from the latest committed snapshot.
@@ -1199,6 +1254,118 @@ async fn runs_promote_through_levels_without_changing_answers() {
         // Components must not have bled into each other across merges.
         if tick + 1 < TICKS {
             assert!(!cold.connected(GLOBAL_SCOPE, tick * 100, (tick + 1) * 100));
+        }
+    }
+}
+
+/// A merge must run in the background while folds and commits carry on, and its
+/// output must splice in at the position its inputs held even though the stack
+/// grew underneath it.
+///
+/// This is what the run-set format was built for, and the observable is sharp: a
+/// detached merge is **published at a sequence later than the span it covers**.
+/// `base_sequence` + `delta_chain_len` cannot express that at all — there is no
+/// sequence at which "a base plus everything after it" describes a run that
+/// covers 1..=3 sitting below a delta committed at 4.
+///
+/// The reason it matters is the memtable. Awaiting a merge inside the tick meant
+/// nothing folded for its duration, so the memtable grew unbounded by the fold
+/// trigger for however many minutes a high-level merge took.
+#[tokio::test]
+async fn a_merge_runs_detached_while_folds_carry_on() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+    const MAX_LAYERS: usize = 3;
+
+    // Three ticks build three runs; the fourth finds the ceiling reached.
+    for tick in 0..4u64 {
+        let events: Vec<EdgeEvent> = (0..10)
+            .map(|i| global_edge(tick * 100 + i, tick * 100 + i + 1))
+            .collect();
+        for e in &events {
+            forest.apply(e);
+        }
+        wh.flush_detached(forest.clone(), offset, &events, MAX_LAYERS, usize::MAX)
+            .await;
+        offset += events.len() as u64;
+    }
+
+    // Tick 4 started the merge and did *not* wait for it: it folded and committed
+    // its batch at sequence 4 regardless. That is the property — under the old
+    // inline behaviour this commit could not have happened until the merge was
+    // done.
+    let during = wh.latest_meta().await;
+    assert_eq!(during.sequence, 4);
+    assert!(
+        !during.data_files.is_empty(),
+        "the tick that started the merge must still commit its batch"
+    );
+    assert_eq!(
+        forest.memtable_links(),
+        0,
+        "the fold must have drained the memtable while the merge ran"
+    );
+    let RunSet::Runs(runs) = during.run_set().unwrap() else {
+        panic!("expected a run set");
+    };
+    assert_eq!(
+        runs.len(),
+        4,
+        "the merge has not landed yet, so all four runs are still listed"
+    );
+
+    // The next tick adopts it.
+    let events: Vec<EdgeEvent> = (0..10).map(|i| global_edge(900 + i, 901 + i)).collect();
+    for e in &events {
+        forest.apply(e);
+    }
+    wh.flush_detached(forest.clone(), offset, &events, MAX_LAYERS, usize::MAX)
+        .await;
+
+    // Sequence 5 is the merge, 6 the batch that followed it.
+    let merge = wh.catalog.get(5).await.unwrap();
+    assert!(merge.data_files.is_empty(), "a merge commits no data");
+    let RunSet::Runs(after) = merge.run_set().unwrap() else {
+        panic!("expected a run set");
+    };
+    assert_eq!(
+        after
+            .iter()
+            .map(|r| (r.level, r.min_sequence, r.max_sequence))
+            .collect::<Vec<_>>(),
+        // The merged run covers 1..=3 and sits *below* the delta committed at 4
+        // while it was running — which then takes the span extension over 5.
+        vec![(1, 1, 3), (0, 4, 5)],
+        "the merge must splice in below the runs committed while it ran"
+    );
+    assert!(
+        after[0].max_sequence < merge.sequence,
+        "a detached merge is published later than the span it covers, which is \
+         exactly what base_sequence + delta_chain_len cannot express"
+    );
+
+    // Everything still answers, from a cold start built only from the run set.
+    let cold = tempfile::tempdir().unwrap();
+    let (base, _, _) = open_base_from_catalog(&wh.store, &wh.catalog, cold.path())
+        .await
+        .unwrap()
+        .expect("a committed snapshot");
+    let cold = Arc::new(ScopedForest::with_base(base));
+    for tick in 0..4u64 {
+        assert!(
+            cold.connected(GLOBAL_SCOPE, tick * 100, tick * 100 + 10),
+            "tick {tick}'s component was lost across a detached merge"
+        );
+    }
+    assert!(cold.connected(GLOBAL_SCOPE, 900, 910));
+    for tick in 0..4u64 {
+        for i in 0..=10u64 {
+            assert_eq!(
+                cold.scope_root(GLOBAL_SCOPE, tick * 100 + i),
+                forest.scope_root(GLOBAL_SCOPE, tick * 100 + i),
+                "tick {tick} node {i} diverged"
+            );
         }
     }
 }

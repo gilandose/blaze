@@ -41,6 +41,40 @@ Worth noting the splice is already proven sound: `M ≡ [L0..Lk]`, and `Lk+1`'s 
 were composed roots of `[L0..Lk]`, hence of `[M]` — so disjointness holds and
 `swap_base` accepts it. That argument is in `core/scoped.rs`.
 
+## Shipped: (a), detached in-process
+
+The format landed with tiering, and (a) is now the default — `--inline-merges`
+turns it off. `start_merge` spawns onto a blocking thread and returns; a later
+tick's `adopt_merge` publishes the result and splices it in. Folds and commits run
+throughout, which was the point: awaiting a merge inside the tick meant nothing
+drained the memtable for its duration, so the fold trigger stopped bounding
+memory for however many minutes a high-level merge took.
+
+Three things this needed that were not obvious up front:
+
+- **The merged run is located by identity, not by remembered indices.** A merge
+  outlives the stack it was planned against — folds append below it, and a
+  full-stack fold can replace it outright. `adopt_merge` finds its inputs as a
+  contiguous window by path and discards the merge if that window is gone, rather
+  than splicing over whatever now sits at those positions.
+- **`fold` had to stop compacting on depth.** That was the only depth control
+  before tiering, and left in place it preempted the policy: with a merge in
+  flight the stack still looks deep, so the fold rewrote the whole thing inline
+  under the union lock — performing the merge's work synchronously, which is
+  precisely what detaching it was meant to avoid. Caught by the first run of the
+  detached test, which found one run where it expected four. `fold` now compacts
+  only when there is no stack yet or the stack holds a local-only run; depth is
+  `pick_merge`'s ceiling branch, and a stack stuck over the ceiling logs a warning
+  rather than being papered over.
+- **A merge is published later than the span it covers.** That is the observable
+  the run-set format exists for and what the test asserts directly: a run covering
+  1..=3 committed at sequence 5, sitting below a delta committed at 4 while it
+  ran. No value of `base_sequence` + `delta_chain_len` describes that.
+
+Still true and still worth doing: `wait_for_merge` exists for graceful shutdown,
+and a process that exits with a merge in flight leaves an orphan file on local
+disk that nothing references.
+
 ## (a) Detached task, same process
 
 A background task that the tick kicks off and does not await; on completion it

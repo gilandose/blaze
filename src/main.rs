@@ -66,6 +66,14 @@ struct Args {
     #[arg(long, default_value_t = blaze::storage::DEFAULT_TIER_FANOUT)]
     tier_fanout: usize,
 
+    /// Await each merge inside the tick that starts it, rather than letting it
+    /// run in the background (--routing-base disk only). Off by default, because
+    /// a detached merge is what lets folds keep draining the memtable while a
+    /// merge runs. Turn it on when ingest must not be able to outrun compaction,
+    /// or when each tick should be a complete unit of work.
+    #[arg(long, default_value_t = false)]
+    inline_merges: bool,
+
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
     flush_interval_secs: u64,
@@ -246,6 +254,8 @@ async fn main() -> anyhow::Result<()> {
         fold_after_links: args.fold_after_links,
         max_delta_layers: args.max_delta_layers,
         tier_fanout: args.tier_fanout,
+        inline_merges: args.inline_merges,
+        pending_merge: parking_lot::Mutex::new(None),
         layers: parking_lot::Mutex::new(local_layers),
     });
     let flush_handle = tokio::spawn(
