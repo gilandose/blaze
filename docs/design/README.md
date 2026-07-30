@@ -36,6 +36,7 @@ Three consequences of this profile shape everything below:
 | [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed |
 | [005](005-union-tier.md) | Union tier (`all` view) & shared/global naming | semantics gap | designed |
 | [006](006-tiered-compaction.md) | Size-tiered compaction + backfill sizing | write amplification, layer count | designed — **next** |
+| [007](007-compaction-execution.md) | Where compaction runs (detached / process / deployment) | compaction's cost to serving | designed — blocked on 006's format |
 
 Recommended implementation order: **006** first (it demotes 001's remaining
 storage-side compaction work off the critical path and is what keeps the layer
