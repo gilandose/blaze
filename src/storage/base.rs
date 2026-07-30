@@ -375,6 +375,21 @@ impl PuffinBase {
         (t.key_at(&self.mmap, i), t.value_at(&self.mmap, i))
     }
 
+    /// Entries in this layer's `root -> scope` registry blob.
+    pub fn registry_len(&self) -> usize {
+        self.registry.as_ref().map(|t| t.count).unwrap_or(0)
+    }
+
+    /// `i`th registry entry, in the blob's stored `(root, scope)` order.
+    ///
+    /// Ordered access matters: compaction merges the layers' registries as
+    /// sorted runs rather than sorting a copy of them, which is what keeps it
+    /// off an O(state) buffer.
+    pub fn registry_at(&self, i: usize) -> (NodeId, ScopeId) {
+        let t = self.registry.as_ref().expect("registry table");
+        (t.root_at(&self.mmap, i), t.scope_at(&self.mmap, i))
+    }
+
     /// Heap held by the sparse indexes — the one part of the base that is
     /// *not* free to map, so it belongs in stats rather than in the shadows.
     fn index_bytes(&self) -> u64 {

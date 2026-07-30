@@ -773,6 +773,78 @@ async fn compaction_fires_on_the_layer_trigger_and_resets_the_chain() {
     assert_eq!(cold.base_stats().unwrap().sequence, 5);
 }
 
+/// Compaction merges the *committed layer files*, taking no union lock and
+/// never reading the forest — so the memtable it runs alongside must still be
+/// there afterwards, holding everything that arrived during the merge.
+///
+/// This is the observable difference from the in-memory compactor, which drains
+/// the memtable as part of the same locked step. Getting it wrong loses every
+/// event applied since the last fold, so assert it directly rather than relying
+/// on another test noticing the gap.
+#[tokio::test]
+async fn storage_side_compaction_preserves_the_memtable() {
+    let wh = Warehouse::new();
+    let forest = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+    const MAX_LAYERS: usize = 3;
+
+    // Ticks 0..3 build base + 2 deltas.
+    for tick in 0..3u64 {
+        let events: Vec<EdgeEvent> = (0..10)
+            .map(|i| global_edge(tick * 100 + i, tick * 100 + i + 1))
+            .collect();
+        for e in &events {
+            forest.apply(e);
+        }
+        wh.flush_layered(forest.clone(), offset, &events, u64::MAX, true, MAX_LAYERS)
+            .await;
+        offset += events.len() as u64;
+    }
+    assert_eq!(forest.memtable_links(), 0, "each tick folded");
+
+    // Now apply events that exist *only* in the memtable, then trigger the
+    // compaction tick. Nothing has folded them into a layer.
+    let orphans: Vec<EdgeEvent> = (0..10).map(|i| global_edge(9000 + i, 9001 + i)).collect();
+    for e in &orphans {
+        forest.apply(e);
+    }
+    let pending = forest.memtable_links();
+    assert_eq!(pending, 10, "10 merges live only in the memtable");
+    let folds_before = forest.stats().folds;
+
+    wh.flush_layered(forest.clone(), offset, &orphans, u64::MAX, true, MAX_LAYERS)
+        .await;
+
+    // The compaction happened, and it did *not* fold.
+    let meta = wh.latest_meta().await;
+    assert_eq!(
+        (meta.sequence, meta.base_sequence, meta.delta_chain_len),
+        (4, 4, 0),
+        "the chain should have been compacted into a fresh base"
+    );
+    assert_eq!(
+        forest.stats().folds,
+        folds_before,
+        "storage-side compaction must not fold the memtable"
+    );
+    assert_eq!(
+        forest.memtable_links(),
+        pending,
+        "the memtable must survive compaction untouched"
+    );
+    assert!(meta.data_files.is_empty(), "a compaction commits no data");
+
+    // Both halves still answer: the compacted base, and the preserved memtable.
+    for tick in 0..3u64 {
+        assert!(forest.connected(GLOBAL_SCOPE, tick * 100, tick * 100 + 10));
+    }
+    assert!(
+        forest.connected(GLOBAL_SCOPE, 9000, 9010),
+        "memtable-only state was lost by the compaction"
+    );
+    assert_eq!(forest.scope_root(GLOBAL_SCOPE, 9010), 9000);
+}
+
 /// A worker that folded locally without committing must not then commit a
 /// delta: the committed chain would be missing those layers, and a cold start
 /// would silently reconstruct incomplete topology.

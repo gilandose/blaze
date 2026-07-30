@@ -21,6 +21,7 @@ use crate::ha::LeaderElector;
 use crate::ingest::EdgeBuffer;
 use crate::storage::base::PuffinBase;
 use crate::storage::catalog::{CommitOutcome, DataFileMeta, SnapshotCatalog, SnapshotMeta};
+use crate::storage::compact::compact_layers;
 use crate::storage::layered::LayeredBase;
 use crate::storage::{codec, parquet_io, puffin};
 
@@ -164,6 +165,17 @@ impl Flusher {
             return Ok(());
         }
 
+        // Before anything else: if the layer chain has grown long, merge it
+        // from storage and publish the result as its own snapshot. That takes no
+        // union lock, so ingest runs throughout; this tick then ends and the
+        // next one commits its delta on top of the fresh base.
+        if self
+            .maybe_compact_chain(sequence, latest.as_ref().map(|s| s.watermark).unwrap_or(0))
+            .await?
+        {
+            return Ok(());
+        }
+
         let segments = self.buffer.sealed_segments();
         if segments.is_empty() {
             return Ok(());
@@ -259,6 +271,104 @@ impl Flusher {
         Ok(())
     }
 
+    /// Merge the layer chain into a single base **from storage**, and publish
+    /// it. Returns whether it did.
+    ///
+    /// This is the compaction that matters, and what makes it different from
+    /// `ScopedForest::compact_and_fold` is what it does *not* touch: the inputs
+    /// are immutable committed layer files that are already mapped, so no union
+    /// lock is taken, the forest is never read, and ingest runs at full rate for
+    /// however many minutes the merge takes. At 2B links that is the difference
+    /// between a 32-minute ingest stall and none.
+    ///
+    /// It is published as its own snapshot carrying the **previous** watermark
+    /// and no data files, because that is exactly what it covers: the merged
+    /// layers, not the memtable, which `swap_base` deliberately preserves. A
+    /// commit claiming this tick's watermark would tell a cold start that merges
+    /// still sitting in the memtable were durable, and replay would skip them.
+    async fn maybe_compact_chain(&self, sequence: u64, watermark: u64) -> anyhow::Result<bool> {
+        let Some(dir) = &self.base_dir else {
+            return Ok(false);
+        };
+        let Some((stack, paths)) = ({
+            let held = self.layers.lock();
+            held.as_ref().map(|l| (l.base.clone(), l.paths.clone()))
+        }) else {
+            return Ok(false);
+        };
+        if stack.delta_count() + 1 < self.max_delta_layers {
+            return Ok(false);
+        }
+
+        let started = std::time::Instant::now();
+        let (blobs, cstats) = compact_layers(&stack, sequence);
+        let bytes = puffin::write(&blobs, puffin_metadata(watermark));
+        let path = dir.join(format!(
+            "routing-{}-{sequence:012}-base.puffin",
+            self.worker_id
+        ));
+        write_atomically(&path, &bytes)?;
+        let merged_ms = started.elapsed().as_millis() as u64;
+
+        // Publish before adopting. An uncommitted base is a harmless orphan; a
+        // worker serving from a base the catalog does not know about would hand
+        // out topology that no cold start could reproduce.
+        let puffin_path = self
+            .table_prefix
+            .clone()
+            .join("puffin")
+            .join(format!("dsu-{sequence:012}.puffin"));
+        self.store
+            .put(&puffin_path, PutPayload::from(bytes))
+            .await?;
+        let meta = SnapshotMeta {
+            sequence,
+            committed_at_ms: now_ms(),
+            watermark,
+            data_files: vec![],
+            puffin_path: puffin_path.to_string(),
+            committer: self.worker_id.clone(),
+            base_sequence: sequence,
+            delta_chain_len: 0,
+        };
+        if self.catalog.commit(&meta).await? == CommitOutcome::Conflict {
+            warn!(
+                sequence,
+                "compaction lost the commit race; discarding the merge"
+            );
+            let _ = std::fs::remove_file(&path);
+            return Ok(false);
+        }
+
+        let merged_layers = stack.layers();
+        let flat = Arc::new(LayeredBase::new(Arc::new(PuffinBase::open(&path)?)));
+        self.forest.swap_base(flat.clone());
+        *self.layers.lock() = Some(LocalLayers {
+            base: flat,
+            paths: vec![path],
+            base_sequence: sequence,
+            committed_through: Some(sequence),
+        });
+        // Unlinking a mapped file is safe: the mapping keeps the inode alive
+        // until the last query using it drops, and the space is reclaimed then.
+        for old in paths {
+            if let Err(e) = std::fs::remove_file(&old) {
+                warn!(path = %old.display(), error = %e, "could not unlink merged layer");
+            }
+        }
+        info!(
+            sequence,
+            merged_layers,
+            shared_pairs = cstats.shared_pairs,
+            overlay_pairs = cstats.overlay_pairs,
+            registry_entries = cstats.registry_entries,
+            registry_corrections = cstats.registry_corrections,
+            merged_ms,
+            "compacted the layer chain from storage; ingest was never stalled"
+        );
+        Ok(true)
+    }
+
     /// Drain the memtable into a new local layer.
     ///
     /// This is the step that makes the disk tier's RAM bound hold for longer
@@ -333,7 +443,9 @@ impl Flusher {
         let mut writer = codec::BlobWriter::new(sequence);
 
         let (bytes, next) = if compact {
-            // Full base: stream the whole composed state (base ⊕ memtable).
+            // No committed chain to merge (the first commit in disk mode):
+            // stream the live forest under the lock. Every other compaction goes
+            // through `maybe_compact_chain`, which takes no lock at all.
             let out = self.forest.compact_and_fold(&mut writer, |w| {
                 let bytes = puffin::write(&w.finish(), puffin_metadata(watermark));
                 write_atomically(&path, &bytes)?;

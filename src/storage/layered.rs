@@ -69,6 +69,12 @@ impl LayeredBase {
         self.layers.len()
     }
 
+    /// The `i`th layer, oldest first. Storage-side compaction merges the
+    /// layers' registry runs directly, which needs positional access.
+    pub fn layer(&self, i: usize) -> &PuffinBase {
+        &self.layers[i]
+    }
+
     /// Resolve `node` through the layers using `probe` to read one layer.
     ///
     /// Starts at `from` and only ever moves forward, which is sound because a
