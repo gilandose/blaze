@@ -44,8 +44,9 @@ const PAGE_BYTES: usize = 4096;
 /// however the payload happens to be aligned inside the Puffin file.
 ///
 /// Cost is one `u64` per block: `8/PAGE_BYTES × stride` of the table's own
-/// size, i.e. 0.4% for pair tables (~62 MB indexing a 16 GB shared tier) and
-/// 0.3% for the registry.
+/// size — 8 bytes per 4 KiB block, i.e. **0.2%** for every table regardless of
+/// stride, so ~32 MB indexes a 16 GB shared tier. (Measured: 0.2 MB for a
+/// 113 MB base.)
 #[derive(Debug)]
 struct SparseIndex {
     /// Entries per block.

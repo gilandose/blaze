@@ -348,7 +348,7 @@ one block, and only then touches the mapping — over 4 KiB of *contiguous*
 bytes, so 1–2 mapped pages regardless of how the payload is aligned inside the
 Puffin file. `narrowed_search_reads_at_most_one_block` pins that bound as a
 test, because a probe whose base fits in page cache cannot observe it. The
-index costs one `u64` per block: 0.4% of the table it indexes, so ~62 MB to
+index costs one `u64` per block: 0.2% of the table it indexes, so ~32 MB to
 index a 16 GB shared tier, reported as `index_bytes` in `/stats`. The mapping
 is also advised `MADV_RANDOM`, since default readahead prefetches pages a
 binary search will never visit — except during a compaction sweep, which
@@ -465,11 +465,66 @@ What still scales with state, named so it is not mistaken for solved:
 - **The Puffin file itself**, buffered in RAM before it is written and
   uploaded. Streaming it to disk and doing a multipart upload would remove
   this; it is only invisible today because a fold already dominates.
-- **The sparse index**, ~0.4% of the base — the deliberate price of bounding
+- **The sparse index**, ~0.2% of the base — the deliberate price of bounding
   cold-page faults.
 - **The registry buffer built during compaction**, 12 bytes per overlay
   endpoint, because it must be sorted by root *across* scopes and so cannot
   stream without an external sort.
+
+## Scaling to billions of links
+
+Extrapolated from the measured per-unit constants above, not estimated:
+**1.068 pairs per link**, **35 B/pair** in the base file (16 B pair + ~19 B of
+registry), **0.2%** sparse index, **0.91 µs/pair** compaction, **160 B/link** if
+held in RAM instead.
+
+| links | pairs | base file | process RSS (disk mode) | RSS if all-RAM | compaction, 1 core | registry sort buffer |
+|---|---|---|---|---|---|---|
+| 100M | 107M | 3.8 GB | ~110 MB | 16 GB | 1.6 min | 2 GB |
+| 1B | 1.07B | 38 GB | ~180 MB | 160 GB | 16 min | 20 GB |
+| 2B | 2.14B | 75 GB | ~300 MB | 320 GB | 32 min | **41 GB** |
+
+**Memory is genuinely flat.** At 2B links the process holds the sparse index
+(150 MB), one flush interval of memtable (~30 MB at 3k events/s), the Arrow
+buffer (~20 MB) and the delta layers' indexes (<1 MB) — call it 300 MB against
+320 GB for the same state in the heap. Page cache then uses whatever RAM the box
+has as a *cache*: the SLO is met at a 0% hit rate (1–2 cold NVMe faults, ~10–100
+µs), so cache size buys throughput, not correctness. A 16–32 GB instance serves
+2B links.
+
+**Steady-state writes are flat too**, because they scale with change, not state:
+7.6 MB and ~0.26 s per tick at 3k events/s, whatever the base weighs — about
+11 GB/day of deltas.
+
+**Local disk**: base 75 GB + 24 deltas ≈ 75 GB, but compaction needs the old and
+new base at once, so provision ~2×. An `i4i.2xlarge` (1.7 TB NVMe) is ample.
+
+### Where it actually breaks today
+
+Compaction, and only compaction. Three things, in the order they bite:
+
+1. **The registry sort buffer is 41 GB at 2B links** — it must be sorted by root
+   *across* scopes, so it is buffered whole. This OOMs before anything else does.
+   Worth noting it is also **55% of the base file**: grouping by root (root once +
+   varint scope list) instead of a flat 12 B stride would cut both the buffer and
+   ~30 GB of disk.
+2. **32 minutes under the union lock** is 32 minutes of stalled ingest. Design
+   001's storage-side compaction fixes this by construction — it reads the
+   committed layers, takes no lock, and can run as a separate job. Compaction also
+   shards trivially by scope (the blobs are independent), so ~32 min on one core
+   is ~4 min on eight.
+3. **The Puffin file is buffered in RAM** before upload — 75 GB. Needs a
+   streaming writer plus multipart upload.
+
+So the honest ceiling today is set by tolerable stall and that buffer: **roughly
+50–100M links** (a 60 s stall is ~66M pairs). Deltas mean flushes stay cheap far
+beyond that, but a base you cannot compact is a base that eventually stops being
+compactable.
+
+With those three fixed, 2B is unremarkable: compaction becomes a background job
+costing minutes of CPU on a node that is not serving. [Design
+002](docs/design/002-dense-interning.md) (u32 interning) then halves pair bytes
+on top — 75 GB → ~45 GB, and compaction time with it.
 
 ## Next phase
 

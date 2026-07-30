@@ -73,6 +73,7 @@ fn main() {
     // Streaming with a sink that counts and drops: compaction's own footprint,
     // with the unavoidable output removed. This is the allocation that goes
     // from ~57 MB here to ~32 GB at 2B links if it is not streamed.
+    #[derive(Debug)]
     struct Counting(usize);
     impl blaze::core::SnapshotSink for Counting {
         fn shared_pair(&mut self, _n: u64, _r: u64) {
@@ -303,6 +304,22 @@ fn main() {
         "base + 3 deltas: {:>9.0} lookups/s   ({:.2} us each)",
         Q as f64 / layered_secs,
         layered_secs * 1e6 / Q as f64
+    );
+
+    // --- compaction through the layer stack ---
+    // This is the real compaction path now, and the one cost that still scales
+    // with total state: it k-way merges every layer and re-resolves each key.
+    let before = rss_mb();
+    let t = Instant::now();
+    let mut counting = Counting(0);
+    delta_forest.compact_into(&mut counting);
+    let layered_compact = t.elapsed().as_secs_f64();
+    println!(
+        "compaction through base + 3 deltas: {:.0} ms for {} pairs ({:.2} us/pair), +{:.0} MB heap",
+        layered_compact * 1000.0,
+        counting.0,
+        layered_compact * 1e6 / counting.0 as f64,
+        rss_mb() - before
     );
 
     std::fs::remove_file(&fold_path).ok();

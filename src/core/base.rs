@@ -84,7 +84,7 @@ pub struct BaseStats {
     /// Bytes mapped (file size), not resident bytes.
     pub mapped_bytes: u64,
     /// Heap held by in-RAM lookup indexes over the mapping. Small and
-    /// proportional to `mapped_bytes` (~0.4%), but not zero — the one part of
+    /// proportional to `mapped_bytes` (~0.2%), but not zero — the one part of
     /// a disk-backed base that still scales with state.
     pub index_bytes: u64,
     /// True when the base carried a precomputed registry blob; false means
