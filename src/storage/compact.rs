@@ -32,11 +32,22 @@
 //! # Why "did this root move?" is a hash probe, not a resolution
 //!
 //! The obvious test is `shared_parent(root).is_some()`, but at depth 8 that is
-//! eight binary searches over the mapping, per entry, twice — measured as ~73%
-//! of total compaction time (109 s of 137 s on a 68M-entry registry). See
-//! [`moved_roots`] for the equivalent test that costs one hash probe, and
-//! `moved_root_set_is_equivalent_to_probing_every_root` for the assertion that
-//! keeps the two definitions in step.
+//! eight binary searches over the mapping, per entry, twice — measured as ~38-40%
+//! of compaction time. See [`moved_roots`] for the equivalent test that costs one
+//! hash probe, and `moved_root_set_is_equivalent_to_probing_every_root` for the
+//! assertion that keeps the two definitions in step.
+//!
+//! Measured on an identical compaction — same 6.0M shared and 34.4M overlay
+//! pairs, same 68.0M registry entries, same 359,223 corrections, same 1.46 GB
+//! output — this plus the parallel overlay merge took compaction from **136.8 s
+//! to 62.6 s (2.19x)**. The corrections count coming out identical is also the
+//! strongest available check on the equivalence: same data, same answer, reached
+//! by a different mechanism.
+//!
+//! Attribution, since a first estimate got this wrong: the resolve was ~38-40% of
+//! compaction time, not the ~73% first claimed. That estimate priced the
+//! pair-merge portion using a *depth-4* per-pair cost, but pairs get more
+//! expensive with depth too, so the registry's share was proportionally smaller.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::{BTreeMap, HashSet};
@@ -195,7 +206,7 @@ struct Run {
 ///
 /// This is the cheap test for "has this registry root moved?", and it replaces a
 /// `shared_parent` probe per registry entry — which at depth 8 is eight binary
-/// searches over the mapping, and measured as ~73% of total compaction time.
+/// searches over the mapping, and measured as ~38-40% of compaction time.
 ///
 /// It is exact, not an approximation. A registry entry recorded in layer `i`
 /// carries a root that had no parent in layers `0..=i` (that is what made it a

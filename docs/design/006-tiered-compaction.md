@@ -53,6 +53,12 @@ the old and new base at once.
 
 - **The quadratic is the headline.** Linear per-pair cost × linearly growing state
   per cycle = quadratic total. This is the ceiling, and no dial avoids it.
+- **Since measured, the constant improved 2.19x** — an identical compaction (same
+  5,999,436 shared and 34,412,994 overlay pairs, same 67,999,607 registry entries,
+  same 359,223 corrections, same 1.46 GB output) went from **136.8 s to 62.6 s**,
+  via a moved-root hash set in place of a per-entry `shared_parent` resolve plus a
+  parallel per-scope overlay merge. That changes the constant only: the total is
+  still quadratic, so tiering remains the precondition.
 - **Effective throughput was 43k links/s** end to end including folds and
   compactions — against 253k/s ingest at one layer, and the 357k/s the DSU
   sustains with no base attached at all.
