@@ -94,9 +94,15 @@ Consequences:
 
 - **Layer count is logarithmic**, ~6–8 runs total instead of thousands, so a
   lookup stays at a handful of probes. Note this bounds depth but does not make
-  depth cheap: measured, 8 layers still costs 3.97x ingest throughput and 6.1x
-  lookup latency versus one. Tiering and per-layer filters solve different halves
-  of the problem and both are wanted.
+  depth free: with per-layer blocked filters shipped, 8 layers costs 1.98x ingest
+  and 3.06x lookups versus one (down from 3.97x and 6.10x without them). Tiering
+  and filters solve different halves and both are wanted — filters make each layer
+  cheap, tiering stops the count growing without bound.
+
+  The filters also move this design's own arithmetic: total merge work goes as
+  `N²/(2·F·L)`, so it is inversely proportional to depth. Measured, **16 layers
+  now cost less than 8 did**, which halves the quadratic constant for free before
+  tiering changes the exponent at all.
 - **Write amplification is O(log N) per link**, not O(state) per compaction. Each
   link is rewritten ~once per level it passes through: ~6 times over its life,
   versus a full-base rewrite that costs 600,000× that at this change rate.

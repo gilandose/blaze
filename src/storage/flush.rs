@@ -77,24 +77,28 @@ pub const DEFAULT_FOLD_AFTER_LINKS: u64 = 1_000_000;
 
 /// Delta layers to carry before compacting.
 ///
-/// This is a read *and write* amplification dial, and depth is more expensive
-/// than it looks. Measured on identical state
-/// (`examples/layer_depth.rs`), going from 1 layer to 8 costs **3.97x ingest
-/// throughput** and **6.1x lookup latency**; 16 layers costs 5.8x and 8.8x.
-/// Depth taxes three paths, because all of them resolve through the stack:
-/// queries (~+0.65 µs per layer), `apply` (~+1.3 µs per link per layer), and
-/// folds, which are O(memtable × layers) rather than O(memtable).
+/// This is a read *and write* amplification dial, because every path resolves
+/// through the stack: queries, `apply`, folds (O(memtable × layers)) and
+/// compaction (O(pairs × layers)).
+///
+/// Measured on identical state (`examples/layer_depth.rs`), with the per-layer
+/// blocked filters in place:
+///
+/// | layers | ingest/s | vs 1 layer | lookup µs | vs 1 layer |
+/// |---|---|---|---|---|
+/// | 1 | 216,963 | 1.00x | 1.01 | 1.00x |
+/// | 8 | 109,487 | 1.98x | 3.10 | 3.06x |
+/// | 16 | 65,850 | 3.29x | 4.90 | 4.84x |
+///
+/// The filters roughly halved the depth penalty — before them, 8 layers cost
+/// 3.97x ingest and 6.10x lookups. Usefully, **16 layers now cost less than 8
+/// used to**, and since total compaction work over a backfill goes as
+/// `N²/(2·F·L)`, doubling viable depth halves the merge work.
 ///
 /// The default of 24 suits *serving*: at ~50 links/s the ingest cost is
-/// irrelevant and ~16 µs lookups are far inside the SLO. It is a poor choice
-/// while **backfilling**, where ingest rate is the entire objective — prefer 2-4
-/// with a large `fold_after_links`, and accept more frequent compaction.
-///
-/// The fix that removes the trade instead of balancing it is a per-layer
-/// membership filter, so a miss costs one probe rather than a binary search per
-/// layer. It must be a *blocked* filter — all of a key's bits in one cache line
-/// — since a classical bloom with k=7 over a multi-megabyte filter is ~7 cache
-/// misses and no cheaper than the search it replaces.
+/// irrelevant and single-digit-µs lookups are far inside the SLO. It is still
+/// the wrong choice while **backfilling**, where ingest rate is the objective —
+/// though the trade is now much flatter than it was.
 pub const DEFAULT_MAX_DELTA_LAYERS: usize = 24;
 
 /// Warn when a fold stalls ingest for longer than this.
