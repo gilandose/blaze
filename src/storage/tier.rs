@@ -34,6 +34,14 @@ use std::ops::Range;
 /// at ~126 KB per L0 run it puts a 75 GB base at six levels, so a lookup scans
 /// tens of runs rather than thousands, and each link is rewritten ~6 times over
 /// its life.
+///
+/// The direction of the trade is easy to get backwards. Write amplification is
+/// roughly the number of levels, `log_T(F)`, so a **larger** fanout rewrites
+/// *less* — measured (`examples/tier_amplification`), `T=2` cost 13.58x against
+/// `T=10`'s 4.96x on identical ingest. What a large fanout costs is depth:
+/// `(T-1)·log_T(F)` runs to probe, since a level holds up to `T-1` runs before it
+/// merges. So fanout is chosen for the depth budget, and within that budget
+/// bigger is better.
 pub const DEFAULT_TIER_FANOUT: usize = 10;
 
 /// Which runs to merge next, as an index range into the stack, oldest first.
