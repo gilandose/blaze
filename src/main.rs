@@ -79,7 +79,8 @@ struct Args {
     /// *unreclaimable* memory floor: everything else a disk-backed base keeps in
     /// RAM is either bounded by a trigger or clean file-backed pages the kernel
     /// can evict, while filters are heap and scale with total state — roughly one
-    /// byte per key at the default 8, so ~2 GB at 2B links. Lowering it costs
+    /// byte per key at the default 8 — measured 1.9 bytes per *link* on a
+    /// 3000-scope mix, so ~3.8 GB at 2B links. Lowering it costs
     /// query latency on a miss, never correctness: a false positive is exactly the
     /// binary search that would have happened anyway. 4 bits roughly halves the
     /// heap for a ~10-15% false-positive rate; 0 makes every probe a binary

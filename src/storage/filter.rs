@@ -65,8 +65,9 @@ pub const DEFAULT_FILTER_BITS: usize = 8;
 /// This is the one dial that moves the *unreclaimable* memory floor. Everything
 /// else a disk-backed base holds in RAM is either bounded by a trigger (the
 /// memtable) or clean file-backed pages the kernel evicts under pressure; filters
-/// are heap and scale with total state, so at 2B links they are ~2.3 GB whether
-/// or not you have the RAM.
+/// are heap and scale with total state, so at 2B links they are ~3.8 GB on the
+/// measured mix whether or not you have the RAM. See the module header for the
+/// measured cost of lowering it.
 ///
 /// Lowering it costs query latency, not correctness: a false positive is exactly
 /// the binary search that would have happened without a filter. Roughly, at K=6,
