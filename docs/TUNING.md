@@ -54,8 +54,39 @@ So:
 ```
 index heap  ~= 1.07 bytes per pair       (at --filter-bits 8; halves at 4, ~0.14 at 0)
 base disk   ~= 29-37 bytes per pair      (upper end when edges carry several scopes)
-pairs       ~= pairs_per_link x links    <- measure this once for your workload
 ```
+
+### Do not derive pairs from links — derive them from nodes
+
+`pairs_per_link` is **not** a workload constant. Sweeping graph density at 3000
+scopes:
+
+| links/node | pairs/link | base B/pair | index B/pair |
+|---|---|---|---|
+| 0.5 | 1.94 | 38.0 | 1.04 |
+| 2 | **4.30** | 28.7 | 1.04 |
+| 8 | 1.69 | 27.3 | 1.02 |
+| 33 | **0.41** | 19.3 | 1.02 |
+
+It swings **10x** and it is **non-monotonic**, peaking around 2 links/node. That
+is the percolation threshold: below it most nodes sit in tiny components, at it
+the giant component forms and nearly every node acquires a parent, and above it
+new links increasingly join nodes that already share a root and create nothing.
+
+State is bounded by **nodes and scope fan-out, never by links**:
+
+```
+shared pairs   <= distinct nodes
+overlay pairs  <= distinct nodes x scopes per node
+pairs          ~= nodes x (1 + scopes_per_node_with_a_distinct_root)
+```
+
+So size from your node count. A worked example: 1.1B nodes with a mean of 2.07
+scopes per node (median 1) gives ~2.2-3.4B pairs, ~2.3-3.6 GB of heap, and
+~63-119 GB of base. Knowing the link count alone would have told you nothing.
+
+Index B/pair stayed at 1.02-1.04 across all nine configurations measured,
+spanning 10x in pairs/link. That constant is solid; everything else is workload.
 
 **Index heap is flat at 1.07 B/pair across every configuration tested** — which is
 the 8 bits per key the filter is sized for, plus the sparse index. The spread in
@@ -84,10 +115,9 @@ Heap floor by pair count, at `--filter-bits 8`:
 | 4B | 4.3 GB | 2.1 GB | 0.56 GB |
 | 20B | 21 GB | 11 GB | 2.8 GB |
 
-At ~1.9 pairs/link on a multi-scope workload, 2B links is ~3.8B pairs — so ~4 GB
-of heap and ~130 GB of base. Note that is nearly double design 006's 75 GB
-estimate, which assumed ~37 B/*link*; validate against your own `pairs/link`
-before committing to an instance type.
+Design 006 sized 2B links at 75 GB of base assuming ~37 B/*link*. That framing
+does not survive the density sweep above — the same link count spans roughly 20 GB
+to 300 GB depending on how many nodes it touches. Size from nodes.
 
 Plus `leader memtable = interval_s x rate x 50 bytes` — 6 MB at 60 s and 2k/s, so
 never the constraint on a writer.
@@ -203,12 +233,20 @@ Worth stating because three flags invert between them:
 
 | | serving (50/s) | backfill (saturated) |
 |---|---|---|
-| `--filter-bits` | low is fine — heap matters more | **high** — ingest throughput |
+| `--filter-bits` | **high, if the base does not fit in cache** — see below | **high** — ingest throughput |
 | `--max-delta-layers` | high is fine — 2k/s is 2% of capacity | **low** — depth taxes every link |
 | `--inline-merges` | off — keep the memtable bounded | **on** — throttle ingest |
 
 If you run one deployment for both, size for serving and override for the backfill
 window.
+
+**One correction to the obvious reading of that table.** Lowering `--filter-bits`
+to reclaim heap is only right when the base *fits in page cache*. When it does
+not, filters become **more** valuable, not less: they are heap and therefore always
+resident, so a lookup probing ~7 runs has 6 of them answered from RAM without
+touching the mapping, and the sparse index narrows the survivor to one 4 KiB block.
+Drop the filters and all 7 probes can fault. At ~13% residency that is the
+difference between roughly one page fault per lookup and seven.
 
 ## What to watch
 
