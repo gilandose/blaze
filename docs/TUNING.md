@@ -13,8 +13,8 @@ Four terms, and only two of them are yours to lose sleep over.
 
 | term | size | reclaimable? |
 |---|---|---|
-| **Filters** | ~2.1 bytes per link (~1.2 single-scope) | **no — heap** |
-| **Sparse index** | ~0.2% of base bytes | **no — heap** |
+| **Filters** | ~1.07 bytes per **pair** | **no — heap** |
+| **Sparse index** | ~0.2% of base bytes (inside the 1.07) | **no — heap** |
 | Leader memtable | `flush_interval x arrival_rate x 50 B` | no, but tiny |
 | Follower memtable | `fold_after_links x 50 B` | no, but tiny |
 | Mapped runs | up to the full base on disk | **yes — clean page cache** |
@@ -31,41 +31,63 @@ So there are two budgets:
 - **Page-cache budget** (soft): whatever is left. It sets query latency, not
   whether you run.
 
-## Sizing: measure, do not extrapolate
+## Sizing: count pairs, not links
 
-**Only one of these terms is a usable constant.** Measured through the real
-flusher at 2M links (`examples/detached_merge`, `--filter-bits 8`):
+**Size against `(node -> root)` pairs, not edges ingested.** An edge that unions
+two nodes already in the same component creates no state at all, so as a graph
+saturates an ever-larger fraction of ingest is free. Bytes-per-*link* therefore has
+an unbounded denominator and drifts with density; bytes-per-*pair* does not.
 
-| scopes/edge | index heap | **B/link (heap)** | base on disk | B/link (disk) |
-|---|---|---|---|---|
-| 1 scope total | 2249 KB | **1.15** | 60 MB | 31.5 |
-| 1–3 of 100 | 4025 KB | **2.06** | 128 MB | 67.1 |
-| 1–3 of 3000 | 4044 KB | **2.07** | 131 MB | 68.7 |
+Measured at 2M links (`examples/detached_merge`, `--filter-bits 8`), sweeping both
+scope shape and graph density:
 
-**Index heap is predictable**: ~1.2 B/link single-scope, ~2.1 B/link once edges
-carry several scopes. It saturates by 100 scopes because what drives it is *scopes
-per edge*, not scope count — going 100 → 3000 does not change how many overlay
-entries an edge creates. Halves at `--filter-bits 4`; drops to just the sparse
-index (~0.14 B/link) at 0.
+| workload | pairs/link | base B/link | **base B/pair** | index B/link | **index B/pair** |
+|---|---|---|---|---|---|
+| 1 scope | 1.09 | 31.5 | 28.8 | 1.15 | **1.06** |
+| 1-3 of 100 | 1.93 | 67.1 | 34.7 | 2.06 | **1.07** |
+| 1-3 of 3000 | 1.94 | 68.7 | 35.3 | 2.07 | **1.06** |
+| 1-3 of 3000, 2x sparser | 1.81 | 66.1 | 36.4 | 1.94 | **1.07** |
+| 1-3 of 3000, 5x sparser | 1.74 | 65.0 | 37.3 | 1.86 | **1.07** |
 
-**Disk bytes per link is not a constant, and an earlier version of this guide
-wrongly gave one.** It said 38 B/link, taken from a single `ceiling` run. Measured
-across configurations it ranges **31.5 to 74.4**, and the variation is not
-explained by stack depth — holding scopes fixed and sweeping the depth ceiling
-gives 70.3 / 69.2 / 74.4 at ceilings of 6 / 12 / 24, i.e. flat. It also is not
-explained by per-run Puffin footer overhead, which would scale with scope *count*
-and so would separate 100 from 3000; it does not. The remaining candidates are
-graph density and fold size, and **we do not currently have a model that predicts
-it.** Measure your own workload before sizing disk.
+So:
 
-Heap floor at `--filter-bits 8`, using 2.1 B/link:
+```
+index heap  ~= 1.07 bytes per pair       (at --filter-bits 8; halves at 4, ~0.14 at 0)
+base disk   ~= 29-37 bytes per pair      (upper end when edges carry several scopes)
+pairs       ~= pairs_per_link x links    <- measure this once for your workload
+```
 
-| links | heap floor | at `--filter-bits 4` | at 0 |
+**Index heap is flat at 1.07 B/pair across every configuration tested** — which is
+the 8 bits per key the filter is sized for, plus the sparse index. The spread in
+the per-link column is entirely `pairs/link` moving underneath it.
+
+**Base disk still varies 1.3x**, and the residual tracks scopes-per-root
+monotonically (28.8 single-scope, 35.3 multi-scope, 37.3 when sparser spreads roots
+further). That is the **registry** — the `(root, scope)` index, which design 006
+measured at 55% of base bytes and flagged for restructuring. Pairs do not count it,
+so it lands in the residual. Restructuring the registry would both shrink the base
+and make this constant.
+
+An earlier version of this guide gave a single 38 B/link figure from one `ceiling`
+run. Across configurations that number ranges 31.5 to 74.4, and chasing it as a
+per-link constant was the mistake — stack depth does not explain it (sweeping the
+ceiling 6/12/24 gives 70.3/69.2/74.4, flat) and neither does per-run Puffin footer
+overhead (it scales with scope *count*, which would separate 100 from 3000, and
+does not). Changing the denominator does.
+
+Heap floor by pair count, at `--filter-bits 8`:
+
+| pairs | heap floor | at 4 | at 0 |
 |---|---|---|---|
-| 100M | 0.21 GB | 0.11 GB | 0.014 GB |
-| 500M | 1.0 GB | 0.53 GB | 0.07 GB |
-| 2B | 4.2 GB | 2.1 GB | 0.28 GB |
-| 10B | 21 GB | 11 GB | 1.4 GB |
+| 100M | 0.11 GB | 0.05 GB | 0.014 GB |
+| 1B | 1.1 GB | 0.53 GB | 0.14 GB |
+| 4B | 4.3 GB | 2.1 GB | 0.56 GB |
+| 20B | 21 GB | 11 GB | 2.8 GB |
+
+At ~1.9 pairs/link on a multi-scope workload, 2B links is ~3.8B pairs — so ~4 GB
+of heap and ~130 GB of base. Note that is nearly double design 006's 75 GB
+estimate, which assumed ~37 B/*link*; validate against your own `pairs/link`
+before committing to an instance type.
 
 Plus `leader memtable = interval_s x rate x 50 bytes` — 6 MB at 60 s and 2k/s, so
 never the constraint on a writer.
@@ -78,8 +100,9 @@ never the constraint on a writer.
 --routing-base disk --filter-bits 8 --flush-interval-secs 60
 --tier-fanout 4 --max-delta-layers 8
 ```
-1 GB heap, leaving ~3 GB of page cache. Whether that is 15% or 50% of your base
-depends on the disk-bytes question above, so measure — but either way queries
+~1 GB heap (950M pairs at 500M links), leaving ~3 GB of page cache against a
+~33 GB base — under 10% resident, so measure your own `pairs/link` — but either
+way queries
 fault, which is fine if your SLO is milliseconds rather than microseconds. Low
 fanout keeps each merge small so it does not evict the working set, and the
 measured table shows it also buys ~3x on lookups.
@@ -90,8 +113,8 @@ measured table shows it also buys ~3x on lookups.
 --routing-base disk --filter-bits 0 --flush-interval-secs 60
 --tier-fanout 4 --max-delta-layers 8
 ```
-`--filter-bits 0` is the only thing that makes this fit: heap drops from ~4.2 GB
-to ~0.28 GB at 2B links. It costs ~35% ingest throughput (measured 88k → 57k
+`--filter-bits 0` is the only thing that makes this fit: heap drops from ~4 GB to
+~0.5 GB at 2B links (3.8B pairs). It costs ~35% ingest throughput (measured 88k → 57k
 links/s), which is irrelevant at 50/s and fatal during a backfill — see below.
 
 **Production serving** — 64 GB RAM, 2B links:
@@ -100,11 +123,11 @@ links/s), which is irrelevant at 50/s and fatal during a backfill — see below.
 --routing-base disk --filter-bits 8 --flush-interval-secs 60
 --tier-fanout 10 --max-delta-layers 24
 ```
-4.2 GB heap, leaving ~59 GB of page cache. Design 006 sized the base at 75 GB for
-2B links, which would be ~79% resident — but that figure predates the measurements
-above and assumes ~37 B/link, at the bottom of the observed range. If your
-workload lands nearer 70 B/link the base is ~140 GB and you are at ~42% resident,
-so validate before committing to an instance type.
+~4 GB heap (3.8B pairs at 1.07 B/pair), leaving ~59 GB of page cache. Design 006
+sized the base at 75 GB assuming ~37 B/*link*; at the measured ~35 B/*pair* and
+1.9 pairs/link it is closer to **130 GB**, so ~45% resident rather than ~79%.
+Validate `pairs/link` on your own workload before committing to an instance type —
+it is the one number everything else scales from.
 
 **Backfill** — whatever box, ingest rate is the objective:
 
@@ -121,7 +144,7 @@ ingest cannot outrun compaction and bury you in runs.
 
 | flag | default | raise it for | costs |
 |---|---|---|---|
-| `--filter-bits` | 8 | ingest speed, query latency | heap: ~2.1 B/link at 8, ~0.14 at 0 |
+| `--filter-bits` | 8 | ingest speed, query latency | heap: ~1.07 B/pair at 8, ~0.14 at 0 |
 | `--tier-fanout` | 10 | less rewriting (`amp ≈ log_T(F)`) | depth: `(T-1)·log_T(F)` runs to probe |
 | `--max-delta-layers` | 24 | fewer merges | every path pays per run |
 | `--flush-interval-secs` | 60 | fewer commits | leader memtable **and** your RPO |

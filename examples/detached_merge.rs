@@ -45,6 +45,7 @@ struct Run {
     links: u64,
     index_kb: u64,
     base_mb: u64,
+    pairs: u64,
     lookup_us: f64,
     ingest_s: f64,
     peak_memtable: u64,
@@ -190,15 +191,19 @@ async fn drive(
 
     // Heap held by in-RAM indexes over the mapping: filters plus sparse index.
     // Unlike RSS this is not reclaimable, so it is the real memory floor.
-    let (index_kb, base_mb) = flusher
+    let (index_kb, base_mb, pairs) = flusher
         .layers
         .lock()
         .as_ref()
         .map(|l| {
             let st = blaze::core::RoutingBase::stats(&*l.base);
-            (st.index_bytes / 1024, st.mapped_bytes / (1024 * 1024))
+            (
+                st.index_bytes / 1024,
+                st.mapped_bytes / (1024 * 1024),
+                st.shared_pairs + st.overlay_pairs,
+            )
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0, 0));
 
     // Warm lookup latency over the composed path, which is what filters are
     // supposed to buy and what the tuning guide claims they cost.
@@ -225,6 +230,7 @@ async fn drive(
         links: ingested.load(Ordering::Relaxed),
         index_kb,
         base_mb,
+        pairs,
         lookup_us,
         ingest_s: ingest_elapsed,
         peak_memtable: peak.load(Ordering::Relaxed),
@@ -258,34 +264,40 @@ async fn main() {
         env("MAX_LAYERS", 12)
     );
     println!(
-        "{:<10} {:>7} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "{:<12} {:>7} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10} {:>9}",
         "policy",
         "links",
-        "ingest/s",
-        "base MB",
-        "index KB",
-        "idx B/lnk",
+        "pairs",
+        "pairs/lnk",
         "base B/lnk",
-        "lookup us",
-        "p99 tick"
+        "base B/pair",
+        "idx B/lnk",
+        "idx B/pair",
+        "lookup us"
     );
 
     for (name, inline) in [("inline", true), ("detached", false)] {
         let mut r = drive(inline, links, rate, tick_ms, nodes, scopes).await;
         r.tick_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "{:<10} {:>6.1}M {:>7.0}k {:>8} {:>9} {:>9.2} {:>10.1} {:>9.2} {:>7.0}ms",
+            "{:<12} {:>6.1}M {:>7.1}M {:>8.2} {:>10.1} {:>10.1} {:>10.2} {:>10.2} {:>9.2}",
             name,
             r.links as f64 / 1e6,
-            r.links as f64 / r.ingest_s / 1e3,
-            r.base_mb,
-            r.index_kb,
-            r.index_kb as f64 * 1024.0 / r.links as f64,
+            r.pairs as f64 / 1e6,
+            r.pairs as f64 / r.links as f64,
             r.base_mb as f64 * 1024.0 * 1024.0 / r.links as f64,
+            r.base_mb as f64 * 1024.0 * 1024.0 / r.pairs.max(1) as f64,
+            r.index_kb as f64 * 1024.0 / r.links as f64,
+            r.index_kb as f64 * 1024.0 / r.pairs.max(1) as f64,
             r.lookup_us,
+        );
+        let _ = (
+            r.merges,
+            r.peak_memtable,
+            r.wall_s,
+            r.ingest_s,
             pct(&r.tick_ms, 0.99),
         );
-        let _ = (r.merges, r.peak_memtable, r.wall_s, pct(&r.tick_ms, 0.50));
         let _ = r.wall_s;
     }
 }
