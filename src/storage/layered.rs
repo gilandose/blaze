@@ -276,7 +276,10 @@ mod tests {
         snap: &ForestSnapshot,
         seq: u64,
     ) -> Arc<PuffinBase> {
-        let bytes = puffin::write(&codec::snapshot_to_blobs(snap, seq), BTreeMap::new());
+        let bytes = puffin::write(
+            &codec::snapshot_to_blobs(snap, seq, crate::storage::filter::DEFAULT_FILTER_BITS),
+            BTreeMap::new(),
+        );
         let path = dir.join(format!("{name}.puffin"));
         std::fs::write(&path, &bytes).unwrap();
         Arc::new(PuffinBase::open(&path).unwrap())

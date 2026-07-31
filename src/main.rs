@@ -74,6 +74,19 @@ struct Args {
     #[arg(long, default_value_t = false)]
     inline_merges: bool,
 
+    /// Bits of membership filter per key written into each run, or 0 for none
+    /// (--routing-base disk only). This is the one dial that moves the
+    /// *unreclaimable* memory floor: everything else a disk-backed base keeps in
+    /// RAM is either bounded by a trigger or clean file-backed pages the kernel
+    /// can evict, while filters are heap and scale with total state — roughly one
+    /// byte per key at the default 8, so ~2 GB at 2B links. Lowering it costs
+    /// query latency on a miss, never correctness: a false positive is exactly the
+    /// binary search that would have happened anyway. 4 bits roughly halves the
+    /// heap for a ~10-15% false-positive rate; 0 makes every probe a binary
+    /// search. Runs already written keep whatever they were written with.
+    #[arg(long, default_value_t = blaze::storage::DEFAULT_FILTER_BITS)]
+    filter_bits: usize,
+
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
     flush_interval_secs: u64,
@@ -254,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
         fold_after_links: args.fold_after_links,
         max_delta_layers: args.max_delta_layers,
         tier_fanout: args.tier_fanout,
+        filter_bits: args.filter_bits,
         inline_merges: args.inline_merges,
         pending_merge: parking_lot::Mutex::new(None),
         layers: parking_lot::Mutex::new(local_layers),

@@ -68,7 +68,8 @@ fn main() {
                 forest.apply(&event(&mut rng));
             }
             let path = dir.join(format!("l{layer}.puffin"));
-            let mut w = codec::BlobWriter::new(layer as u64 + 1);
+            let mut w =
+                codec::BlobWriter::new(layer as u64 + 1, blaze::storage::DEFAULT_FILTER_BITS);
             let next = match stack.take() {
                 None => forest
                     .compact_and_fold(&mut w, |w| {

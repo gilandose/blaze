@@ -18,7 +18,7 @@
 //! it is exactly `rate x seconds the tick failed to fold`.
 //!
 //! Tunables via env: `LINKS`, `RATE`, `TICK_MS`, `SCOPES`, `NODES`, `MAX_LAYERS`,
-//! `FANOUT`.
+//! `FANOUT`, `FILTER_BITS`.
 //!
 //! Run: `cargo run --release --example detached_merge`
 
@@ -43,6 +43,7 @@ fn env<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 struct Run {
     links: u64,
+    index_kb: u64,
     ingest_s: f64,
     peak_memtable: u64,
     tick_ms: Vec<f64>,
@@ -146,6 +147,7 @@ async fn drive(
         fold_after_links: u64::MAX, // a leader folds every tick regardless
         max_delta_layers: env("MAX_LAYERS", 12),
         tier_fanout: env("FANOUT", 4),
+        filter_bits: env("FILTER_BITS", blaze::storage::filter::DEFAULT_FILTER_BITS),
         inline_merges,
         layers: parking_lot::Mutex::new(None),
         pending_merge: parking_lot::Mutex::new(None),
@@ -184,12 +186,22 @@ async fn drive(
     flusher.wait_for_merge().await;
     let wall_s = started.elapsed().as_secs_f64();
 
+    // Heap held by in-RAM indexes over the mapping: filters plus sparse index.
+    // Unlike RSS this is not reclaimable, so it is the real memory floor.
+    let index_kb = flusher
+        .layers
+        .lock()
+        .as_ref()
+        .map(|l| blaze::core::RoutingBase::stats(&*l.base).index_bytes / 1024)
+        .unwrap_or(0);
+
     stop.store(true, Ordering::Relaxed);
     ingest.join().unwrap();
     sampler.join().unwrap();
 
     Run {
         links: ingested.load(Ordering::Relaxed),
+        index_kb,
         ingest_s: ingest_elapsed,
         peak_memtable: peak.load(Ordering::Relaxed),
         tick_ms: tick_times,
@@ -222,33 +234,34 @@ async fn main() {
         env("MAX_LAYERS", 12)
     );
     println!(
-        "{:<10} {:>7} {:>6} {:>8} {:>15} {:>10} {:>10} {:>10} {:>8}",
+        "{:<10} {:>7} {:>6} {:>8} {:>15} {:>9} {:>10} {:>10} {:>10}",
         "policy",
         "links",
         "ticks",
         "ingest/s",
         "peak memtable",
+        "index KB",
         "p50 tick",
         "p99 tick",
-        "max tick",
-        "merges"
+        "max tick"
     );
 
     for (name, inline) in [("inline", true), ("detached", false)] {
         let mut r = drive(inline, links, rate, tick_ms, nodes, scopes).await;
         r.tick_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "{:<10} {:>6.1}M {:>6} {:>7.0}k {:>15} {:>8.0}ms {:>8.0}ms {:>8.0}ms {:>8}",
+            "{:<10} {:>6.1}M {:>6} {:>7.0}k {:>15} {:>9} {:>8.0}ms {:>8.0}ms {:>8.0}ms",
             name,
             r.links as f64 / 1e6,
             r.tick_ms.len(),
             r.links as f64 / r.ingest_s / 1e3,
             r.peak_memtable,
+            r.index_kb,
             pct(&r.tick_ms, 0.50),
             pct(&r.tick_ms, 0.99),
             r.tick_ms.last().copied().unwrap_or(0.0),
-            r.merges,
         );
+        let _ = r.merges;
         let _ = r.wall_s;
     }
 }

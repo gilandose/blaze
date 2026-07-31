@@ -228,6 +228,33 @@ impl Warehouse {
         tier_fanout: usize,
         inline_merges: bool,
     ) {
+        self.flush_all(
+            forest,
+            first_offset,
+            events,
+            fold_after,
+            leader,
+            max_delta_layers,
+            tier_fanout,
+            inline_merges,
+            blaze::storage::DEFAULT_FILTER_BITS,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_all(
+        &self,
+        forest: Arc<ScopedForest>,
+        first_offset: u64,
+        events: &[EdgeEvent],
+        fold_after: u64,
+        leader: bool,
+        max_delta_layers: usize,
+        tier_fanout: usize,
+        inline_merges: bool,
+        filter_bits: usize,
+    ) {
         let buffer = Arc::new(EdgeBuffer::new());
         for (i, e) in events.iter().enumerate() {
             buffer.append(first_offset + i as u64, e);
@@ -249,6 +276,7 @@ impl Warehouse {
             fold_after_links: fold_after,
             max_delta_layers,
             tier_fanout,
+            filter_bits,
             inline_merges,
             layers: parking_lot::Mutex::new(self.held.lock().unwrap().take()),
             pending_merge: parking_lot::Mutex::new(self.held_merge.lock().unwrap().take()),
@@ -530,8 +558,16 @@ async fn streamed_compaction_matches_the_materialized_snapshot() {
         forest.apply(&e);
     }
 
-    let streamed = blaze::storage::codec::compact_to_blobs(&forest, 2);
-    let collected = blaze::storage::codec::snapshot_to_blobs(&forest.snapshot(), 2);
+    let streamed = blaze::storage::codec::compact_to_blobs(
+        &forest,
+        2,
+        blaze::storage::filter::DEFAULT_FILTER_BITS,
+    );
+    let collected = blaze::storage::codec::snapshot_to_blobs(
+        &forest.snapshot(),
+        2,
+        blaze::storage::filter::DEFAULT_FILTER_BITS,
+    );
     let fields = |bs: &[blaze::storage::puffin::Blob]| {
         bs.iter()
             .map(|b| (b.blob_type.clone(), b.properties.clone(), b.data.to_vec()))
@@ -1368,6 +1404,113 @@ async fn a_merge_runs_detached_while_folds_carry_on() {
             );
         }
     }
+}
+
+/// Runs written with no membership filters must answer identically, because the
+/// filter is an optimisation and nothing more.
+///
+/// This is the low-memory escape hatch. Filters are the only thing a disk-backed
+/// base holds in RAM that scales with *total state* and cannot be evicted — the
+/// memtable is bounded by a trigger and the mapping is clean file-backed pages —
+/// so at billions of links they are the floor, and `--filter-bits 0` is how you
+/// trade query latency for it.
+///
+/// The property that makes this safe is that a filter only ever answers "probe
+/// the table" or "definitely absent". Removing it removes the second answer, so
+/// every probe falls through to the binary search that a false positive would
+/// have cost anyway. A run written at any setting stays readable by any build,
+/// which is checked here by mixing settings within one stack.
+#[tokio::test]
+async fn runs_written_without_filters_answer_identically() {
+    let with = Warehouse::new();
+    let without = Warehouse::new();
+    let f_with = Arc::new(ScopedForest::new());
+    let f_without = Arc::new(ScopedForest::new());
+    let mut offset = 1u64;
+
+    // Enough keys per run that bits-per-key actually changes the block count —
+    // below ~64 keys every setting rounds up to the one-block minimum and the
+    // sizes are identical for uninteresting reasons.
+    for tick in 0..6u64 {
+        let mut events: Vec<EdgeEvent> = (0..400)
+            .map(|i| global_edge(tick * 1000 + i, tick * 1000 + i + 1))
+            .collect();
+        events.push(scoped_edge(tick * 1000, tick * 1000 + 50, &[7, 9]));
+        for e in &events {
+            f_with.apply(e);
+            f_without.apply(e);
+        }
+        with.flush_layered(f_with.clone(), offset, &events, u64::MAX, true, 3)
+            .await;
+        // Alternate 0 and 4 bits, so the stack mixes filtered and unfiltered runs
+        // and a merge has to read across both.
+        with_bits(&without, f_without.clone(), offset, &events, tick).await;
+        offset += events.len() as u64;
+    }
+
+    // Both catalogs cold-start, and the unfiltered one really did write no filter
+    // blobs on the runs that asked for none.
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let (base_a, _, _) = open_base_from_catalog(&with.store, &with.catalog, dir_a.path())
+        .await
+        .unwrap()
+        .expect("a committed snapshot");
+    let (base_b, _, _) = open_base_from_catalog(&without.store, &without.catalog, dir_b.path())
+        .await
+        .unwrap()
+        .expect("a committed snapshot");
+    assert!(
+        blaze::core::RoutingBase::stats(&*base_b).index_bytes
+            < blaze::core::RoutingBase::stats(&*base_a).index_bytes,
+        "dropping filters must actually shrink the in-RAM index: {} vs {}",
+        blaze::core::RoutingBase::stats(&*base_b).index_bytes,
+        blaze::core::RoutingBase::stats(&*base_a).index_bytes
+    );
+
+    let cold_a = Arc::new(ScopedForest::with_base(base_a));
+    let cold_b = Arc::new(ScopedForest::with_base(base_b));
+    for tick in 0..6u64 {
+        for i in 0..=400u64 {
+            let node = tick * 1000 + i;
+            assert_eq!(
+                cold_b.scope_root(GLOBAL_SCOPE, node),
+                cold_a.scope_root(GLOBAL_SCOPE, node),
+                "node {node} diverged without filters"
+            );
+            assert_eq!(cold_b.scope_root(7, node), cold_a.scope_root(7, node));
+        }
+        // Misses are the case filters exist for, so check them explicitly.
+        let absent = 9_000_000 + tick;
+        assert_eq!(cold_b.scope_root(GLOBAL_SCOPE, absent), absent);
+        assert_eq!(cold_b.scope_root(9, absent), absent);
+    }
+}
+
+/// Alternate filter settings tick by tick, so one stack holds runs written both
+/// ways.
+async fn with_bits(
+    wh: &Warehouse,
+    forest: Arc<ScopedForest>,
+    offset: u64,
+    events: &[EdgeEvent],
+    tick: u64,
+) {
+    // Mostly none, with one 4-bit run so the stack mixes settings and a merge has
+    // to read across both.
+    let bits = if tick == 3 { 4 } else { 0 };
+    wh.flush_all(
+        forest,
+        offset,
+        events,
+        u64::MAX,
+        true,
+        3,
+        usize::MAX,
+        true,
+        bits,
+    )
+    .await;
 }
 
 /// A catalog written before snapshots carried run sets must cold-start with no

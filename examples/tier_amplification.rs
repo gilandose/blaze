@@ -124,7 +124,8 @@ fn drive(
             let sub = base.slice(range.clone()).unwrap();
 
             let t = Instant::now();
-            let (blobs, cstats) = compact_layers(&sub, seq);
+            let (blobs, cstats) =
+                compact_layers(&sub, seq, blaze::storage::filter::DEFAULT_FILTER_BITS);
             let bytes = puffin::write(&blobs, BTreeMap::new());
             std::fs::write(&path, &bytes).unwrap();
             let secs = t.elapsed().as_secs_f64();
@@ -163,7 +164,7 @@ fn drive(
         // --- fold the memtable out as a new L0 run ---
         seq += 1;
         let path = dir.join(format!("run-{seq:06}-L0.puffin"));
-        let mut writer = codec::BlobWriter::new(seq);
+        let mut writer = codec::BlobWriter::new(seq, blaze::storage::filter::DEFAULT_FILTER_BITS);
         let prev = stack.as_ref().map(|(b, _)| b.clone());
         let folded = if let Some(base) = prev {
             forest

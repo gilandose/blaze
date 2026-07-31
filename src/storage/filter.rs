@@ -21,16 +21,64 @@
 //! right trade here: a false positive costs exactly the binary search that would
 //! have happened anyway, so the filter can be small and sloppy. That works out
 //! at **1 byte of heap per key**, or ~3.6% of the pair bytes it covers.
+//!
+//! # Why this is the memory floor, and the `--filter-bits` escape hatch
+//!
+//! Filters are the only thing a disk-backed base holds in RAM that scales with
+//! *total state* and cannot be reclaimed. The memtable is bounded by a trigger,
+//! and the mapping is clean file-backed pages the kernel evicts under pressure —
+//! but these are heap, so at billions of links they set the instance size.
+//!
+//! Measured through the real flusher (`examples/detached_merge`, 2M links, 3000
+//! scopes, 1-3 scopes per edge):
+//!
+//! | bits | index heap | ingest/s |
+//! |---|---|---|
+//! | 8 | 4044 KB | 88k |
+//! | 4 | 2125 KB | 72k |
+//! | 0 | 273 KB | 57k |
+//!
+//! Dropping filters takes the unreclaimable heap down **14.8x** — the 273 KB left
+//! is the sparse index, which stays — for about **35% of ingest throughput**. Some
+//! of that 35% is second-order: slower ingest stretches the run, which fits more
+//! ticks and so more folds competing for the union lock, so treat the direction as
+//! certain and the magnitude as indicative.
+//!
+//! Note the filter cost is per *key*, not per link: at 1.9 bytes per link on this
+//! mix, 2B links is ~3.8 GB. Overlay pairs outnumber links whenever edges carry
+//! several scopes, so the ratio is workload-shaped.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// Bits set per key. All within one block, so a probe is one cache line.
 const K: u32 = 6;
-/// Bits of filter per key. 8 gives ~2-3% false positives at K=6.
-const BITS_PER_KEY: usize = 8;
 /// One cache line.
 const BLOCK_BITS: usize = 512;
 const BLOCK_WORDS: usize = BLOCK_BITS / 64;
+
+/// Default bits of filter per key: ~2-3% false positives at K=6, one byte of heap
+/// per key.
+pub const DEFAULT_FILTER_BITS: usize = 8;
+
+/// Bits per key, or zero to build no filter at all.
+///
+/// This is the one dial that moves the *unreclaimable* memory floor. Everything
+/// else a disk-backed base holds in RAM is either bounded by a trigger (the
+/// memtable) or clean file-backed pages the kernel evicts under pressure; filters
+/// are heap and scale with total state, so at 2B links they are ~2.3 GB whether
+/// or not you have the RAM.
+///
+/// Lowering it costs query latency, not correctness: a false positive is exactly
+/// the binary search that would have happened without a filter. Roughly, at K=6,
+/// 8 bits gives ~2-3% false positives, 4 bits ~10-15%, and 0 disables filters so
+/// every probe is a binary search.
+///
+/// **Readers do not need to know this value.** The encoded filter records its own
+/// block count and `locate` derives everything from it, so a base written at any
+/// setting — including none at all — is readable by any build.
+pub fn clamp_filter_bits(bits: usize) -> usize {
+    bits.min(64)
+}
 
 const MAGIC: u32 = 0x424C_4631; // "BLF1"
 
@@ -57,10 +105,27 @@ pub struct BlockedFilter {
 }
 
 impl BlockedFilter {
+    /// Build over `keys` at `bits_per_key`, or `None` to build no filter.
+    ///
+    /// `hint` only sizes the allocation; a wrong hint costs accuracy, never
+    /// correctness.
+    pub fn build_with(
+        keys: impl Iterator<Item = u64>,
+        hint: usize,
+        bits_per_key: usize,
+    ) -> Option<Self> {
+        let bits = clamp_filter_bits(bits_per_key);
+        if bits == 0 {
+            return None;
+        }
+        Some(Self::build(keys, hint, bits))
+    }
+
     /// Build over `keys`. `hint` only sizes the allocation; a wrong hint costs
     /// accuracy, never correctness.
-    pub fn build(keys: impl Iterator<Item = u64>, hint: usize) -> Self {
-        let blocks = (hint * BITS_PER_KEY).div_ceil(BLOCK_BITS).max(1);
+    pub fn build(keys: impl Iterator<Item = u64>, hint: usize, bits_per_key: usize) -> Self {
+        let bits = clamp_filter_bits(bits_per_key).max(1);
+        let blocks = (hint * bits).div_ceil(BLOCK_BITS).max(1);
         let mut filter = Self {
             blocks: vec![[0u64; BLOCK_WORDS]; blocks],
         };
@@ -148,7 +213,7 @@ mod tests {
         // No false negatives, ever — a miss would make a layer claim it does not
         // hold a key it does hold, and the lookup would skip it.
         let keys: Vec<u64> = (0..50_000).map(|i| i * 7 + 3).collect();
-        let f = BlockedFilter::build(keys.iter().copied(), keys.len());
+        let f = BlockedFilter::build(keys.iter().copied(), keys.len(), DEFAULT_FILTER_BITS);
         for k in &keys {
             assert!(f.may_contain(*k), "false negative on {k}");
         }
@@ -157,7 +222,7 @@ mod tests {
     #[test]
     fn false_positive_rate_is_low_enough_to_be_worth_it() {
         let keys: Vec<u64> = (0..100_000u64).map(|i| i * 3).collect();
-        let f = BlockedFilter::build(keys.iter().copied(), keys.len());
+        let f = BlockedFilter::build(keys.iter().copied(), keys.len(), DEFAULT_FILTER_BITS);
         // Probe keys that are definitely absent (not multiples of 3).
         let mut fp = 0;
         let trials = 100_000;
@@ -179,10 +244,35 @@ mod tests {
         );
     }
 
+    /// Fewer bits is a smaller filter that lies more often, and zero is no filter
+    /// at all. Both must stay *sound* — a false negative would make a layer deny a
+    /// key it holds, and the lookup would skip it.
+    #[test]
+    fn fewer_bits_trade_accuracy_for_heap_and_never_correctness() {
+        let keys: Vec<u64> = (0..50_000u64).map(|i| i * 7 + 3).collect();
+        let mut sizes = Vec::new();
+        for bits in [4usize, 8, 16] {
+            let f = BlockedFilter::build_with(keys.iter().copied(), keys.len(), bits)
+                .expect("nonzero bits builds a filter");
+            for k in &keys {
+                assert!(f.may_contain(*k), "false negative at {bits} bits on {k}");
+            }
+            sizes.push(f.heap_bytes());
+        }
+        assert!(
+            sizes[0] < sizes[1] && sizes[1] < sizes[2],
+            "heap must scale with bits per key, got {sizes:?}"
+        );
+
+        // Zero means no filter, which the writer turns into no blob and the reader
+        // into "probe the table directly".
+        assert!(BlockedFilter::build_with(keys.iter().copied(), keys.len(), 0).is_none());
+    }
+
     #[test]
     fn roundtrips_through_bytes() {
         let keys: Vec<u64> = (0..5_000).map(|i| i * 11).collect();
-        let f = BlockedFilter::build(keys.iter().copied(), keys.len());
+        let f = BlockedFilter::build(keys.iter().copied(), keys.len(), DEFAULT_FILTER_BITS);
         let back = BlockedFilter::decode(&f.encode()).unwrap();
         for k in &keys {
             assert!(back.may_contain(*k));
@@ -193,7 +283,7 @@ mod tests {
     #[test]
     fn rejects_corrupt_blobs() {
         assert!(BlockedFilter::decode(&[1, 2, 3]).is_err());
-        let f = BlockedFilter::build([1u64, 2, 3].into_iter(), 3);
+        let f = BlockedFilter::build([1u64, 2, 3].into_iter(), 3, DEFAULT_FILTER_BITS);
         let mut bad = f.encode().to_vec();
         bad.truncate(bad.len() - 1);
         assert!(BlockedFilter::decode(&bad).is_err());
@@ -207,7 +297,11 @@ mod tests {
     /// answer for another's membership.
     #[test]
     fn overlay_keys_separate_scopes() {
-        let f = BlockedFilter::build((1..=200u32).map(|s| overlay_key(s, 42)), 200);
+        let f = BlockedFilter::build(
+            (1..=200u32).map(|s| overlay_key(s, 42)),
+            200,
+            DEFAULT_FILTER_BITS,
+        );
         for s in 1..=200u32 {
             assert!(f.may_contain(overlay_key(s, 42)));
         }

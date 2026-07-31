@@ -30,7 +30,7 @@ fn delta_for(
         event_time_ms: 0,
         props: None,
     });
-    let mut w = codec::BlobWriter::new(1);
+    let mut w = codec::BlobWriter::new(1, blaze::storage::DEFAULT_FILTER_BITS);
     seed.compact_into(&mut w);
     let base_bytes = puffin::write(&w.finish(), BTreeMap::new());
     let base_path = dir.join(format!("{tag}-base.puffin"));
@@ -52,7 +52,7 @@ fn delta_for(
         }
     }
 
-    let mut w = codec::BlobWriter::new(2);
+    let mut w = codec::BlobWriter::new(2, blaze::storage::DEFAULT_FILTER_BITS);
     let (blobs, payload) = forest
         .fold_delta(&mut w, |w, _| {
             let blobs = w.finish();

@@ -528,7 +528,8 @@ mod tests {
     use std::io::Write;
 
     fn write_base(snap: &ForestSnapshot, with_registry: bool) -> (tempfile::TempDir, PuffinBase) {
-        let mut blobs = codec::snapshot_to_blobs(snap, 7);
+        let mut blobs =
+            codec::snapshot_to_blobs(snap, 7, crate::storage::filter::DEFAULT_FILTER_BITS);
         if !with_registry {
             blobs.retain(|b| b.blob_type != codec::REGISTRY_BLOB_TYPE);
         }

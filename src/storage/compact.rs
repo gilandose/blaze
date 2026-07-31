@@ -93,7 +93,11 @@ fn table(pairs: impl Iterator<Item = (NodeId, NodeId)>) -> (Bytes, u64) {
 ///
 /// Pure and synchronous: the only inputs are the mappings, so this is the piece
 /// worth testing against the in-memory compactor for equality.
-pub fn compact_layers(layers: &LayeredBase, sequence: u64) -> (Vec<Blob>, CompactionStats) {
+pub fn compact_layers(
+    layers: &LayeredBase,
+    sequence: u64,
+    filter_bits: usize,
+) -> (Vec<Blob>, CompactionStats) {
     let seq = sequence as i64;
     let mut stats = CompactionStats::default();
     let blob = |blob_type: &str, data: Bytes, properties: BTreeMap<String, String>| Blob {
@@ -151,27 +155,33 @@ pub fn compact_layers(layers: &LayeredBase, sequence: u64) -> (Vec<Blob>, Compac
     // regresses to a binary search — the merged layer would be the one layer
     // that cannot answer a miss cheaply. Built from the payloads just written,
     // so the key sets cannot drift from the tables.
-    let shared_filter = BlockedFilter::build(
+    let shared_filter = BlockedFilter::build_with(
         codec::table_keys(&shared_payload).map(|(k, _)| k),
         stats.shared_pairs as usize,
+        filter_bits,
     );
-    let overlay_filter = BlockedFilter::build(
+    let overlay_filter = BlockedFilter::build_with(
         overlay_payloads.iter().flat_map(|(scope, data, _)| {
             let scope = *scope;
             codec::table_keys(data).map(move |(k, _)| filter::overlay_key(scope, k))
         }),
         stats.overlay_pairs as usize,
+        filter_bits,
     );
-    blobs.push(blob(
-        codec::SHARED_FILTER_BLOB_TYPE,
-        shared_filter.encode(),
-        BTreeMap::new(),
-    ));
-    blobs.push(blob(
-        codec::OVERLAY_FILTER_BLOB_TYPE,
-        overlay_filter.encode(),
-        BTreeMap::new(),
-    ));
+    if let Some(f) = shared_filter {
+        blobs.push(blob(
+            codec::SHARED_FILTER_BLOB_TYPE,
+            f.encode(),
+            BTreeMap::new(),
+        ));
+    }
+    if let Some(f) = overlay_filter {
+        blobs.push(blob(
+            codec::OVERLAY_FILTER_BLOB_TYPE,
+            f.encode(),
+            BTreeMap::new(),
+        ));
+    }
 
     (blobs, stats)
 }
@@ -394,7 +404,8 @@ mod tests {
                     props: None,
                 });
             }
-            let mut writer = codec::BlobWriter::new(round + 1);
+            let mut writer =
+                codec::BlobWriter::new(round + 1, crate::storage::filter::DEFAULT_FILTER_BITS);
             let name = format!("layer-{round}");
             let dir_path = dir.path().to_path_buf();
             let stack = layers.clone();
@@ -416,7 +427,8 @@ mod tests {
         assert_eq!(stack.delta_count(), 4);
 
         // Storage-side: merge the mappings, no forest, no lock.
-        let (blobs, stats) = compact_layers(&stack, 99);
+        let (blobs, stats) =
+            compact_layers(&stack, 99, crate::storage::filter::DEFAULT_FILTER_BITS);
         assert!(stats.shared_pairs > 0 && stats.overlay_pairs > 0);
         assert!(
             stats.registry_corrections < stats.registry_entries,
@@ -518,7 +530,8 @@ mod tests {
                     props: None,
                 });
             }
-            let mut writer = codec::BlobWriter::new(round + 1);
+            let mut writer =
+                codec::BlobWriter::new(round + 1, crate::storage::filter::DEFAULT_FILTER_BITS);
             let name = format!("eq-{round}");
             let dir_path = dir.path().to_path_buf();
             let stack = layers.clone();
@@ -588,7 +601,7 @@ mod tests {
                 props: None,
             });
         }
-        let mut w = codec::BlobWriter::new(1);
+        let mut w = codec::BlobWriter::new(1, crate::storage::filter::DEFAULT_FILTER_BITS);
         forest.compact_into(&mut w);
         let base = write_layer(dir.path(), "b", &w.finish());
         for n in 1..=50u64 {
@@ -608,7 +621,7 @@ mod tests {
             event_time_ms: 0,
             props: None,
         });
-        let mut w2 = codec::BlobWriter::new(2);
+        let mut w2 = codec::BlobWriter::new(2, crate::storage::filter::DEFAULT_FILTER_BITS);
         let d1 = forest2
             .fold_delta(&mut w2, |w, _prev| {
                 let layer = write_layer(dir.path(), "d1", &w.finish());
@@ -620,7 +633,7 @@ mod tests {
 
         let stack = LayeredBase::from_layers(vec![base, d1]).unwrap();
         assert_eq!(stack.delta_count(), 1);
-        let (blobs, stats) = compact_layers(&stack, 3);
+        let (blobs, stats) = compact_layers(&stack, 3, crate::storage::filter::DEFAULT_FILTER_BITS);
         // 50 chain nodes plus the newly absorbed one, each stored once — the
         // point being that the delta's keys do not duplicate the base's.
         assert_eq!(stats.shared_pairs, 51);
