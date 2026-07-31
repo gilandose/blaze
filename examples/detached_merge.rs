@@ -150,7 +150,10 @@ async fn drive(
         fold_after_links: u64::MAX, // a leader folds every tick regardless
         max_delta_layers: env("MAX_LAYERS", 12),
         tier_fanout: env("FANOUT", 4),
-        filter_bits: env("FILTER_BITS", blaze::storage::filter::DEFAULT_FILTER_BITS),
+        write: blaze::storage::WriteOptions {
+            filter_bits: env("FILTER_BITS", blaze::storage::DEFAULT_FILTER_BITS),
+            ..Default::default()
+        },
         inline_merges,
         layers: parking_lot::Mutex::new(None),
         pending_merge: parking_lot::Mutex::new(None),

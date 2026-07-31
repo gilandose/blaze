@@ -41,9 +41,11 @@ docs below are the design rationale behind those knobs.
 | [006](006-tiered-compaction.md) | Size-tiered compaction + backfill sizing | write amplification, layer count | **implemented** |
 | [007](007-compaction-execution.md) | Where compaction runs (detached / process / deployment) | compaction's cost to serving | **implemented** (detached in-process) |
 | [008](008-rocksdb-counterfactual.md) | Could this have been built on RocksDB? | whether the storage tier had to be written | evaluation |
+| [009](009-registry-encoding.md) | Registry encoding (delta-varint in indexed blocks) | 25-40% of base bytes | designed — **next** |
 
-006 and 007 are in. Recommended order for what is left: the registry restructure
-006 describes (55% of base bytes), then 002 folded in with 005's rename and union
+006 and 007 are in. Recommended order for what is left: **009** (the registry
+encoding, which supersedes the restructure 006 sketched — measured 4.8-7.1x
+against that proposal's 1.5-2.3x), then 002 folded in with 005's rename and union
 tier, then 004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
 packed u48 to serve the "well beyond 2B" goal.
 

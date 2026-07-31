@@ -12,6 +12,7 @@
 //! Run: `cargo run --release --example layer_depth`
 
 use blaze::core::{EdgeEvent, RoutingBase, ScopedForest, Visibility};
+use blaze::storage::WriteOptions;
 use blaze::storage::{LayeredBase, PuffinBase, codec, puffin};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -68,8 +69,7 @@ fn main() {
                 forest.apply(&event(&mut rng));
             }
             let path = dir.join(format!("l{layer}.puffin"));
-            let mut w =
-                codec::BlobWriter::new(layer as u64 + 1, blaze::storage::DEFAULT_FILTER_BITS);
+            let mut w = codec::BlobWriter::new(layer as u64 + 1, WriteOptions::default());
             let next = match stack.take() {
                 None => forest
                     .compact_and_fold(&mut w, |w| {

@@ -237,7 +237,7 @@ impl Warehouse {
             max_delta_layers,
             tier_fanout,
             inline_merges,
-            blaze::storage::DEFAULT_FILTER_BITS,
+            Default::default(),
         )
         .await;
     }
@@ -253,7 +253,7 @@ impl Warehouse {
         max_delta_layers: usize,
         tier_fanout: usize,
         inline_merges: bool,
-        filter_bits: usize,
+        write: blaze::storage::WriteOptions,
     ) {
         let buffer = Arc::new(EdgeBuffer::new());
         for (i, e) in events.iter().enumerate() {
@@ -276,7 +276,7 @@ impl Warehouse {
             fold_after_links: fold_after,
             max_delta_layers,
             tier_fanout,
-            filter_bits,
+            write,
             inline_merges,
             layers: parking_lot::Mutex::new(self.held.lock().unwrap().take()),
             pending_merge: parking_lot::Mutex::new(self.held_merge.lock().unwrap().take()),
@@ -558,16 +558,9 @@ async fn streamed_compaction_matches_the_materialized_snapshot() {
         forest.apply(&e);
     }
 
-    let streamed = blaze::storage::codec::compact_to_blobs(
-        &forest,
-        2,
-        blaze::storage::filter::DEFAULT_FILTER_BITS,
-    );
-    let collected = blaze::storage::codec::snapshot_to_blobs(
-        &forest.snapshot(),
-        2,
-        blaze::storage::filter::DEFAULT_FILTER_BITS,
-    );
+    let streamed = blaze::storage::codec::compact_to_blobs(&forest, 2, Default::default());
+    let collected =
+        blaze::storage::codec::snapshot_to_blobs(&forest.snapshot(), 2, Default::default());
     let fields = |bs: &[blaze::storage::puffin::Blob]| {
         bs.iter()
             .map(|b| (b.blob_type.clone(), b.properties.clone(), b.data.to_vec()))
@@ -1508,7 +1501,10 @@ async fn with_bits(
         3,
         usize::MAX,
         true,
-        bits,
+        blaze::storage::WriteOptions {
+            filter_bits: bits,
+            ..Default::default()
+        },
     )
     .await;
 }
