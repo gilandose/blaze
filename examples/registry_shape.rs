@@ -83,6 +83,38 @@ fn main() {
     // 4-byte scope each.
     let grouped_bytes = 8 + roots * 12 + entries * 4;
 
+    // Delta-varint: entries are sorted, so store the *gap* to the previous root
+    // and the gaps between a root's scopes. Roots are nearly dense over the node
+    // space, so those gaps are tiny; scope gaps are bounded by the scope count.
+    // This is what a columnar format's delta encoding would do automatically.
+    fn varint_len(v: u64) -> u64 {
+        let mut n = 1;
+        let mut v = v >> 7;
+        while v > 0 {
+            n += 1;
+            v >>= 7;
+        }
+        n
+    }
+    let mut varint_bytes = 8u64;
+    let mut prev_root = 0u64;
+    let mut i2 = 0usize;
+    while i2 < n {
+        let (root, _) = base.registry_at(i2);
+        varint_bytes += varint_len(root.wrapping_sub(prev_root));
+        prev_root = root;
+        let mut prev_scope = 0u64;
+        let mut k = 0u64;
+        while i2 < n && base.registry_at(i2).0 == root {
+            let scope = base.registry_at(i2).1 as u64;
+            varint_bytes += varint_len(scope.wrapping_sub(prev_scope));
+            prev_scope = scope;
+            k += 1;
+            i2 += 1;
+        }
+        varint_bytes += varint_len(k);
+    }
+
     let mut hist: BTreeMap<&str, u64> = BTreeMap::new();
     for &k in &per_root {
         let bucket = match k {
@@ -124,6 +156,14 @@ fn main() {
         100.0 * grouped_bytes as f64 / base_bytes as f64,
         flat_bytes as f64 / grouped_bytes as f64,
         100.0 * (flat_bytes - grouped_bytes) as f64 / base_bytes as f64
+    );
+
+    println!(
+        "registry (varint)    {:.1} MB   {:.0}% of base   -> {:.2}x smaller, base {:.0}% smaller",
+        varint_bytes as f64 / 1e6,
+        100.0 * varint_bytes as f64 / base_bytes as f64,
+        flat_bytes as f64 / varint_bytes as f64,
+        100.0 * (flat_bytes - varint_bytes) as f64 / base_bytes as f64
     );
 
     println!("\nscopes per root:");
