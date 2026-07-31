@@ -79,22 +79,26 @@ fn disk_free_gb(path: &std::path::Path) -> f64 {
 fn registry_shape(layers: &blaze::storage::LayeredBase) -> (u64, u64, f64) {
     let (mut entries, mut roots, mut in_multi) = (0u64, 0u64, 0u64);
     for i in 0..layers.layers() {
-        let run = layers.layer(i);
-        let n = run.registry_len();
-        let mut j = 0;
-        while j < n {
-            let (root, _) = run.registry_at(j);
-            let mut k = 0u64;
-            while j < n && run.registry_at(j).0 == root {
+        let (mut last, mut k) = (None, 0u64);
+        let close = |k: u64, roots: &mut u64, in_multi: &mut u64| {
+            if k > 0 {
+                *roots += 1;
+                if k >= 2 {
+                    *in_multi += k;
+                }
+            }
+        };
+        for (root, _) in layers.layer(i).registry_iter() {
+            if last == Some(root) {
                 k += 1;
-                j += 1;
+            } else {
+                close(k, &mut roots, &mut in_multi);
+                last = Some(root);
+                k = 1;
             }
-            entries += k;
-            roots += 1;
-            if k >= 2 {
-                in_multi += k;
-            }
+            entries += 1;
         }
+        close(k, &mut roots, &mut in_multi);
     }
     (
         entries,
@@ -177,7 +181,7 @@ async fn main() {
         fold_after_links: u64::MAX,
         max_delta_layers: env("MAX_LAYERS", 12),
         tier_fanout: env("FANOUT", 10),
-        filter_bits: blaze::storage::DEFAULT_FILTER_BITS,
+        write: Default::default(),
         inline_merges: false,
         layers: parking_lot::Mutex::new(None),
         pending_merge: parking_lot::Mutex::new(None),

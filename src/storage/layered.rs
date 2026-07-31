@@ -266,6 +266,7 @@ impl LayeredBase {
 mod tests {
     use super::*;
     use crate::core::ForestSnapshot;
+    use crate::storage::codec::WriteOptions;
     use crate::storage::{codec, puffin};
     use std::collections::BTreeMap;
 
@@ -277,7 +278,7 @@ mod tests {
         seq: u64,
     ) -> Arc<PuffinBase> {
         let bytes = puffin::write(
-            &codec::snapshot_to_blobs(snap, seq, crate::storage::filter::DEFAULT_FILTER_BITS),
+            &codec::snapshot_to_blobs(snap, seq, WriteOptions::default()),
             BTreeMap::new(),
         );
         let path = dir.join(format!("{name}.puffin"));

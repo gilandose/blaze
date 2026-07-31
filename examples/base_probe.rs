@@ -1,4 +1,5 @@
 use blaze::core::{EdgeEvent, RoutingBase, ScopedForest, Visibility};
+use blaze::storage::WriteOptions;
 use blaze::storage::{PuffinBase, codec, puffin};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -62,8 +63,7 @@ fn main() {
     let snapshot_ms = t.elapsed().as_secs_f64() * 1000.0;
     let intermediate_mb = rss_mb() - before;
     let pairs = snap.global.len() + snap.scopes.iter().map(|(_, p)| p.len()).sum::<usize>();
-    let collect_blobs =
-        codec::snapshot_to_blobs(&snap, 1, blaze::storage::filter::DEFAULT_FILTER_BITS);
+    let collect_blobs = codec::snapshot_to_blobs(&snap, 1, WriteOptions::default());
     let collect_ms = snapshot_ms + t.elapsed().as_secs_f64() * 1000.0 - snapshot_ms;
     drop(snap);
     println!(
@@ -97,7 +97,7 @@ fn main() {
     assert_eq!(counting.0, pairs);
 
     let t = Instant::now();
-    let blobs = codec::compact_to_blobs(&forest, 1, blaze::storage::filter::DEFAULT_FILTER_BITS);
+    let blobs = codec::compact_to_blobs(&forest, 1, WriteOptions::default());
     println!(
         "compaction, streaming into blobs: {:.0} ms",
         t.elapsed().as_secs_f64() * 1000.0
@@ -212,7 +212,7 @@ fn main() {
     let before = rss_mb();
     let fold_path = std::env::temp_dir().join("blaze-probe-fold.puffin");
     let t = Instant::now();
-    let mut writer = codec::BlobWriter::new(2, blaze::storage::filter::DEFAULT_FILTER_BITS);
+    let mut writer = codec::BlobWriter::new(2, WriteOptions::default());
     let bytes = disk
         .compact_and_fold(&mut writer, |sink| {
             let bytes = puffin::write(&sink.finish(), BTreeMap::new());
@@ -268,8 +268,7 @@ fn main() {
         let grown = delta_forest.memtable_links();
         let dpath = std::env::temp_dir().join(format!("blaze-probe-delta-{round}.puffin"));
         let t = Instant::now();
-        let mut writer =
-            codec::BlobWriter::new(10 + round, blaze::storage::filter::DEFAULT_FILTER_BITS);
+        let mut writer = codec::BlobWriter::new(10 + round, WriteOptions::default());
         let (len, next) = delta_forest
             .fold_delta(&mut writer, |sink, _| {
                 let bytes = puffin::write(&sink.finish(), BTreeMap::new());

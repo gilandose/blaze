@@ -24,6 +24,7 @@ use crate::storage::base::PuffinBase;
 use crate::storage::catalog::{
     CommitOutcome, DataFileMeta, RunMeta, RunSet, SnapshotCatalog, SnapshotMeta,
 };
+use crate::storage::codec::WriteOptions;
 use crate::storage::compact::compact_layers;
 use crate::storage::layered::LayeredBase;
 use crate::storage::{codec, parquet_io, puffin, tier};
@@ -50,14 +51,19 @@ pub struct Flusher {
     /// Runs per level before they merge into one run at the level above. See
     /// [`tier::pick_merge`].
     pub tier_fanout: usize,
-    /// Bits of membership filter per key written into each run; 0 writes none.
+    /// How runs are encoded: filter bits per key, and which registry format.
     ///
-    /// The one dial that moves the *unreclaimable* memory floor. Everything else
-    /// a disk-backed base keeps in RAM is either bounded by a trigger or clean
-    /// file-backed pages the kernel can evict; filters are heap and scale with
-    /// total state. Lowering this costs query latency on a miss, never
-    /// correctness — see [`crate::storage::filter::clamp_filter_bits`].
-    pub filter_bits: usize,
+    /// `filter_bits` is the one dial that moves the *unreclaimable* memory
+    /// floor. Everything else a disk-backed base keeps in RAM is either bounded
+    /// by a trigger or clean file-backed pages the kernel can evict; filters are
+    /// heap and scale with total state. Lowering it costs query latency on a
+    /// miss, never correctness — see
+    /// [`crate::storage::filter::clamp_filter_bits`].
+    ///
+    /// Neither knob has to agree across the runs in a stack: each run is read
+    /// through whatever it was written with, so changing either takes effect on
+    /// the next run and older ones stay readable.
+    pub write: WriteOptions,
     /// Await each merge inside the tick that starts it, instead of letting it run
     /// in the background.
     ///
@@ -515,7 +521,7 @@ impl Flusher {
             Some(folded) => folded,
             None => (
                 puffin::write(
-                    &codec::compact_to_blobs(&self.forest, sequence, self.filter_bits),
+                    &codec::compact_to_blobs(&self.forest, sequence, self.write),
                     puffin_metadata(watermark),
                 ),
                 Layer::Base,
@@ -645,14 +651,14 @@ impl Flusher {
         ));
         let merge_stack = stack.slice(range.clone())?;
         let merge_path = path.clone();
-        let filter_bits = self.filter_bits;
+        let write = self.write;
         let meta = puffin_metadata(watermark);
         let started = std::time::Instant::now();
         // `sequence` here is only what the run's blob metadata records; the
         // sequence it is actually *committed* at is decided at adoption, which may
         // be several ticks later. Nothing resolves by that number — spans do that.
         let handle = tokio::task::spawn_blocking(move || {
-            let (blobs, cstats) = compact_layers(&merge_stack, sequence, filter_bits);
+            let (blobs, cstats) = compact_layers(&merge_stack, sequence, write);
             let bytes = puffin::write(&blobs, meta);
             write_atomically(&merge_path, &bytes)?;
             anyhow::Ok(MergeResult {
@@ -952,7 +958,7 @@ impl Flusher {
             if compact { "base" } else { "delta" }
         ));
         let started = std::time::Instant::now();
-        let mut writer = codec::BlobWriter::new(sequence, self.filter_bits);
+        let mut writer = codec::BlobWriter::new(sequence, self.write);
 
         let (bytes, next) = if compact {
             // No committed chain to merge (the first commit in disk mode):

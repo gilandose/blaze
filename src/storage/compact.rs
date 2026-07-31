@@ -53,10 +53,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::{BTreeMap, HashSet};
 
 use crate::core::{NodeId, RoutingBase, ScopeId};
-use crate::storage::codec;
+use crate::storage::base::RegistryIter;
+use crate::storage::codec::{self, WriteOptions};
 use crate::storage::filter::{self, BlockedFilter};
 use crate::storage::layered::LayeredBase;
 use crate::storage::puffin::Blob;
+use crate::storage::registry::{RegistryEncoding, RegistryWriter};
 
 /// What a compaction produced, for logging and assertions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -96,7 +98,7 @@ fn table(pairs: impl Iterator<Item = (NodeId, NodeId)>) -> (Bytes, u64) {
 pub fn compact_layers(
     layers: &LayeredBase,
     sequence: u64,
-    filter_bits: usize,
+    opts: WriteOptions,
 ) -> (Vec<Blob>, CompactionStats) {
     let seq = sequence as i64;
     let mut stats = CompactionStats::default();
@@ -143,12 +145,12 @@ pub fn compact_layers(
         ));
     }
 
-    let (registry, reg_stats) = compact_registry(layers);
-    stats.registry_entries = reg_stats.0;
-    stats.registry_corrections = reg_stats.1;
-    stats.moved_roots = reg_stats.2;
-    if stats.registry_entries > 0 {
-        blobs.push(blob(codec::REGISTRY_BLOB_TYPE, registry, BTreeMap::new()));
+    let registry = compact_registry(layers, opts.registry);
+    stats.registry_entries = registry.entries;
+    stats.registry_corrections = registry.corrections;
+    stats.moved_roots = registry.moved_roots;
+    if let Some((blob_type, data)) = registry.blob {
+        blobs.push(blob(blob_type, data, BTreeMap::new()));
     }
 
     // A compacted base needs its own filters, or every lookup against it
@@ -158,7 +160,7 @@ pub fn compact_layers(
     let shared_filter = BlockedFilter::build_with(
         codec::table_keys(&shared_payload).map(|(k, _)| k),
         stats.shared_pairs as usize,
-        filter_bits,
+        opts.filter_bits,
     );
     let overlay_filter = BlockedFilter::build_with(
         overlay_payloads.iter().flat_map(|(scope, data, _)| {
@@ -166,7 +168,7 @@ pub fn compact_layers(
             codec::table_keys(data).map(move |(k, _)| filter::overlay_key(scope, k))
         }),
         stats.overlay_pairs as usize,
-        filter_bits,
+        opts.filter_bits,
     );
     if let Some(f) = shared_filter {
         blobs.push(blob(
@@ -235,12 +237,6 @@ fn one_overlay(layers: &LayeredBase, scope: ScopeId) -> Option<(ScopeId, Bytes, 
 }
 
 /// Ordered cursor over one layer's registry run.
-struct Run {
-    layer: usize,
-    at: usize,
-    len: usize,
-}
-
 /// Every node that some *delta* layer stores a shared parent for.
 ///
 /// This is the cheap test for "has this registry root moved?", and it replaces a
@@ -268,9 +264,21 @@ fn moved_roots(layers: &LayeredBase) -> HashSet<NodeId> {
     moved
 }
 
+/// What one registry merge produced. `blob` is `None` when the merged registry
+/// is empty, which happens only when no layer holds overlay state.
+struct MergedRegistry {
+    blob: Option<(&'static str, Bytes)>,
+    entries: u64,
+    corrections: u64,
+    moved_roots: u64,
+}
+
 /// Merge the layers' registry runs into one sorted, deduped, fully-resolved
-/// blob. Returns `(entries, corrections, moved_root_set_len)`.
-fn compact_registry(layers: &LayeredBase) -> (Bytes, (u64, u64, u64)) {
+/// blob in `encoding`.
+///
+/// The inputs are read through each layer's own encoding, so a stack whose runs
+/// were written by different builds merges without a conversion step.
+fn compact_registry(layers: &LayeredBase, encoding: RegistryEncoding) -> MergedRegistry {
     let moved = moved_roots(layers);
 
     // Pass 1: collect the entries whose root moved — the only ones that break
@@ -289,60 +297,55 @@ fn compact_registry(layers: &LayeredBase) -> (Bytes, (u64, u64, u64)) {
 
     // Pass 2: merge the in-order entries with the sorted corrections. A hash
     // probe per entry, no resolution.
-    let mut buf = BytesMut::new();
-    buf.put_u64_le(0);
-    let mut count = 0u64;
+    let mut writer = RegistryWriter::new(encoding);
     let mut ci = 0usize;
     let mut last: Option<(NodeId, ScopeId)> = None;
-    let mut push = |entry: (NodeId, ScopeId), buf: &mut BytesMut, count: &mut u64| {
+    let mut push = |entry: (NodeId, ScopeId), writer: &mut RegistryWriter| {
         // Runs can carry the same (root, scope) in several layers, and a
         // correction can coincide with an in-order entry.
         if last == Some(entry) {
             return;
         }
         last = Some(entry);
-        buf.put_u64_le(entry.0);
-        buf.put_u32_le(entry.1);
-        *count += 1;
+        writer.push(entry.0, entry.1);
     };
     for_each_registry_entry(layers, &mut |root, scope| {
         if moved.contains(&root) {
             return; // handled as a correction
         }
         while ci < corrections.len() && corrections[ci] <= (root, scope) {
-            push(corrections[ci], &mut buf, &mut count);
+            push(corrections[ci], &mut writer);
             ci += 1;
         }
-        push((root, scope), &mut buf, &mut count);
+        push((root, scope), &mut writer);
     });
     while ci < corrections.len() {
-        push(corrections[ci], &mut buf, &mut count);
+        push(corrections[ci], &mut writer);
         ci += 1;
     }
 
-    buf[..8].copy_from_slice(&count.to_le_bytes());
-    (buf.freeze(), (count, correction_count, moved.len() as u64))
+    MergedRegistry {
+        entries: writer.entries(),
+        blob: writer.finish(),
+        corrections: correction_count,
+        moved_roots: moved.len() as u64,
+    }
 }
 
 /// Visit every registry entry across all layers in ascending `(root, scope)`
 /// order — a k-way merge over the per-layer runs, which are each already
 /// sorted, so nothing is buffered.
 fn for_each_registry_entry(layers: &LayeredBase, f: &mut dyn FnMut(NodeId, ScopeId)) {
-    let mut runs: Vec<Run> = (0..layers.layers())
-        .map(|layer| Run {
-            layer,
-            at: 0,
-            len: layers.layer(layer).registry_len(),
-        })
-        .filter(|r| r.len > 0)
+    // Peekable cursors rather than indices: the blocked encoding decodes a block
+    // at a time, so "entry `i` of layer `j`" is not a constant-time question and
+    // a positional merge would re-decode a block per comparison.
+    let mut runs: Vec<std::iter::Peekable<RegistryIter<'_>>> = (0..layers.layers())
+        .map(|layer| layers.layer(layer).registry_iter().peekable())
         .collect();
     loop {
         let mut pick: Option<(usize, (NodeId, ScopeId))> = None;
-        for (idx, run) in runs.iter().enumerate() {
-            if run.at >= run.len {
-                continue;
-            }
-            let entry = layers.layer(run.layer).registry_at(run.at);
+        for (idx, run) in runs.iter_mut().enumerate() {
+            let Some(&entry) = run.peek() else { continue };
             if pick.is_none_or(|(_, best)| entry < best) {
                 pick = Some((idx, entry));
             }
@@ -350,7 +353,7 @@ fn for_each_registry_entry(layers: &LayeredBase, f: &mut dyn FnMut(NodeId, Scope
         let Some((idx, (root, scope))) = pick else {
             return;
         };
-        runs[idx].at += 1;
+        runs[idx].next();
         f(root, scope);
     }
 }
@@ -375,8 +378,42 @@ mod tests {
     /// same routing answers as compacting the live forest in memory. Built over
     /// randomized state with a real layer chain, because the interesting cases
     /// are roots absorbed several layers after the registry recorded them.
+    ///
+    /// Run three ways, because compaction is where a registry encoding is most
+    /// likely to go wrong: it re-keys entries to live roots while merging runs
+    /// it did not write. The mixed case is the one that matters operationally —
+    /// a worker that starts emitting a new encoding still has older runs in its
+    /// stack, and has to merge across both.
     #[test]
     fn storage_side_compaction_matches_the_in_memory_compactor() {
+        for (name, inputs, out) in [
+            ("flat", [RegistryEncoding::Flat; 5], RegistryEncoding::Flat),
+            (
+                "blocked",
+                [RegistryEncoding::Blocked; 5],
+                RegistryEncoding::Blocked,
+            ),
+            (
+                "mixed",
+                [
+                    RegistryEncoding::Flat,
+                    RegistryEncoding::Blocked,
+                    RegistryEncoding::Flat,
+                    RegistryEncoding::Blocked,
+                    RegistryEncoding::Flat,
+                ],
+                RegistryEncoding::Blocked,
+            ),
+        ] {
+            compaction_matches_the_reference(name, &inputs, out);
+        }
+    }
+
+    fn compaction_matches_the_reference(
+        case: &str,
+        inputs: &[RegistryEncoding; 5],
+        out: RegistryEncoding,
+    ) {
         const NODES: u64 = 500;
         const SCOPES: [u32; 4] = [1, 2, 3, 4];
         let dir = tempfile::tempdir().unwrap();
@@ -404,9 +441,14 @@ mod tests {
                     props: None,
                 });
             }
-            let mut writer =
-                codec::BlobWriter::new(round + 1, crate::storage::filter::DEFAULT_FILTER_BITS);
-            let name = format!("layer-{round}");
+            let mut writer = codec::BlobWriter::new(
+                round + 1,
+                WriteOptions {
+                    registry: inputs[round as usize],
+                    ..Default::default()
+                },
+            );
+            let name = format!("{case}-layer-{round}");
             let dir_path = dir.path().to_path_buf();
             let stack = layers.clone();
             forest
@@ -427,8 +469,14 @@ mod tests {
         assert_eq!(stack.delta_count(), 4);
 
         // Storage-side: merge the mappings, no forest, no lock.
-        let (blobs, stats) =
-            compact_layers(&stack, 99, crate::storage::filter::DEFAULT_FILTER_BITS);
+        let (blobs, stats) = compact_layers(
+            &stack,
+            99,
+            WriteOptions {
+                registry: out,
+                ..Default::default()
+            },
+        );
         assert!(stats.shared_pairs > 0 && stats.overlay_pairs > 0);
         assert!(
             stats.registry_corrections < stats.registry_entries,
@@ -436,7 +484,7 @@ mod tests {
             stats.registry_corrections,
             stats.registry_entries
         );
-        let compacted = write_layer(dir.path(), "compacted", &blobs);
+        let compacted = write_layer(dir.path(), &format!("{case}-compacted"), &blobs);
         let flat = LayeredBase::new(compacted);
 
         // In-memory: what the old path would have written.
@@ -450,7 +498,7 @@ mod tests {
                 assert_eq!(
                     served.scope_root(scope, node),
                     reference.scope_root(scope, node),
-                    "scope {scope} root({node}) diverged after storage-side compaction"
+                    "{case}: scope {scope} root({node}) diverged after compaction"
                 );
             }
         }
@@ -462,7 +510,11 @@ mod tests {
         // but that no registration is lost: everything registered on `r` must
         // still be registered on whatever `r` now resolves to.
         let before = LayeredBase::from_layers(layers).unwrap();
-        let after = LayeredBase::new(write_layer(dir.path(), "compacted2", &blobs));
+        let after = LayeredBase::new(write_layer(
+            dir.path(),
+            &format!("{case}-compacted2"),
+            &blobs,
+        ));
         let mut checked = 0usize;
         for root in 0..NODES {
             let live = before.shared_parent(root).unwrap_or(root);
@@ -530,8 +582,7 @@ mod tests {
                     props: None,
                 });
             }
-            let mut writer =
-                codec::BlobWriter::new(round + 1, crate::storage::filter::DEFAULT_FILTER_BITS);
+            let mut writer = codec::BlobWriter::new(round + 1, WriteOptions::default());
             let name = format!("eq-{round}");
             let dir_path = dir.path().to_path_buf();
             let stack = layers.clone();
@@ -601,7 +652,7 @@ mod tests {
                 props: None,
             });
         }
-        let mut w = codec::BlobWriter::new(1, crate::storage::filter::DEFAULT_FILTER_BITS);
+        let mut w = codec::BlobWriter::new(1, WriteOptions::default());
         forest.compact_into(&mut w);
         let base = write_layer(dir.path(), "b", &w.finish());
         for n in 1..=50u64 {
@@ -621,7 +672,7 @@ mod tests {
             event_time_ms: 0,
             props: None,
         });
-        let mut w2 = codec::BlobWriter::new(2, crate::storage::filter::DEFAULT_FILTER_BITS);
+        let mut w2 = codec::BlobWriter::new(2, WriteOptions::default());
         let d1 = forest2
             .fold_delta(&mut w2, |w, _prev| {
                 let layer = write_layer(dir.path(), "d1", &w.finish());
@@ -633,7 +684,7 @@ mod tests {
 
         let stack = LayeredBase::from_layers(vec![base, d1]).unwrap();
         assert_eq!(stack.delta_count(), 1);
-        let (blobs, stats) = compact_layers(&stack, 3, crate::storage::filter::DEFAULT_FILTER_BITS);
+        let (blobs, stats) = compact_layers(&stack, 3, WriteOptions::default());
         // 50 chain nodes plus the newly absorbed one, each stored once — the
         // point being that the delta's keys do not duplicate the base's.
         assert_eq!(stats.shared_pairs, 51);

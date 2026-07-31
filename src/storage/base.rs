@@ -23,6 +23,7 @@ use crate::core::{NodeId, ScopeId};
 use crate::storage::codec;
 use crate::storage::filter::{BlockedFilter, overlay_key};
 use crate::storage::puffin;
+use crate::storage::registry::BlockedRegistry;
 
 const PAIR_STRIDE: usize = 16;
 const REGISTRY_STRIDE: usize = 12;
@@ -164,13 +165,13 @@ impl PairTable {
 
 /// Sorted `(u64 root, u32 scope)` index inside the mapping.
 #[derive(Debug)]
-struct RegistryTable {
+struct FlatRegistry {
     start: usize,
     count: usize,
     index: Option<SparseIndex>,
 }
 
-impl RegistryTable {
+impl FlatRegistry {
     fn parse(data: &[u8], range: std::ops::Range<usize>) -> anyhow::Result<Self> {
         let payload = &data[range.clone()];
         anyhow::ensure!(payload.len() >= 8, "registry table truncated (no header)");
@@ -187,6 +188,10 @@ impl RegistryTable {
         };
         table.index = SparseIndex::build(count, REGISTRY_STRIDE, |i| table.root_at(data, i));
         Ok(table)
+    }
+
+    fn iter<'a>(&'a self, data: &'a [u8]) -> impl Iterator<Item = (NodeId, ScopeId)> + 'a {
+        (0..self.count).map(move |i| (self.root_at(data, i), self.scope_at(data, i)))
     }
 
     fn root_at(&self, data: &[u8], i: usize) -> NodeId {
@@ -223,6 +228,67 @@ impl RegistryTable {
             i += 1;
         }
         out
+    }
+}
+
+/// Whichever registry encoding this layer happens to carry.
+///
+/// An enum rather than a trait object: `scopes_for` is on the merge-notification
+/// path, and a `dyn` call there would cost an indirection per global merge for
+/// no benefit — there are two encodings and both are known here. Because the
+/// match is per-*layer*, a stack may hold runs in both encodings at once, which
+/// is what lets the format change without rewriting a committed base.
+#[derive(Debug)]
+enum RegistryTable {
+    Flat(FlatRegistry),
+    Blocked(BlockedRegistry),
+}
+
+impl RegistryTable {
+    fn count(&self) -> usize {
+        match self {
+            Self::Flat(t) => t.count,
+            Self::Blocked(t) => t.count(),
+        }
+    }
+
+    fn scopes_for(&self, data: &[u8], root: NodeId) -> ScopeList {
+        match self {
+            Self::Flat(t) => t.scopes_for(data, root),
+            Self::Blocked(t) => t.scopes_for(data, root),
+        }
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Self::Flat(t) => t
+                .index
+                .as_ref()
+                .map(|ix| (ix.first_keys.len() * std::mem::size_of::<NodeId>()) as u64)
+                .unwrap_or(0),
+            Self::Blocked(t) => t.heap_bytes(),
+        }
+    }
+}
+
+/// Every `(root, scope)` in a layer's registry, ascending. The encodings decode
+/// differently enough that this cannot be one type, but both are iterators over
+/// the same pairs, which is all the compactor's k-way merge needs.
+pub enum RegistryIter<'a> {
+    Flat(Box<dyn Iterator<Item = (NodeId, ScopeId)> + 'a>),
+    Blocked(crate::storage::registry::BlockedIter<'a>),
+    Empty,
+}
+
+impl Iterator for RegistryIter<'_> {
+    type Item = (NodeId, ScopeId);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Flat(it) => it.next(),
+            Self::Blocked(it) => it.next(),
+            Self::Empty => None,
+        }
     }
 }
 
@@ -291,7 +357,16 @@ impl PuffinBase {
                     overlays.insert(scope, PairTable::parse(&mmap, blob.range())?);
                 }
                 codec::REGISTRY_BLOB_TYPE => {
-                    registry = Some(RegistryTable::parse(&mmap, blob.range())?);
+                    registry = Some(RegistryTable::Flat(FlatRegistry::parse(
+                        &mmap,
+                        blob.range(),
+                    )?));
+                }
+                codec::REGISTRY_V2_BLOB_TYPE => {
+                    registry = Some(RegistryTable::Blocked(BlockedRegistry::parse(
+                        &mmap,
+                        blob.range(),
+                    )?));
                 }
                 codec::SHARED_FILTER_BLOB_TYPE => {
                     shared_filter = Some(BlockedFilter::decode(&mmap[blob.range()])?);
@@ -419,17 +494,22 @@ impl PuffinBase {
 
     /// Entries in this layer's `root -> scope` registry blob.
     pub fn registry_len(&self) -> usize {
-        self.registry.as_ref().map(|t| t.count).unwrap_or(0)
+        self.registry.as_ref().map(|t| t.count()).unwrap_or(0)
     }
 
-    /// `i`th registry entry, in the blob's stored `(root, scope)` order.
+    /// This layer's registry entries in stored `(root, scope)` order.
     ///
     /// Ordered access matters: compaction merges the layers' registries as
     /// sorted runs rather than sorting a copy of them, which is what keeps it
-    /// off an O(state) buffer.
-    pub fn registry_at(&self, i: usize) -> (NodeId, ScopeId) {
-        let t = self.registry.as_ref().expect("registry table");
-        (t.root_at(&self.mmap, i), t.scope_at(&self.mmap, i))
+    /// off an O(state) buffer. It is an iterator rather than positional access
+    /// because the blocked encoding decodes a block at a time — `i`th entry
+    /// would mean re-decoding from a block start on every call.
+    pub fn registry_iter(&self) -> RegistryIter<'_> {
+        match &self.registry {
+            Some(RegistryTable::Flat(t)) => RegistryIter::Flat(Box::new(t.iter(&self.mmap))),
+            Some(RegistryTable::Blocked(t)) => RegistryIter::Blocked(t.iter(&self.mmap)),
+            None => RegistryIter::Empty,
+        }
     }
 
     /// Heap held by the sparse indexes and the membership filters — the parts of
@@ -448,15 +528,14 @@ impl PuffinBase {
     }
 
     fn table_index_bytes(&self) -> u64 {
-        let pair = self
+        let pair: u64 = self
             .shared
             .iter()
             .chain(self.overlays.values())
-            .filter_map(|t| t.index.as_ref());
-        let registry = self.registry.as_ref().and_then(|r| r.index.as_ref());
-        pair.chain(registry)
+            .filter_map(|t| t.index.as_ref())
             .map(|ix| (ix.first_keys.len() * std::mem::size_of::<NodeId>()) as u64)
-            .sum()
+            .sum();
+        pair + self.registry.as_ref().map(|r| r.heap_bytes()).unwrap_or(0)
     }
 }
 
@@ -527,11 +606,31 @@ mod tests {
     use std::collections::BTreeMap as Map;
     use std::io::Write;
 
+    use crate::storage::codec::WriteOptions;
+    use crate::storage::registry::RegistryEncoding;
+
     fn write_base(snap: &ForestSnapshot, with_registry: bool) -> (tempfile::TempDir, PuffinBase) {
-        let mut blobs =
-            codec::snapshot_to_blobs(snap, 7, crate::storage::filter::DEFAULT_FILTER_BITS);
+        write_base_as(snap, with_registry, RegistryEncoding::default())
+    }
+
+    fn write_base_as(
+        snap: &ForestSnapshot,
+        with_registry: bool,
+        registry: RegistryEncoding,
+    ) -> (tempfile::TempDir, PuffinBase) {
+        let mut blobs = codec::snapshot_to_blobs(
+            snap,
+            7,
+            WriteOptions {
+                registry,
+                ..Default::default()
+            },
+        );
         if !with_registry {
-            blobs.retain(|b| b.blob_type != codec::REGISTRY_BLOB_TYPE);
+            blobs.retain(|b| {
+                b.blob_type != codec::REGISTRY_BLOB_TYPE
+                    && b.blob_type != codec::REGISTRY_V2_BLOB_TYPE
+            });
         }
         let bytes = puffin::write(&blobs, Map::new());
         let dir = tempfile::tempdir().unwrap();
@@ -662,7 +761,7 @@ mod tests {
         // — ~17 probes on as many distinct pages.
         assert!(table.count * PAIR_STRIDE / PAGE_BYTES > 100);
 
-        let reg = RegistryTable {
+        let reg = FlatRegistry {
             start: table.start,
             count: table.count,
             index: SparseIndex::build(table.count, REGISTRY_STRIDE, |i| {
@@ -678,9 +777,15 @@ mod tests {
     }
 
     /// Registry roots repeat across scopes, so its runs can straddle blocks;
-    /// the narrowed lower bound has to find the whole run either way.
+    /// both encodings have to find the whole run either way — the flat one via
+    /// a narrowed lower bound that may span two blocks, the blocked one by
+    /// keeping a root's whole scope list inside one record.
+    ///
+    /// Run over both encodings rather than the default, because the point of
+    /// making the encoding a switch is that a reader answers identically
+    /// whichever it finds.
     #[test]
-    fn sparse_index_finds_registry_runs_across_blocks() {
+    fn registry_finds_runs_across_blocks_in_either_encoding() {
         // 40 roots × 30 scopes = 1200 entries at a 12-byte stride: ~4 blocks
         // of 341, with every run of 30 far more likely to straddle than not.
         let scopes: Vec<ScopeId> = (1..=30).collect();
@@ -691,31 +796,46 @@ mod tests {
                 .map(|&s| (s, (1..=40u64).map(|r| (r + 1000, r)).collect()))
                 .collect(),
         };
-        let (_dir, base) = write_base(&snap, true);
-        let reg = base.registry.as_ref().unwrap();
-        assert!(reg.index.is_some(), "registry is big enough to block");
-        for root in 1..=40u64 {
-            let mut got = base.scopes_for_root(root).to_vec();
-            got.sort_unstable();
-            assert_eq!(got, scopes, "root {root} lost scopes");
-            let mut got = base.scopes_for_root(root + 1000).to_vec();
-            got.sort_unstable();
-            assert_eq!(got, scopes, "overlay member {} lost scopes", root + 1000);
+        for encoding in [RegistryEncoding::Flat, RegistryEncoding::Blocked] {
+            let (_dir, base) = write_base_as(&snap, true, encoding);
+            if let Some(RegistryTable::Flat(reg)) = base.registry.as_ref() {
+                assert!(reg.index.is_some(), "registry is big enough to block");
+            }
+            for root in 1..=40u64 {
+                let mut got = base.scopes_for_root(root).to_vec();
+                got.sort_unstable();
+                assert_eq!(got, scopes, "{encoding:?}: root {root} lost scopes");
+                let mut got = base.scopes_for_root(root + 1000).to_vec();
+                got.sort_unstable();
+                assert_eq!(got, scopes, "{encoding:?}: member {} lost", root + 1000);
+            }
+            assert!(base.scopes_for_root(999).is_empty(), "{encoding:?}");
+            assert!(base.scopes_for_root(1041).is_empty(), "{encoding:?}");
+            // Whole-table iteration is the compactor's input, so it has to agree
+            // with the lookups it will be merged against.
+            let mut seen: Vec<(NodeId, ScopeId)> = base.registry_iter().collect();
+            assert_eq!(seen.len(), base.registry_len());
+            assert!(
+                seen.windows(2).all(|w| w[0] < w[1]),
+                "{encoding:?}: unsorted"
+            );
+            seen.dedup();
+            assert_eq!(seen.len(), 80 * 30);
         }
-        assert!(base.scopes_for_root(999).is_empty());
-        assert!(base.scopes_for_root(1041).is_empty());
     }
 
     #[test]
     fn registry_index_resolves_live_roots() {
-        let (_dir, base) = write_base(&sample(), true);
-        // Overlay member 105 is a live shared root referenced by scope 7.
-        assert_eq!(base.scopes_for_root(105).as_slice(), &[7]);
-        // Member 9 of scope 2999 resolves to itself (not in the shared map).
-        assert_eq!(base.scopes_for_root(9).as_slice(), &[2999]);
-        // Member 1 likewise.
-        assert_eq!(base.scopes_for_root(1).as_slice(), &[2999]);
-        assert!(base.scopes_for_root(999_999).is_empty());
+        for encoding in [RegistryEncoding::Flat, RegistryEncoding::Blocked] {
+            let (_dir, base) = write_base_as(&sample(), true, encoding);
+            // Overlay member 105 is a live shared root referenced by scope 7.
+            assert_eq!(base.scopes_for_root(105).as_slice(), &[7], "{encoding:?}");
+            // Member 9 of scope 2999 resolves to itself (not in the shared map).
+            assert_eq!(base.scopes_for_root(9).as_slice(), &[2999], "{encoding:?}");
+            // Member 1 likewise.
+            assert_eq!(base.scopes_for_root(1).as_slice(), &[2999], "{encoding:?}");
+            assert!(base.scopes_for_root(999_999).is_empty(), "{encoding:?}");
+        }
     }
 
     #[test]

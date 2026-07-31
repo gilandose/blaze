@@ -15,6 +15,7 @@
 //! Run: `cargo run --release --example tier_amplification`
 
 use blaze::core::{EdgeEvent, RoutingBase, ScopedForest, Visibility};
+use blaze::storage::WriteOptions;
 use blaze::storage::{LayeredBase, PuffinBase, codec, compact_layers, pick_merge, puffin};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -124,8 +125,7 @@ fn drive(
             let sub = base.slice(range.clone()).unwrap();
 
             let t = Instant::now();
-            let (blobs, cstats) =
-                compact_layers(&sub, seq, blaze::storage::filter::DEFAULT_FILTER_BITS);
+            let (blobs, cstats) = compact_layers(&sub, seq, WriteOptions::default());
             let bytes = puffin::write(&blobs, BTreeMap::new());
             std::fs::write(&path, &bytes).unwrap();
             let secs = t.elapsed().as_secs_f64();
@@ -164,7 +164,7 @@ fn drive(
         // --- fold the memtable out as a new L0 run ---
         seq += 1;
         let path = dir.join(format!("run-{seq:06}-L0.puffin"));
-        let mut writer = codec::BlobWriter::new(seq, blaze::storage::filter::DEFAULT_FILTER_BITS);
+        let mut writer = codec::BlobWriter::new(seq, WriteOptions::default());
         let prev = stack.as_ref().map(|(b, _)| b.clone());
         let folded = if let Some(base) = prev {
             forest
