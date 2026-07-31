@@ -28,6 +28,9 @@ Three consequences of this profile shape everything below:
 
 ## Documents and priority order
 
+Operator-facing sizing and flag guidance is [../TUNING.md](../TUNING.md); the
+docs below are the design rationale behind those knobs.
+
 | # | Design | Attacks | Status |
 |---|---|---|---|
 | [001](001-delta-snapshots.md) | Delta snapshots & compaction | snapshot stall + payload | designed |
