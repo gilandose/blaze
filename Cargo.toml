@@ -40,6 +40,12 @@ async-trait = "0.1.91"
 http-body-util = "0.1.4"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+# A real S3 implementation to run the conformance suite against in CI, so the
+# check itself is tested rather than only its fakes.
+s3s = "0.14.1"
+s3s-fs = { version = "0.14.1", default-features = false }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
 
 [features]
 default = []

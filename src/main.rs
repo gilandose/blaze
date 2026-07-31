@@ -6,7 +6,7 @@ use object_store::path::Path as StorePath;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use blaze::api::{AppState, router};
 use blaze::core::ScopedForest;
@@ -104,6 +104,20 @@ struct Args {
     #[arg(long, default_value_t = Default::default())]
     registry_encoding: blaze::storage::RegistryEncoding,
 
+    /// Start even if the object store fails the put-if-absent preflight.
+    ///
+    /// The snapshot commit is a conditional put, and it is the *only* thing
+    /// standing between two workers that both believe they are the leader and
+    /// two divergent histories of the same table. A store that ignores the
+    /// precondition produces no error and no warning — both commits succeed,
+    /// both workers serve topology consistent with what they wrote, and nothing
+    /// downstream can tell. So the check is fail-closed by default.
+    ///
+    /// Set this only if the preflight is wrong about your store, and expect a
+    /// warning every minute for as long as the process runs.
+    #[arg(long, default_value_t = false)]
+    allow_unsafe_commits: bool,
+
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
     flush_interval_secs: u64,
@@ -155,6 +169,12 @@ fn build_store(uri: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
         let bucket = s3_bucket(uri)?;
         let store = object_store::aws::AmazonS3Builder::from_env()
             .with_bucket_name(bucket)
+            // Stated rather than inherited. This is the default in object_store
+            // 0.14, but the entire commit protocol rests on it, and a default
+            // that changes under a dependency bump would turn leader arbitration
+            // off silently. `verify_conditional_put` then checks that the store
+            // on the other end actually honours it.
+            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
             .build()?;
         Ok(Arc::new(store))
     } else {
@@ -205,6 +225,33 @@ async fn main() -> anyhow::Result<()> {
         StorePath::from(args.table.clone())
     };
     let catalog = Arc::new(SnapshotCatalog::new(store.clone(), table_prefix.clone()));
+
+    // Prove the store can arbitrate commits before we ever try to make one.
+    // Cheap (a few dozen small objects, all removed again) and it runs against
+    // the real bucket, prefix and credentials rather than a stand-in.
+    if let Err(e) = blaze::storage::verify_conditional_put(&store, &table_prefix).await {
+        if !args.allow_unsafe_commits {
+            return Err(anyhow::Error::new(e).context(
+                "object store cannot arbitrate snapshot commits; refusing to start. \
+                 Re-run with --allow-unsafe-commits only if you are certain this \
+                 check is wrong about your store",
+            ));
+        }
+        error!(
+            error = %e,
+            "object store failed the put-if-absent preflight and --allow-unsafe-commits \
+             is set; two leaders can silently publish divergent histories"
+        );
+        let reason = e.to_string();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(60));
+            every.tick().await;
+            loop {
+                every.tick().await;
+                warn!(reason, "running with unverified commit arbitration");
+            }
+        });
+    }
 
     // Committed routing state: either hydrated into the heap, or mmap'd from
     // a local cache of the latest Puffin snapshot.

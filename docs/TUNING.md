@@ -185,11 +185,42 @@ ingest cannot outrun compaction and bury you in runs.
 | `--inline-merges` | off | ingest that cannot outrun compaction | tick blocks for the whole merge |
 | `--routing-base` | ram | — | `disk` is the low-memory mode |
 | `--registry-encoding` | blocked | — | `flat` is 1.6x the base for a 2.4x faster merge notification |
+| `--allow-unsafe-commits` | off | **nothing** — see below | correctness, not performance |
 
 **The gotcha:** `--fold-after-links` does nothing on a leader. The check is
 `!force && links < fold_after_links`, and a leader always passes `force = true`
 because it needs a layer to commit. On the writer, memtable size is governed by
 `--flush-interval-secs`.
+
+## The startup preflight
+
+Not a tuning dial, but it is the one flag that can stop a worker booting, so it
+belongs here.
+
+Snapshot commits arbitrate between leaders with a single conditional put. If the
+object store ignores the precondition, **two workers both succeed, both serve
+topology consistent with what they wrote, and nothing downstream can tell** —
+there is no error, no warning and no metric that moves. So every worker probes
+its own store at startup, under its own bucket and prefix, and refuses to run if
+the probe fails.
+
+The probe writes a few dozen small objects under `{table}/_preflight/` and
+deletes them again. It checks four things, and the fourth is the one that
+matters: a fresh key accepts a conditional put; the same key then refuses one;
+the first write is what is actually stored; and **eight simultaneous callers
+produce exactly one winner**. A store can pass the first three by serializing
+requests per key and still resolve a genuine race by last-write-wins.
+
+If the preflight fails, the message names which property broke and what it means.
+The fix is almost always the store, not blaze: an S3-compatible implementation
+without `If-None-Match` support, or an older MinIO. `--allow-unsafe-commits`
+starts anyway and warns every minute; use it only if you are certain the check is
+wrong about your store, and never with more than one worker able to win an
+election.
+
+Worth knowing that this is not hypothetical. `s3s-fs`, a real S3 server
+implementation, passes the sequential checks and fails the concurrent one —
+its `PutObject` tests `path.exists()` and then writes, with nothing in between.
 
 ## Measured trade curves
 
