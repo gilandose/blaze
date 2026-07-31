@@ -360,6 +360,7 @@ dependencies = [
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
+ "async-trait",
  "axum",
  "bytes",
  "clap",
