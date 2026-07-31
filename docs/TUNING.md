@@ -13,7 +13,7 @@ Four terms, and only two of them are yours to lose sleep over.
 
 | term | size | reclaimable? |
 |---|---|---|
-| **Filters** | ~1.9 bytes per link | **no — heap** |
+| **Filters** | ~2.1 bytes per link (~1.2 single-scope) | **no — heap** |
 | **Sparse index** | ~0.2% of base bytes | **no — heap** |
 | Leader memtable | `flush_interval x arrival_rate x 50 B` | no, but tiny |
 | Follower memtable | `fold_after_links x 50 B` | no, but tiny |
@@ -31,29 +31,44 @@ So there are two budgets:
 - **Page-cache budget** (soft): whatever is left. It sets query latency, not
   whether you run.
 
-## Sizing formulas
+## Sizing: measure, do not extrapolate
 
-With `N` = links of committed state:
+**Only one of these terms is a usable constant.** Measured through the real
+flusher at 2M links (`examples/detached_merge`, `--filter-bits 8`):
 
-```
-base on disk    ~= 38 N bytes          (measured 38.7 B/link; design 006 assumed 37.5)
-filter heap     ~= 1.9 N bytes         (at --filter-bits 8; halves at 4, ~0 at 0)
-sparse index    ~= 0.076 N bytes       (0.2% of base)
-leader memtable  = interval_s x rate x 50 bytes
-```
+| scopes/edge | index heap | **B/link (heap)** | base on disk | B/link (disk) |
+|---|---|---|---|---|
+| 1 scope total | 2249 KB | **1.15** | 60 MB | 31.5 |
+| 1–3 of 100 | 4025 KB | **2.06** | 128 MB | 67.1 |
+| 1–3 of 3000 | 4044 KB | **2.07** | 131 MB | 68.7 |
 
-The filter term is per **key**, not per link — overlay pairs outnumber links
-whenever edges carry several scopes, which is where the 1.9 comes from. On a
-single-scope workload expect closer to 1.0.
+**Index heap is predictable**: ~1.2 B/link single-scope, ~2.1 B/link once edges
+carry several scopes. It saturates by 100 scopes because what drives it is *scopes
+per edge*, not scope count — going 100 → 3000 does not change how many overlay
+entries an edge creates. Halves at `--filter-bits 4`; drops to just the sparse
+index (~0.14 B/link) at 0.
 
-Worked, at `--filter-bits 8`:
+**Disk bytes per link is not a constant, and an earlier version of this guide
+wrongly gave one.** It said 38 B/link, taken from a single `ceiling` run. Measured
+across configurations it ranges **31.5 to 74.4**, and the variation is not
+explained by stack depth — holding scopes fixed and sweeping the depth ceiling
+gives 70.3 / 69.2 / 74.4 at ceilings of 6 / 12 / 24, i.e. flat. It also is not
+explained by per-run Puffin footer overhead, which would scale with scope *count*
+and so would separate 100 from 3000; it does not. The remaining candidates are
+graph density and fold size, and **we do not currently have a model that predicts
+it.** Measure your own workload before sizing disk.
 
-| links | base on disk | heap floor |
-|---|---|---|
-| 100M | 3.8 GB | 0.2 GB |
-| 500M | 19 GB | 1.0 GB |
-| 2B | 75 GB | 4.0 GB |
-| 10B | 375 GB | 20 GB |
+Heap floor at `--filter-bits 8`, using 2.1 B/link:
+
+| links | heap floor | at `--filter-bits 4` | at 0 |
+|---|---|---|---|
+| 100M | 0.21 GB | 0.11 GB | 0.014 GB |
+| 500M | 1.0 GB | 0.53 GB | 0.07 GB |
+| 2B | 4.2 GB | 2.1 GB | 0.28 GB |
+| 10B | 21 GB | 11 GB | 1.4 GB |
+
+Plus `leader memtable = interval_s x rate x 50 bytes` — 6 MB at 60 s and 2k/s, so
+never the constraint on a writer.
 
 ## Worked configurations
 
@@ -63,9 +78,11 @@ Worked, at `--filter-bits 8`:
 --routing-base disk --filter-bits 8 --flush-interval-secs 60
 --tier-fanout 4 --max-delta-layers 8
 ```
-1 GB heap, ~3 GB of page cache against a 19 GB base (16% resident). Queries fault
-often; fine if your SLO is milliseconds rather than microseconds. Low fanout keeps
-each merge small so it does not evict the working set.
+1 GB heap, leaving ~3 GB of page cache. Whether that is 15% or 50% of your base
+depends on the disk-bytes question above, so measure — but either way queries
+fault, which is fine if your SLO is milliseconds rather than microseconds. Low
+fanout keeps each merge small so it does not evict the working set, and the
+measured table shows it also buys ~3x on lookups.
 
 **Small box, large state** — 4 GB RAM, billions of links:
 
@@ -73,9 +90,9 @@ each merge small so it does not evict the working set.
 --routing-base disk --filter-bits 0 --flush-interval-secs 60
 --tier-fanout 4 --max-delta-layers 8
 ```
-`--filter-bits 0` is the only thing that makes this fit: heap drops from ~4 GB to
-~150 MB at 2B links. It costs ~35% ingest throughput (measured 88k → 57k links/s),
-which is irrelevant at 50/s and fatal during a backfill — see below.
+`--filter-bits 0` is the only thing that makes this fit: heap drops from ~4.2 GB
+to ~0.28 GB at 2B links. It costs ~35% ingest throughput (measured 88k → 57k
+links/s), which is irrelevant at 50/s and fatal during a backfill — see below.
 
 **Production serving** — 64 GB RAM, 2B links:
 
@@ -83,8 +100,11 @@ which is irrelevant at 50/s and fatal during a backfill — see below.
 --routing-base disk --filter-bits 8 --flush-interval-secs 60
 --tier-fanout 10 --max-delta-layers 24
 ```
-4 GB heap, ~59 GB of page cache against a 75 GB base (~79% resident). This is the
-configuration design 006 sized for, and the one the defaults target.
+4.2 GB heap, leaving ~59 GB of page cache. Design 006 sized the base at 75 GB for
+2B links, which would be ~79% resident — but that figure predates the measurements
+above and assumes ~37 B/link, at the bottom of the observed range. If your
+workload lands nearer 70 B/link the base is ~140 GB and you are at ~42% resident,
+so validate before committing to an instance type.
 
 **Backfill** — whatever box, ingest rate is the objective:
 
@@ -101,7 +121,7 @@ ingest cannot outrun compaction and bury you in runs.
 
 | flag | default | raise it for | costs |
 |---|---|---|---|
-| `--filter-bits` | 8 | ingest speed, query latency | heap: ~1.9 B/link at 8, ~0 at 0 |
+| `--filter-bits` | 8 | ingest speed, query latency | heap: ~2.1 B/link at 8, ~0.14 at 0 |
 | `--tier-fanout` | 10 | less rewriting (`amp ≈ log_T(F)`) | depth: `(T-1)·log_T(F)` runs to probe |
 | `--max-delta-layers` | 24 | fewer merges | every path pays per run |
 | `--flush-interval-secs` | 60 | fewer commits | leader memtable **and** your RPO |
@@ -140,6 +160,19 @@ Detached vs inline merges, 3M links at matched schedule:
 |---|---|---|---|
 | `--inline-merges` | 661,468 | 1200 ms | 3258 ms |
 | default (detached) | 111,168 | 296 ms | 650 ms |
+
+Depth end to end, 3000 scopes at 2M links — note the p99 tick moves *opposite* to
+lookup and ingest, because a deeper stack merges less often:
+
+| fanout / ceiling | ingest/s | lookup | p99 tick |
+|---|---|---|---|
+| 4 / 6 | 96k | 0.88 µs | 351 ms |
+| 4 / 12 | 89k | 0.75 µs | 265 ms |
+| 10 / 24 (defaults) | 80k | 2.41 µs | 156 ms |
+
+That is the whole trade in one table: the shipped defaults buy the smoothest tick
+latency and pay ~3x on lookups and 17% on ingest. At 50 links/s that is the right
+corner; during a backfill it is the wrong one.
 
 ## Serving and backfill pull opposite ways
 

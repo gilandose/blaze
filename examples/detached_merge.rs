@@ -44,6 +44,8 @@ fn env<T: std::str::FromStr>(key: &str, default: T) -> T {
 struct Run {
     links: u64,
     index_kb: u64,
+    base_mb: u64,
+    lookup_us: f64,
     ingest_s: f64,
     peak_memtable: u64,
     tick_ms: Vec<f64>,
@@ -188,12 +190,32 @@ async fn drive(
 
     // Heap held by in-RAM indexes over the mapping: filters plus sparse index.
     // Unlike RSS this is not reclaimable, so it is the real memory floor.
-    let index_kb = flusher
+    let (index_kb, base_mb) = flusher
         .layers
         .lock()
         .as_ref()
-        .map(|l| blaze::core::RoutingBase::stats(&*l.base).index_bytes / 1024)
-        .unwrap_or(0);
+        .map(|l| {
+            let st = blaze::core::RoutingBase::stats(&*l.base);
+            (st.index_bytes / 1024, st.mapped_bytes / (1024 * 1024))
+        })
+        .unwrap_or((0, 0));
+
+    // Warm lookup latency over the composed path, which is what filters are
+    // supposed to buy and what the tuning guide claims they cost.
+    const PROBES: usize = 100_000;
+    let mut qrng = StdRng::seed_from_u64(0x10CA1);
+    let t = Instant::now();
+    let mut sink = 0u64;
+    for _ in 0..PROBES {
+        let scope = if scopes > 1 {
+            1 + qrng.random_range(0..scopes)
+        } else {
+            1
+        };
+        sink += forest.scope_root(scope, qrng.random_range(0..nodes));
+    }
+    std::hint::black_box(sink);
+    let lookup_us = t.elapsed().as_secs_f64() * 1e6 / PROBES as f64;
 
     stop.store(true, Ordering::Relaxed);
     ingest.join().unwrap();
@@ -202,6 +224,8 @@ async fn drive(
     Run {
         links: ingested.load(Ordering::Relaxed),
         index_kb,
+        base_mb,
+        lookup_us,
         ingest_s: ingest_elapsed,
         peak_memtable: peak.load(Ordering::Relaxed),
         tick_ms: tick_times,
@@ -234,34 +258,34 @@ async fn main() {
         env("MAX_LAYERS", 12)
     );
     println!(
-        "{:<10} {:>7} {:>6} {:>8} {:>15} {:>9} {:>10} {:>10} {:>10}",
+        "{:<10} {:>7} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9}",
         "policy",
         "links",
-        "ticks",
         "ingest/s",
-        "peak memtable",
+        "base MB",
         "index KB",
-        "p50 tick",
-        "p99 tick",
-        "max tick"
+        "idx B/lnk",
+        "base B/lnk",
+        "lookup us",
+        "p99 tick"
     );
 
     for (name, inline) in [("inline", true), ("detached", false)] {
         let mut r = drive(inline, links, rate, tick_ms, nodes, scopes).await;
         r.tick_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "{:<10} {:>6.1}M {:>6} {:>7.0}k {:>15} {:>9} {:>8.0}ms {:>8.0}ms {:>8.0}ms",
+            "{:<10} {:>6.1}M {:>7.0}k {:>8} {:>9} {:>9.2} {:>10.1} {:>9.2} {:>7.0}ms",
             name,
             r.links as f64 / 1e6,
-            r.tick_ms.len(),
             r.links as f64 / r.ingest_s / 1e3,
-            r.peak_memtable,
+            r.base_mb,
             r.index_kb,
-            pct(&r.tick_ms, 0.50),
+            r.index_kb as f64 * 1024.0 / r.links as f64,
+            r.base_mb as f64 * 1024.0 * 1024.0 / r.links as f64,
+            r.lookup_us,
             pct(&r.tick_ms, 0.99),
-            r.tick_ms.last().copied().unwrap_or(0.0),
         );
-        let _ = r.merges;
+        let _ = (r.merges, r.peak_memtable, r.wall_s, pct(&r.tick_ms, 0.50));
         let _ = r.wall_s;
     }
 }
