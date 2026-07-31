@@ -61,6 +61,11 @@ compaction; queries compose the mapped base with that memtable. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the composition rules and measured
 cold-start/latency numbers.
 
+**Sizing this to your hardware — including running billions of links on a small
+box — is [docs/TUNING.md](docs/TUNING.md).** It covers which memory terms are
+reclaimable and which are not, worked configurations from 4 GB up, the measured
+trade curve for each flag, and why serving and backfill want opposite settings.
+
 ## Warehouse backends
 
 | URI | Backend |

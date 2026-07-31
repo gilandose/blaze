@@ -143,7 +143,8 @@ fn main() {
             let s = stack.take().unwrap();
             seq += 1;
             let t = Instant::now();
-            let (blobs, cstats) = compact_layers(&s.base, seq);
+            let (blobs, cstats) =
+                compact_layers(&s.base, seq, blaze::storage::filter::DEFAULT_FILTER_BITS);
             let bytes = puffin::write(&blobs, BTreeMap::new());
             let path = dir.join(format!("base-{seq:06}.puffin"));
             std::fs::write(&path, &bytes).unwrap();
@@ -174,7 +175,7 @@ fn main() {
         seq += 1;
         let path = dir.join(format!("layer-{seq:06}.puffin"));
         let t = Instant::now();
-        let mut writer = codec::BlobWriter::new(seq);
+        let mut writer = codec::BlobWriter::new(seq, blaze::storage::filter::DEFAULT_FILTER_BITS);
         let prev = stack.as_ref().map(|s| s.base.clone());
         let written = if let Some(prev_base) = prev {
             forest

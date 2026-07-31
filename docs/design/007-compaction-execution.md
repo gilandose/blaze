@@ -41,6 +41,73 @@ Worth noting the splice is already proven sound: `M ≡ [L0..Lk]`, and `Lk+1`'s 
 were composed roots of `[L0..Lk]`, hence of `[M]` — so disjointness holds and
 `swap_base` accepts it. That argument is in `core/scoped.rs`.
 
+## Shipped: (a), detached in-process
+
+The format landed with tiering, and (a) is now the default — `--inline-merges`
+turns it off. `start_merge` spawns onto a blocking thread and returns; a later
+tick's `adopt_merge` publishes the result and splices it in. Folds and commits run
+throughout, which was the point: awaiting a merge inside the tick meant nothing
+drained the memtable for its duration, so the fold trigger stopped bounding
+memory for however many minutes a high-level merge took.
+
+### Measured
+
+`examples/detached_merge` drives the real `Flusher` — real object store, real
+catalog, real policy — with a separate thread ingesting continuously, because the
+claim is about concurrency and nothing else would test it. Both arms take the same
+3M links and tick on the same fixed schedule.
+
+| policy | ticks | ingest/s | peak memtable | p50 tick | p99 tick | max tick |
+|---|---|---|---|---|---|---|
+| inline | 100 | 92k | 661,468 | 92 ms | 1200 ms | 3258 ms |
+| detached | 139 | 85k | **111,168** | 89 ms | **296 ms** | **650 ms** |
+
+- **Peak memtable is 5.9x lower**, which is the whole claim. Inline, the memtable
+  is whatever arrives during the longest merge, and nothing bounds it but the
+  merge's duration; detached, the fold trigger bounds it as designed.
+- **Tail latency: p99 4.1x lower, worst tick 5.0x lower.** A 3.3-second tick is
+  3.3 seconds of watermark not advancing and segments not dropping.
+- **p50 is unchanged** (92 vs 89 ms), so detaching costs nothing in the common
+  case where no merge is running.
+- **Ingest was ~8% slower detached** (85k vs 92k links/s), which was not expected.
+  Shorter ticks mean more of them fit in the same window — 139 against 100 — and
+  every one folds, taking the union lock that ingest needs. So the trade is real:
+  much lower memory and tail latency for slightly lower throughput. One run, so
+  treat the 8% as indicative rather than settled.
+
+Two caveats on the numbers. Ingest saturated at ~90k links/s on this box against a
+requested 100k, so this is a *saturated* writer, far above the ~50/s target — which
+is the harder case for stall behaviour and the right one to test. And a first
+version of the harness let the ingest thread run free for a fixed tick count, so
+the arm with slower ticks also got more wall time to ingest and was handed 47%
+more data than its comparator; fixing the link budget and the tick schedule is
+what makes the two columns comparable.
+
+Three things this needed that were not obvious up front:
+
+- **The merged run is located by identity, not by remembered indices.** A merge
+  outlives the stack it was planned against — folds append below it, and a
+  full-stack fold can replace it outright. `adopt_merge` finds its inputs as a
+  contiguous window by path and discards the merge if that window is gone, rather
+  than splicing over whatever now sits at those positions.
+- **`fold` had to stop compacting on depth.** That was the only depth control
+  before tiering, and left in place it preempted the policy: with a merge in
+  flight the stack still looks deep, so the fold rewrote the whole thing inline
+  under the union lock — performing the merge's work synchronously, which is
+  precisely what detaching it was meant to avoid. Caught by the first run of the
+  detached test, which found one run where it expected four. `fold` now compacts
+  only when there is no stack yet or the stack holds a local-only run; depth is
+  `pick_merge`'s ceiling branch, and a stack stuck over the ceiling logs a warning
+  rather than being papered over.
+- **A merge is published later than the span it covers.** That is the observable
+  the run-set format exists for and what the test asserts directly: a run covering
+  1..=3 committed at sequence 5, sitting below a delta committed at 4 while it
+  ran. No value of `base_sequence` + `delta_chain_len` describes that.
+
+Still true and still worth doing: `wait_for_merge` exists for graceful shutdown,
+and a process that exits with a merge in flight leaves an orphan file on local
+disk that nothing references.
+
 ## (a) Detached task, same process
 
 A background task that the tick kicks off and does not await; on completion it
@@ -100,6 +167,33 @@ Mostly already handled, which is worth stating so nobody re-solves it:
   (measured ~1.3 µs per link ingested per layer, ~0.65 µs per lookup), and
   serving degrades smoothly rather than failing. That makes **chain length an
   SLI** — it should be alerted on, since nothing else will notice.
+
+## Page-cache pollution, and why it is not a one-line fix
+
+Attempted and backed out, because it is worth recording why. A compaction reads
+each page of a layer exactly once and leaves all of them resident — measured,
+8.4 GB RSS against a 5.4 GB base — and since those pages are the most recently
+touched, LRU prefers to evict the query working set over them. Recency inversion,
+not a leak.
+
+- **`MADV_COLD`** is exactly right: deprioritize for reclaim without freeing
+  anything or changing an observable byte, so it is safe to issue while other
+  threads read the mapping. memmap2 0.9.11 does not expose it.
+- **`MADV_DONTNEED`** is exposed, but only through `unsafe
+  unchecked_advise_range`, and it is unsound here. Queries hold `&[u8]` borrows
+  into the same mapping concurrently with a sweep, and freeing pages under a live
+  borrow is UB in Rust's model — even though a read-only mapping of an immutable
+  file would refault identical bytes. The precondition cannot be established, so
+  the unsafe block cannot be justified.
+- **The safe fix is to stop sweeping through the mapping**: have compaction read
+  layers with ordinary buffered file I/O and `posix_fadvise(POSIX_FADV_DONTNEED)`
+  on the descriptor, which involves no borrows at all. That is a real change to
+  the compaction reader rather than an advice call, and it composes well with
+  running compaction in a separate process — which would not have the serving
+  node's page cache to pollute in the first place.
+
+Note this ranks *below* tiering for the same reason everything else does: once
+merges stop touching the whole base, there is far less cache to pollute.
 
 ## Recommendation
 

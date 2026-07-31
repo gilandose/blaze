@@ -49,6 +49,72 @@ pub struct SnapshotMeta {
     /// cold start has to fetch.
     #[serde(default)]
     pub delta_chain_len: u64,
+    /// The runs that make up routing state as of this snapshot, oldest first.
+    ///
+    /// This supersedes `base_sequence` + `delta_chain_len`, which can only
+    /// describe *one* base followed by a contiguous chain — a shape that breaks
+    /// as soon as merges stop being all-or-nothing. Two things need that:
+    ///
+    /// - **Tiered compaction** merges a *subset* of runs, so there is no single
+    ///   privileged base, just runs at different size levels.
+    /// - **Detached compaction** finishes after later deltas have been
+    ///   committed, and its output covers an *earlier* span than the newest
+    ///   commit. There is no sequence number at which that can be expressed as
+    ///   "a base plus everything after it".
+    ///
+    /// Empty on snapshots written before this field existed; use
+    /// [`SnapshotMeta::run_set`] rather than reading it directly.
+    #[serde(default)]
+    pub runs: Vec<RunMeta>,
+    /// Catalog format generation, `0` for anything written before run sets.
+    ///
+    /// **Reading a run-set catalog with a pre-run-set binary is not safe**, and
+    /// this field exists to name that rather than fix it. It cannot fix it: a
+    /// tiered stack is runs at several levels, which `base_sequence` +
+    /// `delta_chain_len` simply cannot describe, so there is no value of those
+    /// fields that an old reader resolves correctly. They are written on a
+    /// best-effort basis for a chain-shaped stack and are wrong for any other.
+    ///
+    /// An old binary ignores this field — that is the whole problem, and why the
+    /// upgrade is one-way. Once a tiered merge has been committed, roll forward,
+    /// not back. A new reader treats `format_version >= FORMAT_RUN_SETS` as a
+    /// promise that `runs` is populated and well-formed, and fails loudly if not.
+    #[serde(default)]
+    pub format_version: u32,
+}
+
+/// `format_version` for snapshots that describe themselves as a set of runs.
+pub const FORMAT_RUN_SETS: u32 = 1;
+
+/// One immutable run of routing pairs — a folded memtable, or the output of
+/// merging several runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunMeta {
+    pub path: String,
+    /// Size tier. 0 is a freshly folded memtable; merging `fanout` runs at level
+    /// `n` produces one run at level `n + 1`.
+    #[serde(default)]
+    pub level: u8,
+    /// Catalog sequences this run covers, inclusive.
+    ///
+    /// This is what fixes a run's place in the resolution order, and it is why a
+    /// merged run inherits the *span* of everything it subsumed rather than
+    /// taking the sequence it was committed at. Runs resolve oldest-span-first,
+    /// and the disjoint-keys invariant holds because a run's keys are composed
+    /// roots of every run with an earlier span.
+    pub min_sequence: u64,
+    pub max_sequence: u64,
+    pub pairs: u64,
+    pub bytes: u64,
+}
+
+impl RunMeta {
+    /// Whether `self` is immediately followed by `next` with no gap — merges may
+    /// only span a contiguous stretch, or a run left in the middle would end up
+    /// resolved out of order.
+    pub fn adjacent_to(&self, next: &RunMeta) -> bool {
+        self.max_sequence + 1 == next.min_sequence
+    }
 }
 
 /// Snapshots written before delta support had no `base_sequence`; every one of
@@ -70,6 +136,83 @@ impl SnapshotMeta {
         };
         base..=self.sequence
     }
+
+    /// The runs to assemble, oldest first — the single way readers should ask.
+    ///
+    /// Falls back to synthesising a run set from `base_sequence` +
+    /// `delta_chain_len` for snapshots written before `runs` existed, so an old
+    /// catalog reads correctly without a migration. The synthesised runs carry no
+    /// paths, because the old format only recorded the *newest* commit's Puffin
+    /// path and a reader has to fetch each sequence's own snapshot to learn the
+    /// rest; `sequences_only` says so explicitly rather than inventing paths.
+    ///
+    /// Fallible because the span structure is checked here, and it is checked here
+    /// because this is the one place every reader passes through. Runs resolve
+    /// oldest-span-first, so a gap means some sequence's state belongs to no run
+    /// and an overlap means two runs claim it — either way resolution order stops
+    /// being total, and the disjoint-keys argument stops holding. Nothing else
+    /// would notice: a malformed set assembles and answers just as cleanly as a
+    /// correct one, only wrongly. The cost is a walk of a handful of runs, once
+    /// per commit or cold start.
+    pub fn run_set(&self) -> anyhow::Result<RunSet> {
+        if self.format_version >= FORMAT_RUN_SETS {
+            anyhow::ensure!(
+                !self.runs.is_empty(),
+                "snapshot {} claims the run-set format but lists no runs",
+                self.sequence
+            );
+        }
+        if self.runs.is_empty() {
+            return Ok(RunSet::SequencesOnly(self.chain()));
+        }
+
+        let mut runs = self.runs.clone();
+        runs.sort_by_key(|r| r.min_sequence);
+        for run in &runs {
+            anyhow::ensure!(
+                run.min_sequence <= run.max_sequence,
+                "snapshot {}: run {} spans backwards ({}..={})",
+                self.sequence,
+                run.path,
+                run.min_sequence,
+                run.max_sequence
+            );
+        }
+        for pair in runs.windows(2) {
+            anyhow::ensure!(
+                pair[0].adjacent_to(&pair[1]),
+                "snapshot {}: runs {}..={} and {}..={} are not adjacent, so sequence order is \
+                 ambiguous",
+                self.sequence,
+                pair[0].min_sequence,
+                pair[0].max_sequence,
+                pair[1].min_sequence,
+                pair[1].max_sequence
+            );
+        }
+        // Note the *oldest* run is deliberately not required to start at 1: a
+        // worker that cold-started from a pre-run-set catalog inherits that
+        // catalog's base sequence, and everything below it is already inside that
+        // base.
+        let newest = runs.last().expect("non-empty");
+        anyhow::ensure!(
+            newest.max_sequence == self.sequence,
+            "snapshot {}: newest run ends at {}, so this commit's own sequence is in no run",
+            self.sequence,
+            newest.max_sequence
+        );
+        Ok(RunSet::Runs(runs))
+    }
+}
+
+/// How a snapshot describes its routing state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunSet {
+    /// Explicit runs with levels, spans and paths.
+    Runs(Vec<RunMeta>),
+    /// A pre-`runs` snapshot: a base sequence followed by a contiguous chain,
+    /// with each link's path found by reading that sequence's own snapshot.
+    SequencesOnly(std::ops::RangeInclusive<u64>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,9 +343,159 @@ mod tests {
             data_files: vec![],
             puffin_path: format!("puffin/dsu-{seq}.puffin"),
             committer: "test".into(),
+            runs: Vec::new(),
+            format_version: 0,
             base_sequence: seq,
             delta_chain_len: 0,
         }
+    }
+
+    fn run(level: u8, min_sequence: u64, max_sequence: u64) -> RunMeta {
+        RunMeta {
+            path: format!("puffin/run-L{level}-{min_sequence}-{max_sequence}.puffin"),
+            level,
+            min_sequence,
+            max_sequence,
+            pairs: 1,
+            bytes: 1,
+        }
+    }
+
+    /// A catalog written before `runs` existed has to keep reading correctly —
+    /// there is no migration, so the absent field must land on the chain path
+    /// rather than on an empty run set (which would read as "no state at all").
+    #[test]
+    fn a_snapshot_without_runs_falls_back_to_its_chain() {
+        let json = r#"{
+            "sequence": 7,
+            "committed_at_ms": 0,
+            "watermark": 100,
+            "data_files": [],
+            "puffin_path": "puffin/dsu-7.puffin",
+            "committer": "old-worker",
+            "base_sequence": 4,
+            "delta_chain_len": 3
+        }"#;
+        let meta: SnapshotMeta = serde_json::from_str(json).unwrap();
+        assert!(meta.runs.is_empty());
+        assert_eq!(meta.run_set().unwrap(), RunSet::SequencesOnly(4..=7));
+    }
+
+    /// Pre-delta snapshots recorded no `base_sequence` at all; each was its own
+    /// base, and `chain()` already encodes that. Checked here too because
+    /// `run_set` is now the only entry point readers use.
+    #[test]
+    fn a_pre_delta_snapshot_is_its_own_base() {
+        let json = r#"{
+            "sequence": 3,
+            "committed_at_ms": 0,
+            "watermark": 10,
+            "data_files": [],
+            "puffin_path": "puffin/dsu-3.puffin",
+            "committer": "ancient"
+        }"#;
+        let meta: SnapshotMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.run_set().unwrap(), RunSet::SequencesOnly(3..=3));
+    }
+
+    /// Resolution order is by span, not by the order the runs happen to be
+    /// listed in — a detached merge appends a run covering an *earlier* span
+    /// than runs already in the list, so the sort is load-bearing, not cosmetic.
+    #[test]
+    fn runs_resolve_oldest_span_first_however_they_were_listed() {
+        let mut meta = snap(9, 900);
+        meta.runs = vec![run(0, 9, 9), run(2, 1, 6), run(1, 7, 8)];
+
+        let RunSet::Runs(runs) = meta.run_set().unwrap() else {
+            panic!("explicit runs must not fall back to the chain");
+        };
+        assert_eq!(
+            runs.iter().map(|r| r.min_sequence).collect::<Vec<_>>(),
+            vec![1, 7, 9]
+        );
+        // Levels are deliberately out of order relative to spans: a big old run
+        // sits *below* newer small ones. Level says how much was merged into a
+        // run, span says where it resolves; conflating them inverts the stack.
+        assert_eq!(
+            runs.iter().map(|r| r.level).collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+        assert!(runs[0].adjacent_to(&runs[1]));
+        assert!(runs[1].adjacent_to(&runs[2]));
+    }
+
+    #[test]
+    fn adjacency_rejects_gaps_and_overlaps() {
+        assert!(run(0, 1, 4).adjacent_to(&run(0, 5, 5)));
+        // A gap would leave a run to be resolved between these two.
+        assert!(!run(0, 1, 4).adjacent_to(&run(0, 6, 6)));
+        // An overlap means both claim the same sequence.
+        assert!(!run(0, 1, 4).adjacent_to(&run(0, 4, 6)));
+    }
+
+    /// A malformed run set must fail loudly, because nothing downstream would
+    /// notice. Runs resolve by span, so a gap leaves a sequence owned by no run
+    /// and an overlap has two runs claiming one — either way the order stops being
+    /// total, and the stack still assembles and still answers, just wrongly.
+    #[test]
+    fn a_malformed_run_set_is_rejected() {
+        let mut meta = snap(9, 900);
+        meta.format_version = FORMAT_RUN_SETS;
+
+        meta.runs = vec![run(0, 1, 4), run(0, 6, 9)];
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(err.contains("not adjacent"), "gap not caught: {err}");
+
+        meta.runs = vec![run(0, 1, 5), run(0, 4, 9)];
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(err.contains("not adjacent"), "overlap not caught: {err}");
+
+        meta.runs = vec![run(0, 1, 4), run(0, 5, 7)];
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(
+            err.contains("own sequence is in no run"),
+            "short set not caught: {err}"
+        );
+
+        meta.runs = vec![run(0, 6, 2)];
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(err.contains("spans backwards"), "got: {err}");
+
+        // The well-formed set it was nearly.
+        meta.runs = vec![run(1, 1, 4), run(0, 5, 9)];
+        assert!(meta.run_set().is_ok());
+    }
+
+    /// The format marker is the only thing distinguishing "written before run
+    /// sets" from "written by a run-set writer that emitted none", and those need
+    /// opposite handling: read the chain, or refuse.
+    #[test]
+    fn claiming_the_run_set_format_without_runs_is_corruption() {
+        let mut meta = snap(3, 300);
+        meta.format_version = FORMAT_RUN_SETS;
+        let err = meta.run_set().unwrap_err().to_string();
+        assert!(err.contains("lists no runs"), "got: {err}");
+
+        // Without the marker the same snapshot is simply an old one.
+        meta.format_version = 0;
+        assert_eq!(meta.run_set().unwrap(), RunSet::SequencesOnly(3..=3));
+    }
+
+    #[tokio::test]
+    async fn runs_survive_a_commit_round_trip() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = SnapshotCatalog::new(store, Path::from("warehouse/edges"));
+
+        let mut meta = snap(2, 200);
+        meta.runs = vec![run(1, 1, 1), run(0, 2, 2)];
+        assert_eq!(
+            catalog.commit(&meta).await.unwrap(),
+            CommitOutcome::Committed
+        );
+
+        let read = catalog.get(2).await.unwrap();
+        assert_eq!(read.runs, meta.runs);
+        assert_eq!(read.run_set().unwrap(), RunSet::Runs(meta.runs));
     }
 
     #[tokio::test]

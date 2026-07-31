@@ -452,7 +452,8 @@ A worker whose newest layer was folded **locally but never committed** (any
 follower, or a leader that lost a commit race) must not then commit a delta: the
 committed chain would be missing those layers, and a cold start would silently
 reconstruct incomplete topology. Such a worker compacts and commits a full base
-instead — `LocalLayers::committed_through` tracks it and a test pins it.
+instead — every local run carries whether the catalog has it, so
+`LocalLayers::fully_committed` tracks this and a test pins it.
 
 ### Compaction streams; it never materializes
 

@@ -1,12 +1,16 @@
 # 006 — Tiered compaction, and sizing for a backfill-dominated workload
 
-> **Now the top priority, and measurement upgraded it from optimization to
-> precondition.** A 145M-link stress run (`examples/ceiling.rs`) shows flat
-> base+delta compaction is **O(N²) in total state**: per-pair cost is constant
-> (3.39, 3.44, 3.33 µs across three compactions) while each cycle merges linearly
-> more, so the costs sum quadratically. Extrapolated to 2B links with the measured
-> constant: **~58 hours of compaction against ~13 hours of ingest**, i.e. 82% of
-> wall clock. Tiering turns that into O(N log N). See "Measured" below.
+> **Shipped, and the exponent is confirmed by measurement.** A 145M-link stress
+> run (`examples/ceiling.rs`) showed flat base+delta compaction is **O(N²) in
+> total state**: per-pair cost is constant (3.39, 3.44, 3.33 µs across three
+> compactions) while each cycle merges linearly more, so the costs sum
+> quadratically. Extrapolated to 2B links: **~58 hours of compaction against ~13
+> hours of ingest**, i.e. 82% of wall clock.
+>
+> Size-tiered compaction is now in behind `--tier-fanout`. Measured at a matched
+> depth ceiling (`examples/tier_amplification`), doubling the workload doubles the
+> flat policy's write amplification while tiering's grows by 1.33x — 8.5x less
+> merge work at 500 folds, and widening. See "Measured after shipping".
 
 ## The workload, restated
 
@@ -126,6 +130,123 @@ One real change: today `layers[0]` is privileged as "the base". Under tiering
 there is no single base, just runs with levels, so `LocalLayers` needs to carry a
 level per run and the catalog needs to list the run set rather than a single
 `base_sequence` + chain length.
+
+## Measured after shipping: the exponent, not just the constant
+
+`examples/tier_amplification` runs both policies over identical ingest through the
+real fold and merge code. Both arms hold the **same depth ceiling of 12 runs**,
+because comparing at different depths proves nothing — the flat policy can always
+cut its write cost by carrying more runs, and breaking that trade is the whole
+point. `amp` is pairs rewritten per link ingested.
+
+| folds | policy | merges | pairs merged | amp | GB written | merge s |
+|---|---|---|---|---|---|---|
+| 250 | flat | 22 | 20.7M | 20.72x | 0.80 | 18.2 |
+| 250 | tier T=10 | 43 | 3.7M | **3.72x** | 0.21 | 3.0 |
+| 500 | flat | 45 | 84.5M | 42.24x | 3.10 | 83.3 |
+| 500 | tier T=10 | 101 | 9.9M | **4.96x** | 0.51 | 9.3 |
+
+- **The exponent changed, which is the claim.** Doubling the fold count doubles
+  flat's amplification (20.72 → 42.24, i.e. **2.04x**) — linear in fold count, so
+  quadratic in total state. Tiering's rises **1.33x** against a pure-log
+  prediction of 1.13x; the excess is the depth ceiling forcing relief merges on
+  top of level merges, and it is decisively sublinear either way.
+- **The advantage therefore widens with scale**: 5.6x fewer pairs merged at 250
+  folds, 8.5x at 500. 500 folds is ~8 hours of 60s ticks; the regime that matters
+  is ~500,000 folds a year.
+- Tiering does **more** merges (101 vs 45) and each is far smaller — 6x fewer
+  bytes written and 9x less merge time. That is the trade working as designed:
+  frequent cheap merges instead of rare enormous ones.
+
+Two things this corrected:
+
+- **Larger fanout is better for write amplification, not worse.** Amplification is
+  roughly the number of levels, `log_T(F)`, so a *small* fanout means more levels
+  and more rewriting: measured, `T=2` cost **13.58x** where `T=10` cost 4.96x on
+  the same workload. Fanout trades write cost against depth monotonically —
+  `(T-1)·log_T(F)` runs to probe — so pick it for the depth you can afford. The
+  default of 10 is in the right place.
+- **A first attempt at this measurement was invalid** and is worth recording so
+  nobody repeats it. The baseline expressed "never tier" as an unreachable fanout,
+  which falls through to the depth-ceiling branch — and that branch merges the
+  lowest stretch, not the whole stack. So both arms were tiered, and they scored
+  4.98x and 4.96x. Reassuringly consistent, and completely uninformative.
+
+## Shipped
+
+All three pieces are in: the catalog run-set format (`SnapshotMeta.runs`, with
+old catalogs synthesising one from `base_sequence` + `delta_chain_len` so there is
+no migration), the flush loop expressed in runs, and the policy in
+`storage/tier.rs` behind `--tier-fanout`.
+
+The correctness question a subset merge raises is whether the output may be
+spliced back **at the position its inputs held**, rather than having to go on top.
+It may, and `LayeredBase::slice` carries the argument: order is preserved because
+`M` is equivalent to what it replaced at the same position; keys stay disjoint
+because `M`'s keys are the union of its inputs'; and resolution still advances
+monotonically because a value in `M` is some `L_m` value with `m ≤ j`, which has
+no parent in `L_0..=L_m` and hence none below the splice. The third is the one
+that would bite — without it, resolution would have to restart from the bottom
+after every hit, making lookups O(layers²).
+
+### The upgrade is one-way, and that is deliberate
+
+Old catalogs read on the new binary with no migration — an absent `runs` field
+synthesises a run set from `base_sequence` + `delta_chain_len`, and there is a
+test for it. **The reverse does not work, and cannot be made to.**
+
+A cold review of the implementation caught this, and it is worth stating exactly
+rather than softening. `base_sequence` + `delta_chain_len` describe one base
+followed by a contiguous chain. That is not a lossy description of a tiered stack;
+it is not a description of one at all, so there is no value of those fields a
+pre-run-set reader resolves correctly. Concretely: a merge that lands *below* the
+top of the stack keeps the span it subsumed, so it is published at a later
+sequence than its span ends. An old reader follows `chain()` to that sequence's
+`puffin_path`, gets a different and already-subsumed object, assembles the stack
+in the wrong order, and reports two merged components as disconnected. No error —
+`#[serde(default)]` makes the new JSON parse cleanly.
+
+Nor can an old reader be made to fail *loudly*. The obvious trick — a
+`base_sequence` past `sequence`, giving an empty chain — makes
+`open_base_from_catalog` error on an empty layer list, but makes
+`hydrate_from_catalog` iterate zero times and return a healthy watermark over an
+empty DSU. Silently worse. There is no single value that trips both paths.
+
+So the fields are written best-effort for a chain-shaped stack,
+`SnapshotMeta::format_version` marks the boundary, and the operational rule is:
+**once a tiered merge has been committed, roll forward, not back.** Nothing in
+this build reads the compatibility fields.
+
+What *is* now checked, on every read, is the run set's own shape.
+`SnapshotMeta::run_set` is fallible and rejects gaps, overlaps, backwards spans,
+and a newest run that does not cover the snapshot's own sequence. That validator
+existed as `RunMeta::adjacent_to`, was documented as guarding "the property that
+breaks quietly", was asserted in three tests — and was called from no production
+path at all until the review pointed it out.
+
+Two smaller decisions worth recording:
+
+- **Spans, not commit order, fix a run's place.** A merged run inherits the span
+  of everything it subsumed. It also extends over the sequence that publishes it,
+  because a merge commit carries no data files and the previous watermark — it
+  adds no routing state — and without the extension the run set leaves a hole at
+  its own sequence.
+- **The depth ceiling now merges the lowest stretch available**, rather than
+  falling back to a full-base rewrite. It stays a bounded merge: any stretch of
+  `fanout` or more would have been caught by the level rule first.
+- **A merge tick still commits its data batch**, at the sequence after the merge.
+  It used to return early, which was tolerable when a merge fired roughly one tick
+  in twenty-four; under tiering it fires on ~10% of ticks and up to three in a row,
+  so each early return was holding the watermark back for a whole interval — a 3x
+  worse worst-case recovery point, bought for a merge that took no lock and
+  touched no buffered data. Also from the review.
+- **Puffin objects carry a UUID**, as Parquet data files always have. Two workers
+  can both believe they hold the lease for a sequence — that is the race
+  `CommitOutcome::Conflict` settles — and both upload before either learns who
+  won. Sharing a key lets the loser overwrite the winner's object *after* the
+  winning commit, leaving a snapshot naming a run composed over a different stack.
+  The flat policy healed that within a compaction cycle; a tiered high-level run
+  can stay referenced for far longer.
 
 ## Backfill — corrected by measurement
 

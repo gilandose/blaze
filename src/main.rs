@@ -51,12 +51,42 @@ struct Args {
     #[arg(long, default_value_t = blaze::storage::DEFAULT_FOLD_AFTER_LINKS)]
     fold_after_links: u64,
 
-    /// Compact once the routing base carries this many delta layers
-    /// (--routing-base disk only). Higher means cheaper flushes and rarer
-    /// rewrites, at the cost of more layers to probe per lookup and a longer
-    /// chain to fetch on cold start.
+    /// Depth ceiling: past this many runs, merge the lowest stretch available
+    /// even when no level is due (--routing-base disk only). Higher means rarer
+    /// merges, at the cost of more runs to probe per lookup, slower ingest, and
+    /// more files to fetch on cold start.
     #[arg(long, default_value_t = blaze::storage::DEFAULT_MAX_DELTA_LAYERS)]
     max_delta_layers: usize,
+
+    /// Runs per size level before they merge into one run at the level above
+    /// (--routing-base disk only). This is what keeps total merge work
+    /// O(N log N): each link is rewritten about once per level it passes
+    /// through, rather than once per whole-base rewrite. Lower means fewer runs
+    /// to probe but more levels and so more rewriting per link.
+    #[arg(long, default_value_t = blaze::storage::DEFAULT_TIER_FANOUT)]
+    tier_fanout: usize,
+
+    /// Await each merge inside the tick that starts it, rather than letting it
+    /// run in the background (--routing-base disk only). Off by default, because
+    /// a detached merge is what lets folds keep draining the memtable while a
+    /// merge runs. Turn it on when ingest must not be able to outrun compaction,
+    /// or when each tick should be a complete unit of work.
+    #[arg(long, default_value_t = false)]
+    inline_merges: bool,
+
+    /// Bits of membership filter per key written into each run, or 0 for none
+    /// (--routing-base disk only). This is the one dial that moves the
+    /// *unreclaimable* memory floor: everything else a disk-backed base keeps in
+    /// RAM is either bounded by a trigger or clean file-backed pages the kernel
+    /// can evict, while filters are heap and scale with total state — roughly one
+    /// byte per key at the default 8 — measured 1.9 bytes per *link* on a
+    /// 3000-scope mix, so ~3.8 GB at 2B links. Lowering it costs
+    /// query latency on a miss, never correctness: a false positive is exactly the
+    /// binary search that would have happened anyway. 4 bits roughly halves the
+    /// heap for a ~10-15% false-positive rate; 0 makes every probe a binary
+    /// search. Runs already written keep whatever they were written with.
+    #[arg(long, default_value_t = blaze::storage::DEFAULT_FILTER_BITS)]
+    filter_bits: usize,
 
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
@@ -237,6 +267,10 @@ async fn main() -> anyhow::Result<()> {
         base_dir,
         fold_after_links: args.fold_after_links,
         max_delta_layers: args.max_delta_layers,
+        tier_fanout: args.tier_fanout,
+        filter_bits: args.filter_bits,
+        inline_merges: args.inline_merges,
+        pending_merge: parking_lot::Mutex::new(None),
         layers: parking_lot::Mutex::new(local_layers),
     });
     let flush_handle = tokio::spawn(

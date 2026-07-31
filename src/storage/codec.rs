@@ -109,7 +109,7 @@ pub fn decode_registry(data: &[u8]) -> anyhow::Result<Vec<(NodeId, ScopeId)>> {
 
 /// Encode a forest snapshot as Puffin blobs: one global blob, one blob per
 /// scope with overlay state, and the `root -> scopes` registry index.
-pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64) -> Vec<Blob> {
+pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64, filter_bits: usize) -> Vec<Blob> {
     let seq = sequence as i64;
     let mut blobs = Vec::with_capacity(1 + snap.scopes.len());
     blobs.push(Blob {
@@ -144,20 +144,28 @@ pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64) -> Vec<Blob> {
     for (blob_type, filter) in [
         (
             SHARED_FILTER_BLOB_TYPE,
-            BlockedFilter::build(snap.global.iter().map(|(k, _)| *k), snap.global.len()),
+            BlockedFilter::build_with(
+                snap.global.iter().map(|(k, _)| *k),
+                snap.global.len(),
+                filter_bits,
+            ),
         ),
         (
             OVERLAY_FILTER_BLOB_TYPE,
-            BlockedFilter::build(
+            BlockedFilter::build_with(
                 snap.scopes.iter().flat_map(|(s, pairs)| {
                     pairs
                         .iter()
                         .map(move |(k, _)| crate::storage::filter::overlay_key(*s, *k))
                 }),
                 overlay_keys,
+                filter_bits,
             ),
         ),
-    ] {
+    ]
+    .into_iter()
+    .filter_map(|(t, f)| f.map(|f| (t, f)))
+    {
         blobs.push(Blob {
             blob_type: blob_type.into(),
             data: filter.encode(),
@@ -182,6 +190,9 @@ pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64) -> Vec<Blob> {
 /// overlay endpoint; spilling it to an external sort is design 001's job.
 pub struct BlobWriter {
     sequence: i64,
+    /// Bits of membership filter per key; 0 emits no filter blobs at all. See
+    /// [`crate::storage::filter::clamp_filter_bits`].
+    filter_bits: usize,
     shared: BytesMut,
     shared_pairs: u64,
     /// The scope currently open, its payload, and its pair count.
@@ -220,9 +231,10 @@ fn close_table(mut buf: BytesMut, count: u64) -> Bytes {
 }
 
 impl BlobWriter {
-    pub fn new(sequence: u64) -> Self {
+    pub fn new(sequence: u64, filter_bits: usize) -> Self {
         Self {
             sequence: sequence as i64,
+            filter_bits,
             shared: open_table(),
             shared_pairs: 0,
             scope: None,
@@ -249,9 +261,10 @@ impl BlobWriter {
         // Filters are built by re-reading the payloads already in hand, so
         // nothing extra is buffered and the key sets cannot drift from the
         // tables they describe.
-        let shared_filter = BlockedFilter::build(
+        let shared_filter = BlockedFilter::build_with(
             table_keys(&shared).map(|(k, _)| k),
             self.shared_pairs as usize,
+            self.filter_bits,
         );
         blobs.push(self.blob(GLOBAL_BLOB_TYPE, shared, BTreeMap::new()));
 
@@ -260,7 +273,7 @@ impl BlobWriter {
             .iter()
             .map(|b| table_keys(&b.data).count())
             .sum();
-        let overlay_filter = BlockedFilter::build(
+        let overlay_filter = BlockedFilter::build_with(
             self.scope_blobs.iter().flat_map(|b| {
                 let scope: ScopeId = b
                     .properties
@@ -270,6 +283,7 @@ impl BlobWriter {
                 table_keys(&b.data).map(move |(k, _)| crate::storage::filter::overlay_key(scope, k))
             }),
             overlay_keys,
+            self.filter_bits,
         );
         blobs.append(&mut self.scope_blobs);
 
@@ -279,16 +293,15 @@ impl BlobWriter {
             let data = encode_registry(&self.registry);
             blobs.push(self.blob(REGISTRY_BLOB_TYPE, data, BTreeMap::new()));
         }
-        blobs.push(self.blob(
-            SHARED_FILTER_BLOB_TYPE,
-            shared_filter.encode(),
-            BTreeMap::new(),
-        ));
-        blobs.push(self.blob(
-            OVERLAY_FILTER_BLOB_TYPE,
-            overlay_filter.encode(),
-            BTreeMap::new(),
-        ));
+        // No filter blobs at all when disabled: the reader treats their absence as
+        // "probe the table directly", so a filterless base is readable by any
+        // build, just slower on a miss.
+        if let Some(f) = shared_filter {
+            blobs.push(self.blob(SHARED_FILTER_BLOB_TYPE, f.encode(), BTreeMap::new()));
+        }
+        if let Some(f) = overlay_filter {
+            blobs.push(self.blob(OVERLAY_FILTER_BLOB_TYPE, f.encode(), BTreeMap::new()));
+        }
         blobs
     }
 }
@@ -334,8 +347,8 @@ impl SnapshotSink for BlobWriter {
 /// Compact `forest` directly into Puffin blobs. Byte-identical to
 /// `snapshot_to_blobs(&forest.snapshot(), sequence)`, but without the
 /// O(state) intermediate — this is the flush path.
-pub fn compact_to_blobs(forest: &ScopedForest, sequence: u64) -> Vec<Blob> {
-    let mut writer = BlobWriter::new(sequence);
+pub fn compact_to_blobs(forest: &ScopedForest, sequence: u64, filter_bits: usize) -> Vec<Blob> {
+    let mut writer = BlobWriter::new(sequence, filter_bits);
     forest.compact_into(&mut writer);
     writer.finish()
 }
@@ -376,7 +389,7 @@ mod tests {
             global: vec![(500, 105), (7, 105)],
             scopes: vec![(3, vec![(9, 1)]), (2999, vec![(4, 2), (8, 2)])],
         };
-        let blobs = snapshot_to_blobs(&snap, 12);
+        let blobs = snapshot_to_blobs(&snap, 12, crate::storage::filter::DEFAULT_FILTER_BITS);
         let file = puffin::write(&blobs, BTreeMap::new());
         let parsed = puffin::read(&file).unwrap();
         let back = blobs_to_snapshot(&parsed).unwrap();
@@ -418,8 +431,12 @@ mod tests {
             });
         }
 
-        let streamed = compact_to_blobs(&forest, 9);
-        let collected = snapshot_to_blobs(&forest.snapshot(), 9);
+        let streamed = compact_to_blobs(&forest, 9, crate::storage::filter::DEFAULT_FILTER_BITS);
+        let collected = snapshot_to_blobs(
+            &forest.snapshot(),
+            9,
+            crate::storage::filter::DEFAULT_FILTER_BITS,
+        );
         let fields = |bs: &[Blob]| -> Vec<(String, BTreeMap<String, String>, Vec<u8>)> {
             bs.iter()
                 .map(|b| (b.blob_type.clone(), b.properties.clone(), b.data.to_vec()))
