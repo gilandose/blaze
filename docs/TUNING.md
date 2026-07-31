@@ -85,19 +85,22 @@ So size from your node count. A worked example: 1.1B nodes with a mean of 2.07
 scopes per node (median 1) gives ~2.2-3.4B pairs, ~2.3-3.6 GB of heap, and
 ~63-119 GB of base. Knowing the link count alone would have told you nothing.
 
-Index B/pair stayed at 1.02-1.04 across all nine configurations measured,
-spanning 10x in pairs/link. That constant is solid; everything else is workload.
-
-**Index heap is flat at 1.07 B/pair across every configuration tested** — which is
+**Index heap is flat at 1.02-1.07 B/pair across every configuration tested** — which is
 the 8 bits per key the filter is sized for, plus the sparse index. The spread in
 the per-link column is entirely `pairs/link` moving underneath it.
 
 **Base disk still varies 1.3x**, and the residual tracks scopes-per-root
 monotonically (28.8 single-scope, 35.3 multi-scope, 37.3 when sparser spreads roots
-further). That is the **registry** — the `(root, scope)` index, which design 006
-measured at 55% of base bytes and flagged for restructuring. Pairs do not count it,
-so it lands in the residual. Restructuring the registry would both shrink the base
-and make this constant.
+further). That is the **registry** — the `(root, scope)` index. Pairs do not count
+it, so it lands in the residual.
+
+The registry is now delta-varint encoded (`--registry-encoding blocked`, the
+default), which took a measured base from 133.6 MB to 81.0 MB — **39% off** — so
+the base figures below, taken before that change, are conservative by roughly
+25-40% depending on scope fan-out. The saving is largest where the residual was
+largest, so it shrinks the 1.3x spread as well as the absolute number. Writing
+`--registry-encoding flat` restores the old format if a reader needs it; see
+`docs/design/009-registry-encoding.md`.
 
 An earlier version of this guide gave a single 38 B/link figure from one `ceiling`
 run. Across configurations that number ranges 31.5 to 74.4, and chasing it as a
@@ -181,6 +184,7 @@ ingest cannot outrun compaction and bury you in runs.
 | `--fold-after-links` | 1M | fewer follower folds | follower heap only — see gotcha |
 | `--inline-merges` | off | ingest that cannot outrun compaction | tick blocks for the whole merge |
 | `--routing-base` | ram | — | `disk` is the low-memory mode |
+| `--registry-encoding` | blocked | — | `flat` is 1.6x the base for a 2.4x faster merge notification |
 
 **The gotcha:** `--fold-after-links` does nothing on a leader. The check is
 `!force && links < fold_after_links`, and a leader always passes `force = true`
