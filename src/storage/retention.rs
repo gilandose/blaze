@@ -321,6 +321,8 @@ mod tests {
                 bytes: 1,
                 min_offset: 0,
                 max_offset: sequence * 10,
+                first_position: Default::default(),
+                last_position: Default::default(),
             }],
             puffin_path: runs
                 .last()

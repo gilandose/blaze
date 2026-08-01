@@ -288,17 +288,47 @@ the run, so no flush or compaction happened inside the window. It is the ceiling
 not a sustained rate — the soak numbers below are what sustained looks like once
 tiering and percolation are in play.
 
-### One partition
+### Partitions
 
-blaze tracks a **scalar** watermark, so it consumes one ordered log. Against
-Kafka that means a single-partition topic.
+Point `--edge-log` at a **directory** of `partition-<n>.ndjson` files and blaze
+consumes them as one partitioned stream, checkpointing every partition
+independently. A single file is a single partition, unchanged.
 
-Multiple partitions are not blocked by anything fundamental — DSU merges commute,
-so partitions would be independently correct — but the watermark would have to
-become a map of partition to offset in `SnapshotMeta`, and every comparison
-against it a per-partition comparison. Until that exists, the consumer takes one
-partition and says so rather than interleaving two and producing a watermark that
-means nothing.
+```bash
+edges/partition-0.ndjson
+edges/partition-1.ndjson   →   blaze --edge-log edges
+edges/partition-2.ndjson
+```
+
+A snapshot then records a **position**, a map of partition to offset, rather than
+a scalar:
+
+```json
+"position": {"0": 900, "1": 400, "2": 1300, "3": 700}
+```
+
+Three things worth knowing about that:
+
+- **A topic can gain partitions with no migration step.** Absent means zero, so a
+  snapshot written before an expansion simply has no entry for the new partition,
+  reads it as 0, and consumes from its beginning — where it genuinely starts.
+  Verified end to end: a table consuming three partitions, restarted against a
+  stream that had gained a fourth, resumed the first three where they stood and
+  committed exactly the new records and no others.
+- **`watermark` is 0 on a multi-partition snapshot.** No `u64` describes one, and
+  inventing a number is how a reader ends up confidently wrong. It stays exact
+  for a single partition, so nothing changes for a single-partition deployment
+  and an older binary still reads those correctly.
+- **Consumption is still single-writer.** One thread polls every partition.
+  Partitions buy correctness against a partitioned topic, not parallelism — the
+  single-writer pipeline is what keeps the query path lock-free, and that is
+  worth more than the concurrency.
+
+The one shape this does *not* support is a consumer group splitting partitions
+across two blaze workers. blaze is single-writer per table via leader election,
+so the leader must own every partition. A second worker committing is **detected**
+— the per-partition monotonicity check rejects a position that moves any
+partition backwards — but detection is not support.
 
 ## Retention
 

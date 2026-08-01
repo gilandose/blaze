@@ -257,7 +257,7 @@ impl Warehouse {
     ) {
         let buffer = Arc::new(EdgeBuffer::new());
         for (i, e) in events.iter().enumerate() {
-            buffer.append(first_offset + i as u64, e);
+            buffer.append(0, first_offset + i as u64, e);
         }
         let flusher = Flusher {
             forest,

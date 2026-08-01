@@ -15,11 +15,17 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-use crate::core::{EdgeEvent, GLOBAL_SCOPE, Visibility};
+use crate::core::{EdgeEvent, GLOBAL_SCOPE, PartitionId, StreamPosition, Visibility};
 
 /// Schema of the edge table as written to Parquet.
 pub fn edge_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
+        // `partition` before `offset` because together they are the row's
+        // identity in the stream, and neither means anything alone. Added by
+        // design 010; blaze never reads its own data files back — recovery is
+        // from the Puffin sidecars — so this is purely additive for external
+        // readers, and a file written without it reads as partition 0.
+        Field::new("partition", DataType::UInt32, false),
         Field::new("offset", DataType::UInt64, false),
         Field::new("src", DataType::UInt64, false),
         Field::new("dst", DataType::UInt64, false),
@@ -35,6 +41,7 @@ pub fn edge_schema() -> Arc<Schema> {
 
 #[derive(Default)]
 struct ActiveBuf {
+    partition: UInt32Builder,
     offset: UInt64Builder,
     src: UInt64Builder,
     dst: UInt64Builder,
@@ -42,16 +49,21 @@ struct ActiveBuf {
     event_time: PrimitiveBuilder<TimestampMillisecondType>,
     props: StringBuilder,
     rows: usize,
-    min_offset: u64,
-    max_offset: u64,
+    /// Lowest and highest offset seen per partition. Both are needed: `max` is
+    /// what decides durability, `min` is what a data file advertises.
+    first: StreamPosition,
+    last: StreamPosition,
 }
 
 /// An immutable, flush-ready chunk of buffered edges.
 #[derive(Clone)]
 pub struct Segment {
     pub batch: RecordBatch,
-    pub min_offset: u64,
-    pub max_offset: u64,
+    /// Lowest offset this segment holds per partition.
+    pub first: StreamPosition,
+    /// Highest offset this segment holds per partition — the position a
+    /// committed snapshot must **dominate** before the segment is durable.
+    pub last: StreamPosition,
 }
 
 #[derive(Default)]
@@ -73,19 +85,22 @@ impl EdgeBuffer {
         Self::default()
     }
 
-    /// Append one event under the given log offset, exploding multi-scope
+    /// Append one event at its position in the stream, exploding multi-scope
     /// visibility into one row per scope (global => single row, scope 0).
-    pub fn append(&self, offset: u64, event: &EdgeEvent) {
+    pub fn append(&self, partition: PartitionId, offset: u64, event: &EdgeEvent) {
         let mut buf = self.active.lock();
-        if buf.rows == 0 {
-            buf.min_offset = offset;
+        // Offsets are one-based, so a zero here means this partition has not
+        // contributed to the active buffer yet rather than "starts at zero".
+        if buf.first.get(partition) == 0 {
+            buf.first.advance(partition, offset);
         }
-        buf.max_offset = offset;
+        buf.last.advance(partition, offset);
         let scopes: smallvec::SmallVec<[u32; 4]> = match event.visibility.clone().normalize() {
             Visibility::Global => smallvec::smallvec![GLOBAL_SCOPE],
             Visibility::Scoped(s) => s,
         };
         for scope in scopes {
+            buf.partition.append_value(partition);
             buf.offset.append_value(offset);
             buf.src.append_value(event.src);
             buf.dst.append_value(event.dst);
@@ -108,20 +123,22 @@ impl EdgeBuffer {
         drop(buf);
 
         let ActiveBuf {
+            mut partition,
             mut offset,
             mut src,
             mut dst,
             mut scope,
             mut event_time,
             mut props,
-            min_offset,
-            max_offset,
+            first,
+            last,
             ..
         } = taken;
 
         let batch = RecordBatch::try_new(
             edge_schema(),
             vec![
+                Arc::new(partition.finish()),
                 Arc::new(offset.finish()),
                 Arc::new(src.finish()),
                 Arc::new(dst.finish()),
@@ -134,11 +151,11 @@ impl EdgeBuffer {
 
         let sort_cols = vec![
             SortColumn {
-                values: batch.column(3).clone(), // scope_id
+                values: batch.column(4).clone(), // scope_id
                 options: None,
             },
             SortColumn {
-                values: batch.column(1).clone(), // src
+                values: batch.column(2).clone(), // src
                 options: None,
             },
         ];
@@ -150,11 +167,7 @@ impl EdgeBuffer {
             .collect::<Vec<_>>();
         let batch = RecordBatch::try_new(edge_schema(), columns).expect("sorted edge batch");
 
-        let segment = Segment {
-            batch,
-            min_offset,
-            max_offset,
-        };
+        let segment = Segment { batch, first, last };
         self.sealed.lock().push(segment.clone());
         Some(segment)
     }
@@ -164,13 +177,20 @@ impl EdgeBuffer {
         self.sealed.lock().clone()
     }
 
-    /// Drop sealed segments fully covered by the committed watermark. Called
-    /// by followers when they observe a new catalog snapshot, and by the
-    /// leader after a successful commit.
-    pub fn drop_committed(&self, watermark: u64) -> usize {
+    /// Drop sealed segments the committed position fully covers. Called by
+    /// followers when they observe a new catalog snapshot, and by the leader
+    /// after a successful commit.
+    ///
+    /// **Dominance, not a comparison.** A segment spanning partitions 0 and 3 is
+    /// durable only when *both* are committed. Under the old scalar watermark
+    /// this was `max_offset > watermark`, which silently assumed a total order;
+    /// with a partial one, a position may cover part of a segment and not the
+    /// rest. Dropping such a segment loses data a follower still owes, and the
+    /// loss surfaces only on failover — the one moment nobody is watching.
+    pub fn drop_committed(&self, committed: &StreamPosition) -> usize {
         let mut sealed = self.sealed.lock();
         let before = sealed.len();
-        sealed.retain(|s| s.max_offset > watermark);
+        sealed.retain(|s| !committed.dominates(&s.last));
         before - sealed.len()
     }
 
@@ -205,20 +225,21 @@ mod tests {
     #[test]
     fn explode_seal_and_prune() {
         let buf = EdgeBuffer::new();
-        buf.append(1, &ev(1, 2, Visibility::Global));
-        buf.append(2, &ev(3, 4, Visibility::Scoped(smallvec![7, 9])));
+        buf.append(0, 1, &ev(1, 2, Visibility::Global));
+        buf.append(0, 2, &ev(3, 4, Visibility::Scoped(smallvec![7, 9])));
         assert_eq!(buf.stats().active_rows, 3);
 
         let seg = buf.seal_active().expect("segment");
         assert_eq!(seg.batch.num_rows(), 3);
-        assert_eq!((seg.min_offset, seg.max_offset), (1, 2));
+        assert_eq!(seg.first, StreamPosition::single(1));
+        assert_eq!(seg.last, StreamPosition::single(2));
         assert_eq!(buf.stats().active_rows, 0);
         assert_eq!(buf.stats().sealed_segments, 1);
 
         // Sorted by scope: global row (scope 0) first.
         let scopes = seg
             .batch
-            .column(3)
+            .column(4)
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
@@ -227,14 +248,79 @@ mod tests {
         // Nothing to seal when empty.
         assert!(buf.seal_active().is_none());
 
-        buf.append(3, &ev(5, 6, Visibility::Global));
+        buf.append(0, 3, &ev(5, 6, Visibility::Global));
         buf.seal_active();
         assert_eq!(buf.stats().sealed_segments, 2);
 
-        // Watermark 2 covers only the first segment.
-        assert_eq!(buf.drop_committed(2), 1);
+        // A position at 2 covers only the first segment.
+        assert_eq!(buf.drop_committed(&StreamPosition::single(2)), 1);
         assert_eq!(buf.stats().sealed_segments, 1);
-        assert_eq!(buf.drop_committed(3), 1);
+        assert_eq!(buf.drop_committed(&StreamPosition::single(3)), 1);
         assert_eq!(buf.stats().sealed_segments, 0);
+    }
+
+    /// The eviction case a scalar watermark could not express.
+    ///
+    /// A segment spanning two partitions is durable only when **both** are
+    /// committed. Under the old `max_offset > watermark` there was one number to
+    /// compare and the question could not arise; with a partial order a position
+    /// can cover part of a segment and not the rest. Dropping it there loses
+    /// data the worker still owes, and — because the mapping stays valid and the
+    /// catalog stays parseable — the loss shows up only when someone hydrates
+    /// from scratch after a failover.
+    #[test]
+    fn a_segment_spanning_two_partitions_needs_both_committed() {
+        let buf = EdgeBuffer::new();
+        buf.append(0, 10, &ev(1, 2, Visibility::Global));
+        buf.append(3, 4, &ev(3, 4, Visibility::Global));
+        let seg = buf.seal_active().expect("segment");
+        assert_eq!(seg.first, [(0, 10), (3, 4)].into_iter().collect());
+        assert_eq!(seg.last, [(0, 10), (3, 4)].into_iter().collect());
+
+        // Partition 0 committed well past this segment, partition 3 not at all.
+        // A scalar comparison on the larger offset would drop it.
+        let one_side: StreamPosition = [(0, 99)].into_iter().collect();
+        assert_eq!(
+            buf.drop_committed(&one_side),
+            0,
+            "dropped an undurable segment"
+        );
+        assert_eq!(buf.stats().sealed_segments, 1);
+
+        // Partition 3 committed but short of offset 4 — still not covered.
+        let nearly: StreamPosition = [(0, 99), (3, 3)].into_iter().collect();
+        assert_eq!(buf.drop_committed(&nearly), 0);
+
+        // Both covered.
+        let both: StreamPosition = [(0, 99), (3, 4)].into_iter().collect();
+        assert_eq!(buf.drop_committed(&both), 1);
+        assert_eq!(buf.stats().sealed_segments, 0);
+    }
+
+    /// Partitions interleave in the active buffer and each keeps its own span,
+    /// rather than one global min and max that would claim offsets neither
+    /// partition holds.
+    #[test]
+    fn each_partition_keeps_its_own_span() {
+        let buf = EdgeBuffer::new();
+        buf.append(1, 100, &ev(1, 2, Visibility::Global));
+        buf.append(2, 5, &ev(3, 4, Visibility::Global));
+        buf.append(1, 101, &ev(5, 6, Visibility::Global));
+        buf.append(2, 9, &ev(7, 8, Visibility::Global));
+
+        let seg = buf.seal_active().expect("segment");
+        assert_eq!(seg.first, [(1, 100), (2, 5)].into_iter().collect());
+        assert_eq!(seg.last, [(1, 101), (2, 9)].into_iter().collect());
+
+        // And the partition travels with the row into Parquet.
+        let parts = seg
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let mut seen: Vec<u32> = parts.values().to_vec();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 1, 2, 2]);
     }
 }

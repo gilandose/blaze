@@ -144,7 +144,7 @@ async fn run_storage(input: &Input) -> (Arc<ScopedForest>, usize, tempfile::Temp
         for (i, &(src, dst, scope)) in chunk.iter().enumerate() {
             let e = event(src, dst, scope);
             forest.apply(&e);
-            buffer.append((offset * batch + i) as u64, &e);
+            buffer.append(0, (offset * batch + i) as u64, &e);
         }
         flusher.tick().await.unwrap();
     }

@@ -84,7 +84,7 @@ async fn build(ticks: u64, per_tick: u64) -> Table {
         for _ in 0..per_tick {
             let e = edge(offset);
             forest.apply(&e);
-            buffer.append(offset, &e);
+            buffer.append(0, offset, &e);
             offset += 1;
         }
         flusher.tick().await.unwrap();
