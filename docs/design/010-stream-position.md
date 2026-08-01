@@ -4,12 +4,17 @@
 Every recovery path, every dedup decision and every buffer eviction compares
 against it. It is correct, and it can describe exactly one ordered stream.
 
-> **Proposed:** replace the scalar with a `StreamPosition` — a map of partition
-> to highest-applied offset — carried end to end, plus a `StreamId` naming the
+> **Built.** The scalar is replaced by a `StreamPosition` — a map of partition to
+> highest-applied offset — carried end to end, plus a `StreamId` naming the
 > stream and consumer group the offsets belong to. Legacy scalars read as
 > `{0: watermark}`, mirroring how `run_set()` already absorbs pre-run-set
 > snapshots. The partial order this introduces is confined to *bookkeeping*;
 > layer resolution stays totally ordered by catalog sequence and is untouched.
+>
+> Verified through the real binary: a table consuming three partitions, restarted
+> against a directory that has since gained a fourth, resumes the first three
+> where they stood and consumes the new one from its beginning — **3300 rows
+> committed, exactly the stream, no migration step.**
 
 ## Two problems, only one of them obvious
 
@@ -185,8 +190,25 @@ set and readers already understand.
   single-partition world.
 - **Multi-partition is a one-way upgrade**, like tiered run sets. There is no
   value of `watermark` that an old reader resolves correctly, so it is written as
-  `0` and `format_version` names why. An old binary ignores `format_version`;
-  that remains the known hole, documented rather than pretended away.
+  `0`.
+
+### What the version marker turned out not to be
+
+The first cut bumped `format_version` to `FORMAT_STREAM_POSITION` for any
+multi-partition position. That is wrong, and building it made the reason
+obvious: **`format_version` is a generation, not a bitfield.** Each level implies
+the ones below it, and `>= FORMAT_RUN_SETS` is a *promise that `runs` is
+populated* — `run_set()` rejects a snapshot claiming it and listing none. A
+RAM-mode worker writes no runs, so version 2 there is a promise it does not keep,
+and the first RAM-mode multi-partition commit failed its own validation.
+
+So the bump applies only on top of a run set. A RAM-mode multi-partition snapshot
+carries no version marker at all, and that costs less than it looks like. An old
+binary ignores `format_version` — that was already the known hole in the run-set
+upgrade — so the marker was never protection, only documentation. What genuinely
+describes such a snapshot is `position` being present with more than one entry:
+self-describing, in the way the Puffin blob types are, and readable by anything
+that knows to look.
 
 ### Parquet is the easy half
 
@@ -256,14 +278,31 @@ Tests this needs, beyond porting the existing ones:
 A multi-partition `FileLog` — a directory of files, one per partition, offset
 still the line number — is what makes 2 through 5 testable without a broker.
 
+## What building it turned up
+
+Two bugs the design did not predict, both caught by checks this design added:
+
+- **The committed position has to be cumulative.** The flush loop first published
+  the extent of *this tick's* segments, so a tick holding nothing from partition 1
+  dropped partition 1 from the position entirely — and the next recovery would
+  have replayed it from the beginning. `advances_from` rejected the commit, which
+  is exactly the incomparability it was written to catch, arriving from a
+  direction nobody had in mind. The position a snapshot publishes is the previous
+  one merged with what was just written.
+- **The data file's extent is not the snapshot's position.** They were briefly the
+  same value. `DataFileMeta` names what its rows *are*, which is only this tick's
+  writes; the snapshot names where the whole stream stands.
+
+And one thing the design got wrong on paper, corrected above: the
+`format_version` bump. See *What the version marker turned out not to be*.
+
 ## Sequencing
 
-Worth landing in two commits rather than one, because the first is mechanical and
-the second is where the thinking is:
+Landed in two commits, because the first is mechanical and the second is where
+the thinking is:
 
 1. **`StreamPosition` + `StreamId` in the catalog**, with the legacy fallback and
-   the migration tests. Nothing produces a multi-partition position yet; the
-   single-partition path serialises identically to today apart from the new
-   fields.
+   the migration tests. Nothing produced a multi-partition position yet; the
+   single-partition path serialised identically apart from the new fields.
 2. **Carry the partition end to end** — record, buffer, Parquet column, dedup,
-   eviction, seek — plus the multi-partition file log and tests 2 through 5.
+   eviction, seek — plus `PartitionedLog` and tests 2 through 5.

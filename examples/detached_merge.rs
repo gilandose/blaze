@@ -112,7 +112,7 @@ async fn drive(
                         props: None,
                     };
                     forest.apply(&e);
-                    buffer.append(offset, &e);
+                    buffer.append(0, offset, &e);
                     offset += 1;
                 }
                 ingested.fetch_add(BATCH, Ordering::Relaxed);

@@ -64,13 +64,21 @@ cargo run --release -- --edge-log edges.ndjson \
 cargo run --release -- --edge-log edges.ndjson --edge-log-follow false ...
 ```
 
-A restart seeks to the committed watermark and replays exactly the records that
-were applied but never committed; redelivery below the watermark is skipped, so
-the rows land once. `--edge-log` refuses `POST /v1/edges` while it is set, because
-an injected edge has no log position and minting one would collide with the log's
-numbering. Swapping the file for Kafka is an implementation of the `LogSource`
-trait — `poll` and `seek_after` — and a single-partition topic. See
-[docs/TUNING.md](docs/TUNING.md#where-edges-come-in).
+Point `--edge-log` at a **directory** of `partition-<n>.ndjson` files and blaze
+consumes them as one partitioned stream, checkpointing each partition
+independently — a snapshot records `{"0": 900, "1": 400, "2": 1300}` rather than
+a single number. A topic that gains a partition needs no migration: absent means
+zero, so the new partition is simply consumed from its beginning. Consumption
+stays single-writer throughout; partitions buy correctness against a partitioned
+topic, not parallelism.
+
+A restart seeks to the committed position and replays exactly the records that
+were applied but never committed; redelivery below it is skipped, so the rows
+land once. `--edge-log` refuses `POST /v1/edges` while set, because an injected
+edge has no log position and minting one would collide with the log's numbering.
+Swapping the file for Kafka is an implementation of the `LogSource` trait —
+`poll` and `seek`. See [docs/TUNING.md](docs/TUNING.md#where-edges-come-in) and
+[design 010](docs/design/010-stream-position.md).
 
 ## Checking the answers against something we did not write
 

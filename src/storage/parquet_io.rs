@@ -40,6 +40,7 @@ mod tests {
         let buf = EdgeBuffer::new();
         for i in 0..10u64 {
             buf.append(
+                0,
                 i,
                 &EdgeEvent {
                     src: i,

@@ -223,7 +223,7 @@ impl Harness {
                 props: None,
             };
             self.forest.apply(&e);
-            self.buffer.append(self.offset + i, &e);
+            self.buffer.append(0, self.offset + i, &e);
         }
         self.offset += 40;
     }

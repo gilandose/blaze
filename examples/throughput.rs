@@ -62,7 +62,7 @@ fn main() {
     // --- Arrow buffer append (separate pass to isolate cost) ---
     let t = Instant::now();
     for (i, e) in events.iter().enumerate() {
-        buffer.append(i as u64, e);
+        buffer.append(0, i as u64, e);
     }
     let buf_secs = t.elapsed().as_secs_f64();
     println!(

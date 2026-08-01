@@ -42,12 +42,10 @@ docs below are the design rationale behind those knobs.
 | [007](007-compaction-execution.md) | Where compaction runs (detached / process / deployment) | compaction's cost to serving | **implemented** (detached in-process) |
 | [008](008-rocksdb-counterfactual.md) | Could this have been built on RocksDB? | whether the storage tier had to be written | evaluation |
 | [009](009-registry-encoding.md) | Registry encoding (delta-varint in indexed blocks) | 25-40% of base bytes | **implemented** |
-| [010](010-stream-position.md) | Stream position (per-partition offsets + stream identity) | snapshot metadata cannot describe Kafka | designed — **next** |
+| [010](010-stream-position.md) | Stream position (per-partition offsets + stream identity) | snapshot metadata cannot describe Kafka | **implemented** |
 
-006, 007 and 009 are in. Recommended order for what is left: **010** (per-partition
-stream positions, which is what stands between the current single-partition log
-consumer and a Kafka deployment), then 002 folded in with 005's rename and union
-tier, then 004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
+006, 007, 009 and 010 are in. Recommended order for what is left: **002** folded
+in with 005's rename and union tier, then 004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
 packed u48 to serve the "well beyond 2B" goal.
 
 Cost impact at the target profile: an all-RAM design would need ~256–512 GB
@@ -76,7 +74,7 @@ model tests enforce most of them and must keep passing:
 - **I6 — Cold-start fidelity**: a worker hydrated from the catalog answers
   exactly what the writer answered at the committed watermark, and keeps
   composing with new merges (registry rebuild).
-- **I7 — Stream identity** (proposed by [010](010-stream-position.md)): a
+- **I7 — Stream identity** ([010](010-stream-position.md)): a
   snapshot's offsets are only interpretable against the stream they were
   committed against. A worker configured for a different stream refuses to
   start rather than resuming at offsets that mean something else.

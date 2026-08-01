@@ -66,6 +66,8 @@ fn meta(sequence: u64, committer: &str, watermark: u64) -> SnapshotMeta {
             bytes: 1,
             min_offset: 0,
             max_offset: watermark,
+            first_position: Default::default(),
+            last_position: Default::default(),
         }],
         puffin_path: format!("puffin/dsu-{sequence}-{committer}.puffin"),
         committer: committer.to_string(),
@@ -126,7 +128,7 @@ impl Worker {
         for n in range {
             let e = edge(n, scope);
             self.forest.apply(&e);
-            self.buffer.append(n, &e);
+            self.buffer.append(0, n, &e);
         }
     }
 }

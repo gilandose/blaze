@@ -25,8 +25,16 @@ pub struct DataFileMeta {
     pub path: String,
     pub rows: u64,
     pub bytes: u64,
+    /// Legacy scalar span, exact for a single-partition stream and `0` otherwise.
+    /// Prefer `first_position`/`last_position`.
     pub min_offset: u64,
     pub max_offset: u64,
+    /// Lowest offset this file holds per partition.
+    #[serde(default, skip_serializing_if = "StreamPosition::is_empty")]
+    pub first_position: StreamPosition,
+    /// Highest offset this file holds per partition.
+    #[serde(default, skip_serializing_if = "StreamPosition::is_empty")]
+    pub last_position: StreamPosition,
 }
 
 /// One committed micro-batch.

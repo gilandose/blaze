@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     ];
     for (i, e) in batch1.iter().enumerate() {
         forest.apply(e);
-        buffer.append(i as u64 + 1, e);
+        buffer.append(0, i as u64 + 1, e);
     }
     flusher.tick().await?;
     let snap1 = catalog.latest().await?.expect("snapshot 1");
@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let batch2 = [edge(1, 3, &[]), edge(900, 105, &[])];
     for (i, e) in batch2.iter().enumerate() {
         forest.apply(e);
-        buffer.append(snap1.watermark + i as u64 + 1, e);
+        buffer.append(0, snap1.watermark + i as u64 + 1, e);
     }
     flusher.tick().await?;
     let snap2 = catalog.latest().await?.expect("snapshot 2");

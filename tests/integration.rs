@@ -89,7 +89,7 @@ async fn leader_flush_commit_and_cold_start_hydration() {
     ];
     for (i, e) in events.iter().enumerate() {
         forest.apply(e);
-        buffer.append(i as u64 + 1, e);
+        buffer.append(0, i as u64 + 1, e);
     }
 
     let (flusher, catalog) = make_flusher(
@@ -146,7 +146,7 @@ async fn follower_never_commits_but_prunes_after_leader() {
             .enumerate()
         {
             forest.apply(e);
-            buffer.append(i as u64 + 1, e);
+            buffer.append(0, i as u64 + 1, e);
         }
         (forest, buffer)
     };
@@ -369,7 +369,7 @@ async fn incremental_puffin_cycles_stay_correct() {
             };
             offset += 1;
             forest.apply(&event);
-            buffer.append(offset, &event);
+            buffer.append(0, offset, &event);
         }
 
         flusher.tick().await.unwrap();

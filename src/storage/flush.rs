@@ -243,6 +243,32 @@ fn run_set_format(runs: &[RunMeta]) -> u32 {
     }
 }
 
+/// The format a snapshot declares, given its runs and its stream position.
+///
+/// `format_version` is a **generation, not a bitfield**: each level implies the
+/// ones below it, and `>= FORMAT_RUN_SETS` is a promise that `runs` is populated
+/// and well-formed — `SnapshotMeta::run_set` rejects a snapshot that claims it
+/// and lists none. So a multi-partition position cannot bump the version on its
+/// own; a RAM-mode worker writes no runs, and version 2 there would be a
+/// promise it does not keep.
+///
+/// The consequence, stated plainly because it is a real limit: a RAM-mode
+/// multi-partition snapshot carries **no version marker**. That costs less than
+/// it appears to. An old binary ignores `format_version` anyway — that was
+/// already the known hole in the run-set upgrade — so the marker was never
+/// protection, only documentation. What actually describes a multi-partition
+/// snapshot is the `position` field being there with more than one entry, which
+/// is self-describing in the way the Puffin blob types are.
+fn snapshot_format(runs: &[RunMeta], position: &StreamPosition) -> u32 {
+    match run_set_format(runs) {
+        0 => 0,
+        base if position.as_scalar().is_none() => {
+            base.max(crate::storage::catalog::FORMAT_STREAM_POSITION)
+        }
+        base => base,
+    }
+}
+
 /// A merge running on a blocking thread, and what is needed to splice it in when
 /// it lands.
 pub struct PendingMerge {
@@ -441,10 +467,11 @@ impl Flusher {
         // everyone.
         let latest = self.catalog.latest().await?;
         if let Some(latest) = &latest {
-            let dropped = self.buffer.drop_committed(latest.watermark);
+            let committed = latest.stream_position();
+            let dropped = self.buffer.drop_committed(&committed);
             if dropped > 0 {
                 info!(
-                    watermark = latest.watermark,
+                    position = %committed,
                     dropped, "pruned segments covered by committed snapshot"
                 );
             }
@@ -460,13 +487,23 @@ impl Flusher {
             // fully_committed` exists to detect.
             self.fold(
                 sequence,
-                latest.as_ref().map(|s| s.watermark).unwrap_or(0),
+                &latest
+                    .as_ref()
+                    .map(|s| s.stream_position())
+                    .unwrap_or_default(),
                 false,
             )?;
             return Ok(());
         }
 
-        let prev_watermark = latest.as_ref().map(|s| s.watermark).unwrap_or(0);
+        // The *whole* previous position, not its scalar form. A merge adopted
+        // below republishes it unchanged, and collapsing it to partition 0 would
+        // drop every other partition — which `advances_from` would then reject,
+        // correctly.
+        let prev_position = latest
+            .as_ref()
+            .map(|s| s.stream_position())
+            .unwrap_or_default();
 
         // Adopt a merge started on an earlier tick, if one is ready, then start
         // whatever the policy has due now. Adopting first means a merge is never
@@ -481,7 +518,7 @@ impl Flusher {
         // for a whole interval. Retained segments and a stalled watermark are the
         // recovery-point objective, and that is not worth paying for a merge that
         // took no lock and touched no buffered data.
-        if self.adopt_merge(sequence, prev_watermark).await? {
+        if self.adopt_merge(sequence, &prev_position).await? {
             // The merge took this sequence; the data batch follows at the next.
             sequence += 1;
         }
@@ -490,10 +527,10 @@ impl Flusher {
         // point — a high-level merge is minutes of CPU, and awaiting it inside the
         // tick let the memtable grow for the duration, unbounded by the fold
         // trigger.
-        self.start_merge(sequence, prev_watermark)?;
+        self.start_merge(sequence, &prev_position)?;
         if self.inline_merges {
             self.wait_for_merge().await;
-            if self.adopt_merge(sequence, prev_watermark).await? {
+            if self.adopt_merge(sequence, &prev_position).await? {
                 sequence += 1;
             }
         }
@@ -502,8 +539,40 @@ impl Flusher {
         if segments.is_empty() {
             return Ok(());
         }
-        let watermark = segments.iter().map(|s| s.max_offset).max().unwrap_or(0);
-        let min_offset = segments.iter().map(|s| s.min_offset).min().unwrap_or(0);
+        // Per-partition extent of everything about to be persisted. `position`
+        // is what the snapshot commits and what eviction later compares against;
+        // `first` is what the data file advertises as its low end.
+        //
+        // The low end is tracked in a plain map rather than a `StreamPosition`,
+        // because that type's `advance` is deliberately a maximum — it exists so
+        // a partition cannot walk backwards — and a minimum is the one thing it
+        // must not offer.
+        let mut file_last = StreamPosition::new();
+        let mut low: BTreeMap<crate::core::PartitionId, u64> = BTreeMap::new();
+        for segment in &segments {
+            file_last.merge(&segment.last);
+            for (partition, offset) in segment.first.iter() {
+                low.entry(partition)
+                    .and_modify(|held| *held = (*held).min(offset))
+                    .or_insert(offset);
+            }
+        }
+        let first: StreamPosition = low.into_iter().collect();
+
+        // The snapshot's position is **cumulative**, not this tick's extent. A
+        // tick whose segments happen to hold nothing from partition 1 still
+        // covers everything partition 1 committed earlier; publishing only what
+        // was just written would drop those partitions from the position and
+        // make the next recovery replay them from the beginning.
+        let mut position = latest
+            .as_ref()
+            .map(|s| s.stream_position())
+            .unwrap_or_default();
+        position.merge(&file_last);
+        // Legacy scalars, exact for one partition and 0 otherwise — the same
+        // bargain `SnapshotMeta::watermark` strikes.
+        let watermark = position.as_scalar().unwrap_or(0);
+        let min_offset = first.as_scalar().unwrap_or(0);
 
         // 1. Data file.
         let (parquet_bytes, rows) = parquet_io::segments_to_parquet(&segments)?;
@@ -522,12 +591,12 @@ impl Flusher {
         // small delta; it becomes a full base when the chain has grown long
         // enough to compact. In RAM mode there is no base to layer over, so
         // fall back to writing the whole map.
-        let (puffin_bytes, layer) = match self.fold(sequence, watermark, true)? {
+        let (puffin_bytes, layer) = match self.fold(sequence, &position, true)? {
             Some(folded) => folded,
             None => (
                 puffin::write(
                     &codec::compact_to_blobs(&self.forest, sequence, self.write),
-                    puffin_metadata(watermark),
+                    puffin_metadata(&position),
                 ),
                 Layer::Base,
             ),
@@ -563,10 +632,7 @@ impl Flusher {
             sequence,
             committed_at_ms: now_ms(),
             watermark,
-            // Stage 1 of design 010: the flush loop still consumes one ordered
-            // stream, so the position it commits has a single partition. What
-            // changed is that the *catalog* can now describe more.
-            position: StreamPosition::single(watermark),
+            position: position.clone(),
             stream: self.stream.clone(),
             data_files: vec![DataFileMeta {
                 path: data_path.to_string(),
@@ -574,12 +640,17 @@ impl Flusher {
                 bytes: parquet_len,
                 min_offset,
                 max_offset: watermark,
+                first_position: first,
+                // The *file's* extent, not the cumulative position: this names
+                // what these rows are, and the rows are only what this tick
+                // wrote.
+                last_position: file_last,
             }],
             puffin_path: puffin_path.to_string(),
             committer: self.worker_id.clone(),
             base_sequence,
             delta_chain_len: sequence - base_sequence,
-            format_version: run_set_format(&runs),
+            format_version: snapshot_format(&runs, &position),
             runs,
         };
         // Every partition must be at or ahead of where the last snapshot left
@@ -593,7 +664,7 @@ impl Flusher {
         }
         match self.catalog.commit(&meta).await? {
             CommitOutcome::Committed => {
-                self.buffer.drop_committed(watermark);
+                self.buffer.drop_committed(&position);
                 // The layer we just folded is now part of the committed run set,
                 // so a delta may be layered on it next tick.
                 if let Some(local) = self.layers.lock().as_mut() {
@@ -636,7 +707,7 @@ impl Flusher {
     /// takes no union lock, never reads the forest, and cannot conflict with
     /// ingest. It merges a **subset** — see [`tier::pick_merge`] for the policy and
     /// [`LayeredBase::slice`] for why a subset merge is sound.
-    fn start_merge(&self, sequence: u64, watermark: u64) -> anyhow::Result<()> {
+    fn start_merge(&self, sequence: u64, position: &StreamPosition) -> anyhow::Result<()> {
         let Some(dir) = &self.base_dir else {
             return Ok(());
         };
@@ -671,7 +742,7 @@ impl Flusher {
         let merge_stack = stack.slice(range.clone())?;
         let merge_path = path.clone();
         let write = self.write;
-        let meta = puffin_metadata(watermark);
+        let meta = puffin_metadata(position);
         let started = std::time::Instant::now();
         // `sequence` here is only what the run's blob metadata records; the
         // sequence it is actually *committed* at is decided at adoption, which may
@@ -749,7 +820,7 @@ impl Flusher {
     /// memtable, which `swap_base` deliberately preserves. A commit claiming this
     /// tick's watermark would tell a cold start that merges still sitting in the
     /// memtable were durable, and replay would skip them.
-    async fn adopt_merge(&self, sequence: u64, watermark: u64) -> anyhow::Result<bool> {
+    async fn adopt_merge(&self, sequence: u64, position: &StreamPosition) -> anyhow::Result<bool> {
         // Take it only if it is ready, so a tick never blocks on the merge.
         let pending = {
             let mut held = self.pending_merge.lock();
@@ -832,15 +903,15 @@ impl Flusher {
         let meta = SnapshotMeta {
             sequence,
             committed_at_ms: now_ms(),
-            watermark,
-            position: StreamPosition::single(watermark),
+            watermark: position.as_scalar().unwrap_or(0),
+            position: position.clone(),
             stream: self.stream.clone(),
             data_files: vec![],
             puffin_path: puffin_path.to_string(),
             committer: self.worker_id.clone(),
             base_sequence,
             delta_chain_len: sequence - base_sequence,
-            format_version: run_set_format(&runs),
+            format_version: snapshot_format(&runs, position),
             runs: runs.clone(),
         };
         if self.catalog.commit(&meta).await? == CommitOutcome::Conflict {
@@ -932,7 +1003,7 @@ impl Flusher {
     fn fold(
         &self,
         sequence: u64,
-        watermark: u64,
+        position: &StreamPosition,
         force: bool,
     ) -> anyhow::Result<Option<(bytes::Bytes, Layer)>> {
         let Some(dir) = &self.base_dir else {
@@ -986,7 +1057,7 @@ impl Flusher {
             // stream the live forest under the lock. Every other compaction goes
             // through `maybe_compact_chain`, which takes no lock at all.
             let (bytes, layered) = self.forest.compact_and_fold(&mut writer, |w| {
-                let bytes = puffin::write(&w.finish(), puffin_metadata(watermark));
+                let bytes = puffin::write(&w.finish(), puffin_metadata(position));
                 write_atomically(&path, &bytes)?;
                 let mapped = Arc::new(PuffinBase::open(&path)?);
                 let layered = Arc::new(LayeredBase::new(mapped));
@@ -1008,7 +1079,7 @@ impl Flusher {
             // Delta: stream only the memtable's own pairs and append them as a
             // new layer over the mappings already open.
             let (bytes, layered) = self.forest.fold_delta(&mut writer, |w, _| {
-                let bytes = puffin::write(&w.finish(), puffin_metadata(watermark));
+                let bytes = puffin::write(&w.finish(), puffin_metadata(position));
                 write_atomically(&path, &bytes)?;
                 let mapped = Arc::new(PuffinBase::open(&path)?);
                 let layered = Arc::new(base.pushed(mapped));
@@ -1085,11 +1156,17 @@ impl Flusher {
     }
 }
 
-fn puffin_metadata(watermark: u64) -> BTreeMap<String, String> {
-    BTreeMap::from([
+fn puffin_metadata(position: &StreamPosition) -> BTreeMap<String, String> {
+    let mut meta = BTreeMap::from([
         ("created-by".to_string(), "blaze".to_string()),
-        ("watermark".to_string(), watermark.to_string()),
-    ])
+        ("position".to_string(), position.to_string()),
+    ]);
+    // Keep the scalar key where it is exact, so a reader that only knows
+    // `watermark` still finds the right number for a single-partition stream.
+    if let Some(scalar) = position.as_scalar() {
+        meta.insert("watermark".to_string(), scalar.to_string());
+    }
+    meta
 }
 
 /// Open the latest committed routing snapshot as an mmap'd base on local

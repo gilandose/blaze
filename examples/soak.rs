@@ -168,7 +168,7 @@ async fn main() {
                         props: None,
                     };
                     forest.apply(&e);
-                    buffer.append(offset, &e);
+                    buffer.append(0, offset, &e);
                     offset += 1;
                 }
                 ingested.fetch_add(10_000, Ordering::Relaxed);

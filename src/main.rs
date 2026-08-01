@@ -392,7 +392,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Ingest pipeline. Offsets come either from a log or from a local counter,
     // never both — see `--edge-log`.
-    let pipeline = Arc::new(Pipeline::new(forest.clone(), buffer.clone(), watermark));
+    // Resume every partition, not just partition 0. `hydrate_from_catalog`
+    // returns the scalar for the RAM path; the committed snapshot is what
+    // carries the full position, and reads as `{0: watermark}` when it predates
+    // design 010.
+    let start_position = match catalog.latest().await? {
+        Some(snapshot) => snapshot.stream_position(),
+        None => blaze::core::StreamPosition::single(watermark),
+    };
+    let pipeline = Arc::new(Pipeline::resuming(
+        forest.clone(),
+        buffer.clone(),
+        start_position.clone(),
+    ));
     let pipeline_stats = pipeline.stats.clone();
     let stop_ingest = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -405,10 +417,19 @@ async fn main() -> anyhow::Result<()> {
                      `edge_log` example if you want simulated data through the log path)"
                 );
             }
-            let mut log = blaze::ingest::FileLog::open(path, args.edge_log_follow)?;
+            // A directory is a partitioned stream (`partition-<n>.ndjson`), a
+            // file is a single partition. Both consume single-writer.
+            let mut log: Box<dyn LogSource> = if std::path::Path::new(path).is_dir() {
+                Box::new(blaze::ingest::PartitionedLog::open_dir(
+                    path,
+                    args.edge_log_follow,
+                )?)
+            } else {
+                Box::new(blaze::ingest::FileLog::open(path, args.edge_log_follow)?)
+            };
             // Recovery: skip what the last committed snapshot already covers, so
             // the replayed suffix is exactly the applied-but-uncommitted tail.
-            log.seek_after(watermark)?;
+            log.seek(&start_position)?;
             info!(
                 path,
                 watermark,
@@ -425,7 +446,10 @@ async fn main() -> anyhow::Result<()> {
             // leaving it on the runtime lets a batch stall query handlers.
             let handle = tokio::task::spawn_blocking(move || {
                 match blaze::ingest::consume(log, &p, cfg, stop) {
-                    Ok(last) => info!(last_offset = last, "edge log drained"),
+                    // The position, not the return value: `consume` reports
+                    // partition 0, which on a partitioned stream is one of
+                    // several and on its own says almost nothing.
+                    Ok(_) => info!(position = %p.stats.position(), "edge log drained"),
                     Err(e) => error!(error = %e, "edge log consumer stopped"),
                 }
             });

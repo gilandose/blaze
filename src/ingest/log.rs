@@ -31,14 +31,18 @@
 //! This also happens to be the shape real clients offer: `rdkafka`'s
 //! `BaseConsumer::poll(timeout)` is [`LogSource::poll`] with a different name.
 //!
-//! # One partition
+//! # Partitions
 //!
-//! blaze tracks a scalar watermark, so it consumes a *single* ordered log.
-//! Multiple partitions are not a small change: DSU merges commute, so partitions
-//! would be independently correct, but the watermark would have to become a map
-//! of partition to offset in `SnapshotMeta` and every comparison against it would
-//! become a per-partition comparison. Until then, a Kafka deployment wants one
-//! partition, and this module says so rather than silently interleaving.
+//! A source may present several partitions, each its own ordered log with its
+//! own offsets, and a [`StreamPosition`] checkpoints all of them. Consumption
+//! stays **single-writer**: one thread polls every partition and applies what it
+//! gets, because that is what keeps the query path lock-free. Partitions buy
+//! correctness against a partitioned topic, not parallelism.
+//!
+//! Nothing orders records of different partitions against each other, and
+//! nothing needs to — DSU merges commute, so the forest is the same whatever
+//! interleaving arrives. The offset is bookkeeping for exactly-once *buffering*,
+//! not a serialization requirement. See design 010.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -47,7 +51,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::core::EdgeEvent;
+use crate::core::{EdgeEvent, PartitionId, StreamPosition};
 use crate::ingest::Pipeline;
 
 /// One record from the log: the event, and the offset the log gave it.
@@ -62,6 +66,8 @@ use crate::ingest::Pipeline;
 /// consumes offsets without yielding a record.
 #[derive(Debug, Clone)]
 pub struct Record {
+    /// Which ordered log this came from. Single-partition sources use `0`.
+    pub partition: PartitionId,
     pub offset: u64,
     pub event: EdgeEvent,
 }
@@ -79,13 +85,19 @@ pub trait LogSource: Send {
     /// is how a source at the head of a live topic behaves.
     fn poll(&mut self, max: usize) -> anyhow::Result<Vec<Record>>;
 
-    /// Position the source so the next [`poll`](Self::poll) returns the first
-    /// record *after* `offset`. `0` means the beginning of the log.
+    /// Position every partition so the next [`poll`](Self::poll) returns the
+    /// first record after the given position. An absent partition starts at the
+    /// beginning of its log.
     ///
     /// This is the recovery primitive: a worker hydrates to the committed
-    /// watermark and seeks to it, and the records it then replays are exactly
+    /// position and seeks to it, and the records it then replays are exactly
     /// the ones that were applied but never committed.
-    fn seek_after(&mut self, offset: u64) -> anyhow::Result<()>;
+    fn seek(&mut self, position: &StreamPosition) -> anyhow::Result<()>;
+
+    /// Single-partition convenience: seek partition 0 alone.
+    fn seek_after(&mut self, offset: u64) -> anyhow::Result<()> {
+        self.seek(&StreamPosition::single(offset))
+    }
 
     /// Whether more records may yet arrive. A source over a finite file that is
     /// not being followed reports `false` once it is drained, which is what lets
@@ -114,6 +126,9 @@ pub trait LogSource: Send {
 /// that can reorder within a partition (Kafka cannot either, without retries and
 /// `max.in.flight > 1`).
 pub struct FileLog {
+    /// Which partition this file *is*. Zero on its own; a
+    /// [`PartitionedLog`] assigns one per file.
+    partition: PartitionId,
     reader: BufReader<File>,
     /// Offset of the last record returned; the next line is `next + 1`.
     next: u64,
@@ -130,11 +145,18 @@ impl FileLog {
         let file = File::open(path.as_ref())
             .map_err(|e| anyhow::anyhow!("opening edge log {}: {e}", path.as_ref().display()))?;
         Ok(Self {
+            partition: 0,
             reader: BufReader::with_capacity(1 << 20, file),
             next: 0,
             follow,
             line: String::new(),
         })
+    }
+
+    /// Label this file as a given partition of a larger stream.
+    pub fn as_partition(mut self, partition: PartitionId) -> Self {
+        self.partition = partition;
+        self
     }
 
     /// Read one line, or `None` at end of file.
@@ -173,6 +195,7 @@ impl LogSource for FileLog {
                 .map_err(|e| anyhow::anyhow!("offset {}: {e}", self.next + 1))?;
             self.next += 1;
             out.push(Record {
+                partition: self.partition,
                 offset: self.next,
                 event,
             });
@@ -180,7 +203,8 @@ impl LogSource for FileLog {
         Ok(out)
     }
 
-    fn seek_after(&mut self, offset: u64) -> anyhow::Result<()> {
+    fn seek(&mut self, position: &StreamPosition) -> anyhow::Result<()> {
+        let offset = position.get(self.partition);
         // A linear scan, because a plain file has no offset index. Kafka does
         // this with a sparse `.index` per segment; the cost here is one pass
         // over the already-consumed prefix at startup, paid once.
@@ -191,10 +215,11 @@ impl LogSource for FileLog {
             scratch.clear();
             if self.reader.read_until(b'\n', &mut scratch)? == 0 {
                 anyhow::bail!(
-                    "cannot resume at offset {offset}: the log ends at {}. \
-                     The committed watermark is past the end of this log, which \
+                    "cannot resume partition {} at offset {offset}: the log ends at {}. \
+                     The committed position is past the end of this log, which \
                      usually means the worker is pointed at a different stream \
                      than the one its snapshots were built from.",
+                    self.partition,
                     self.next
                 );
             }
@@ -205,6 +230,97 @@ impl LogSource for FileLog {
 
     fn is_live(&self) -> bool {
         self.follow
+    }
+}
+
+/// Several partitions consumed as one stream.
+///
+/// Files named `partition-<n>.ndjson` in a directory, each its own ordered log
+/// with its own offsets — the shape of a partitioned topic, with none of the
+/// broker.
+///
+/// A poll takes a slice from every partition in turn rather than draining one
+/// before starting the next. That is not cosmetic: draining in order would mean
+/// a snapshot committed mid-catch-up covers partition 0 completely and the rest
+/// not at all, so the *incomparable* positions this design exists to handle
+/// would never actually arise in a test. Round-robin makes the interesting case
+/// the normal one.
+pub struct PartitionedLog {
+    parts: Vec<FileLog>,
+}
+
+impl PartitionedLog {
+    /// Open every `partition-<n>.ndjson` in `dir`, lowest partition first.
+    pub fn open_dir(dir: impl AsRef<Path>, follow: bool) -> anyhow::Result<Self> {
+        let dir = dir.as_ref();
+        let mut found: Vec<(PartitionId, std::path::PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(dir)
+            .map_err(|e| anyhow::anyhow!("reading edge log directory {}: {e}", dir.display()))?
+        {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Some(rest) = name.strip_prefix("partition-")
+                && let Some(id) = rest.strip_suffix(".ndjson")
+                && let Ok(id) = id.parse::<PartitionId>()
+            {
+                found.push((id, path));
+            }
+        }
+        anyhow::ensure!(
+            !found.is_empty(),
+            "no partition-<n>.ndjson files in {}",
+            dir.display()
+        );
+        found.sort_unstable();
+        let parts = found
+            .into_iter()
+            .map(|(id, path)| FileLog::open(path, follow).map(|f| f.as_partition(id)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self { parts })
+    }
+
+    pub fn partitions(&self) -> usize {
+        self.parts.len()
+    }
+}
+
+impl LogSource for PartitionedLog {
+    fn poll(&mut self, max: usize) -> anyhow::Result<Vec<Record>> {
+        let share = max.div_ceil(self.parts.len()).max(1);
+        let mut out = Vec::with_capacity(max.min(4096));
+        for part in &mut self.parts {
+            out.extend(part.poll(share)?);
+        }
+        Ok(out)
+    }
+
+    fn seek(&mut self, position: &StreamPosition) -> anyhow::Result<()> {
+        // Each partition reads its own entry, and one absent from the position
+        // seeks to the start of its log — which is where it genuinely begins.
+        for part in &mut self.parts {
+            part.seek(position)?;
+        }
+        Ok(())
+    }
+
+    fn is_live(&self) -> bool {
+        self.parts.iter().any(|p| p.is_live())
+    }
+}
+
+/// So a caller that picks a source at runtime — a directory or a single file —
+/// can still hand it to [`consume`], which is generic.
+impl LogSource for Box<dyn LogSource> {
+    fn poll(&mut self, max: usize) -> anyhow::Result<Vec<Record>> {
+        (**self).poll(max)
+    }
+    fn seek(&mut self, position: &StreamPosition) -> anyhow::Result<()> {
+        (**self).seek(position)
+    }
+    fn is_live(&self) -> bool {
+        (**self).is_live()
     }
 }
 
@@ -447,6 +563,7 @@ mod tests {
         .unwrap();
 
         let seg = buffer.seal_active().unwrap();
-        assert_eq!((seg.min_offset, seg.max_offset), (13, 20));
+        assert_eq!(seg.first, StreamPosition::single(13));
+        assert_eq!(seg.last, StreamPosition::single(20));
     }
 }
