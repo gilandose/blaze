@@ -13,10 +13,14 @@ production profile**:
 
 Three consequences of this profile shape everything below:
 
-1. **Throughput is a non-problem, by a wide margin.** 2k/s peak is ~0.6% of one
-   worker's measured ingest capacity (357k links/s through the DSU, 308k/s with
-   Arrow). Partitioning across workers is *not* on this roadmap; one HA group of
-   3 replicas suffices indefinitely. A 2B-link backfill is ~1.8 hours.
+1. **Throughput is a non-problem for the live stream, with less margin than
+   this once claimed.** 2k/s peak is ~0.6% of the 357k links/s the DSU sustains
+   *with no base attached* — but that figure does not survive contact with a
+   layer stack. [006](006-tiered-compaction.md#backfill) retracts it: the
+   effective rate is **~76k links/s**, so a 2B-link backfill is **~7 hours**, not
+   the ~1.8 this section used to claim. One HA group of 3 replicas still suffices
+   for the live rate; the sharding question is genuinely open at 10B+, and the
+   number that made it look closed was wrong.
 2. **State size is the whole problem.** At the measured 160 B/link in RAM, 2B
    links is ~320 GB. Every design below attacks state cost, snapshot cost, or
    restart cost.
@@ -33,7 +37,7 @@ docs below are the design rationale behind those knobs.
 
 | # | Design | Attacks | Status |
 |---|---|---|---|
-| [001](001-delta-snapshots.md) | Delta snapshots & compaction | snapshot stall + payload | designed |
+| [001](001-delta-snapshots.md) | Delta snapshots & compaction | snapshot stall + payload | **implemented** — parts superseded by 006/007 |
 | [002](002-dense-interning.md) | Dense id interning | memory (200→~45 B/link) | designed |
 | [003](003-disk-backed-base.md) | Disk-backed routing base (LSM) | memory + cold start | **implemented** |
 | [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed |
@@ -44,14 +48,23 @@ docs below are the design rationale behind those knobs.
 | [009](009-registry-encoding.md) | Registry encoding (delta-varint in indexed blocks) | 25-40% of base bytes | **implemented** |
 | [010](010-stream-position.md) | Stream position (per-partition offsets + stream identity) | snapshot metadata cannot describe Kafka | **implemented** |
 
-006, 007, 009 and 010 are in. Recommended order for what is left: **002** folded
+001, 003, 006, 007, 009 and 010 are in. Recommended order for what is left: **002** folded
 in with 005's rename and union tier, then 004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
 packed u48 to serve the "well beyond 2B" goal.
 
 Cost impact at the target profile: an all-RAM design would need ~256–512 GB
-instances; with 003 shipped it is ~64 GB + NVMe (~$1.5k/mo for 3 replicas), and
-measured resident set is ~300 MB at 2B links, so the instance is sized by page
-cache and headroom rather than by state.
+instances; with 003 shipped it is ~64 GB + NVMe (~$1.5k/mo for 3 replicas). The
+instance is sized by page cache and headroom rather than by state — but note
+that an earlier version of this paragraph claimed "~300 MB resident at 2B
+links", which `ARCHITECTURE.md` retracts by name: that is the *heap*, and RSS
+climbs toward `min(base size, available RAM)`. Size the box for the base you
+want cached, not for the heap floor.
+
+The base figures throughout 006 and 007 assume **~37 bytes per link**. See
+[../TUNING.md](../TUNING.md#sizing-count-pairs-not-links): that framing does not
+survive a density sweep, the same link count spans roughly 20 GB to 300 GB, and
+the durable unit is the **pair**, not the link. Every figure below derived from
+"75 GB at 2B links" inherits the error.
 
 ## Invariants every design must preserve
 
@@ -68,9 +81,11 @@ model tests enforce most of them and must keep passing:
   a node loses no committed data.
 - **I5 — Exactly-once visibility**: whatever files exist, state becomes
   visible only via the put-if-absent catalog commit; watermarks advance
-  monotonically; sequences are dense. ([010](010-stream-position.md) amends
-  "monotonically" to mean per-partition dominance once the watermark stops
-  being a scalar.)
+  monotonically; sequences are dense. Since
+  [010](010-stream-position.md), "monotonically" means **per-partition
+  dominance**: the watermark is a `StreamPosition`, and the scalar `watermark`
+  field is legacy. Enforced by `SnapshotMeta::advances_from`
+  (`a_position_that_goes_backwards_is_rejected`).
 - **I6 — Cold-start fidelity**: a worker hydrated from the catalog answers
   exactly what the writer answered at the committed watermark, and keeps
   composing with new merges (registry rebuild).
@@ -78,3 +93,12 @@ model tests enforce most of them and must keep passing:
   snapshot's offsets are only interpretable against the stream they were
   committed against. A worker configured for a different stream refuses to
   start rather than resuming at offsets that mean something else.
+  `tests/stream_identity.rs` drives the real binary through both branches;
+  `--allow-stream-change` is the override, for a stream renamed or moved with
+  its offsets intact.
+
+**On I3.** No test asserts it. `queries_see_no_torn_state_while_folding` checks
+that readers never observe a torn answer, which is a correctness property, not
+the lock property — `scope_root` simply does not take the union lock, and that
+is held by code review rather than by a test. Stated here so the list is not
+read as uniformly enforced.

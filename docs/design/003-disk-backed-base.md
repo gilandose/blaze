@@ -1,5 +1,19 @@
 # 003 — Disk-backed routing base (LSM-in-time)
 
+> **Three caveats in this doc are resolved.** The whole-base fold that "stalls
+> ingest proportional to total state" was fixed by [001](001-delta-snapshots.md):
+> the ordinary path is `fold_delta`, and a full rewrite happens only when there
+> is no committed stack. The bloom filters listed as *deferred* shipped
+> (`storage::filter`, `--filter-bits`, default 8). The registry blob is now
+> `blaze-registry-v2`, delta-varint in indexed blocks, per
+> [009](009-registry-encoding.md) — `v1` is the legacy flat encoding.
+>
+> The memtable and restart budgets below assume [002](002-dense-interning.md),
+> which was never built; `../TUNING.md` has the figures that hold today. Recovery
+> is no longer "resume the log from the watermark" but a per-partition seek over
+> a `StreamPosition` ([010](010-stream-position.md)).
+
+
 > **Status: implemented** (`--routing-base disk`, `src/storage/base.rs`,
 > `src/core/base.rs`). Shipped: mmap'd base with binary-search lookups, a
 > sparse in-RAM index (first key per 4 KiB block) plus `MADV_RANDOM` so a

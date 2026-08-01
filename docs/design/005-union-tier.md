@@ -1,5 +1,12 @@
 # 005 — Union tier ("all edges from all scopes") & naming
 
+> **Cost model assumes [002](002-dense-interning.md)**, which was never built, so
+> the per-pair figures below are counterfactual. The composition story ("participates
+> in 001 and 003 identically") is also dated: state is a tiered run set with
+> per-run membership filters and a delta-varint registry
+> ([006](006-tiered-compaction.md), [009](009-registry-encoding.md)).
+
+
 ## Problem
 
 "Global" is currently overloaded. The implemented `Visibility::Global` /

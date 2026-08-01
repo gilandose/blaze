@@ -1,5 +1,19 @@
 # 001 — Delta snapshots & compaction
 
+> **Superseded in part.** The write path shipped, but the snapshot *format* this
+> doc describes did not survive [006](006-tiered-compaction.md):
+> `base_sequence` + `delta_chain_len` are legacy compatibility fields that
+> nothing reads, replaced by the run set (`SnapshotMeta::runs`,
+> `SnapshotMeta::run_set`). The compaction trigger described below
+> (`delta_chain_len > 60`, plus a delta-bytes rule) does not exist either —
+> `--max-delta-layers` defaults to **24** and is a *depth ceiling* handed to
+> `tier::pick_merge`, not a trigger. The membership filter called "the next piece
+> of work" shipped as `storage::filter::BlockedFilter`, and the storage-side
+> compaction this doc "recommends" runs detached and takes no union lock
+> ([007](007-compaction-execution.md), `storage::compact`). Read 006 and 007 for
+> what is actually built.
+
+
 > **Status: implemented** (`src/storage/layered.rs`, `ScopedForest::fold_delta`,
 > `SnapshotMeta::base_sequence`). A flush now commits only what changed, and a
 > fold appends a layer instead of rewriting the base. Measured on the 3M-link

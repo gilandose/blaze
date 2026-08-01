@@ -134,6 +134,21 @@ struct Args {
     #[arg(long, default_value_t = false)]
     allow_unsafe_commits: bool,
 
+    /// Resume a table whose snapshots were committed against a different stream.
+    ///
+    /// Offsets are only meaningful in the stream that assigned them, so by
+    /// default a mismatch refuses to start: resuming would seek to an offset
+    /// that exists in the new stream and means something else in the old one,
+    /// hydrate cleanly, and produce a table nothing downstream can tell is
+    /// wrong.
+    ///
+    /// The legitimate use is a stream that was renamed or moved with its offsets
+    /// intact — a topic migration, or a log file given a new path. It is **not**
+    /// a way to point a table at different data: for that, start a new table.
+    /// Expect a warning every minute for as long as the process runs.
+    #[arg(long, default_value_t = false)]
+    allow_stream_change: bool,
+
     /// Seconds between retention sweeps, or 0 to never reclaim storage.
     ///
     /// Nothing in the commit path deletes anything, and tiering writes several
@@ -174,9 +189,13 @@ struct Args {
     /// but never committed. A worker that mints its own offsets has a watermark
     /// only it can interpret.
     ///
-    /// One line per event, offset = line number from 1. A single log, because
-    /// blaze tracks a scalar watermark; against Kafka that means a
-    /// single-partition topic.
+    /// One line per event, offset = line number from 1.
+    ///
+    /// A **file** is one partition. A **directory** of `partition-<n>.ndjson` is
+    /// a partitioned stream, checkpointed per partition — a snapshot then records
+    /// `{"0": 900, "1": 400}` rather than one number, and a topic that gains a
+    /// partition needs no migration because an absent partition reads as zero,
+    /// which is where it starts. Consumption is single-writer either way.
     ///
     /// Injection over HTTP/gRPC is refused while this is set — those events have
     /// no log position, and minting offsets for them would collide with the log's.
@@ -401,15 +420,33 @@ async fn main() -> anyhow::Result<()> {
         if let Some(committed) = latest.as_ref().and_then(|s| s.stream.as_ref())
             && !committed.same_stream(id)
         {
-            // Not a warning. Resuming here would seek to an offset that exists
-            // in this stream and means something else in the one the snapshots
-            // were built from — it hydrates cleanly and produces a table nothing
-            // downstream can tell is wrong.
-            anyhow::bail!(
-                "this table's snapshots were committed against {committed}, but this worker \
-                 is configured for {id}. Offsets from one stream are meaningless in the \
-                 other. Point --edge-log at the original stream, or start a new table."
+            // Fail closed by default. Resuming here would seek to an offset that
+            // exists in this stream and means something else in the one the
+            // snapshots were built from — it hydrates cleanly and produces a
+            // table nothing downstream can tell is wrong.
+            if !args.allow_stream_change {
+                anyhow::bail!(
+                    "this table's snapshots were committed against {committed}, but this \
+                     worker is configured for {id}. Offsets from one stream are meaningless \
+                     in the other. Point --edge-log at the original stream, start a new \
+                     table, or pass --allow-stream-change if the stream was renamed or \
+                     moved with its offsets intact."
+                );
+            }
+            error!(
+                %committed, new = %id,
+                "resuming a table against a different stream because --allow-stream-change \
+                 is set; the committed offsets only mean anything if this stream kept them"
             );
+            let (was, now) = (committed.to_string(), id.to_string());
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(Duration::from_secs(60));
+                every.tick().await;
+                loop {
+                    every.tick().await;
+                    warn!(committed = %was, configured = %now, "running against a changed stream");
+                }
+            });
         }
     }
 
