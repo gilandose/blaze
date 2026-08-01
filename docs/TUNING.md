@@ -292,6 +292,13 @@ the run, so no flush or compaction happened inside the window. It is the ceiling
 not a sustained rate — the soak numbers below are what sustained looks like once
 tiering and percolation are in play.
 
+One caveat on every soak figure quoted in this guide: they were measured at a
+**30% global share**, while the profile this is sized against is stated as
+**2-5%**. A global edge is the expensive kind — it merges in the shared tier and
+then notifies every scope keyed on the roots it joined — so these numbers are a
+floor, not an estimate, and the percolation cliff is considerably steeper here
+than it would be at 3%. Re-measure with `GLOBAL_PCT` set to your real share.
+
 ### Partitions
 
 Point `--edge-log` at a **directory** of `partition-<n>.ndjson` files and blaze

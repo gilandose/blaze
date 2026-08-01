@@ -20,6 +20,14 @@
 //! would confound every other column. Default 1.8 links/node matches the
 //! production profile this was sized against.
 //!
+//! **`GLOBAL_PCT` defaults to 30, which is far harsher than the profile this is
+//! sized against — production is stated as 2-5%.** That is deliberate for a
+//! stress harness, but it means every number this prints is a floor rather than
+//! an estimate: the percolation cliff in particular is driven by scopes-per-root
+//! and is much steeper at 30% than it would be at 3%. Set it to your real share
+//! before quoting anything. See `docs/design/README.md`, "if we shard, we shard
+//! on scope", for why this one number decides so much.
+//!
 //! `GLOBAL_PCT` is the sharpest knob here. A global edge merges once in the
 //! shared tier and then has to notify every scope keyed on the roots it joined,
 //! so its cost scales with scopes-per-root; a scoped edge touches exactly one

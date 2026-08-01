@@ -20,7 +20,8 @@ Three consequences of this profile shape everything below:
    effective rate is **~76k links/s**, so a 2B-link backfill is **~7 hours**, not
    the ~1.8 this section used to claim. One HA group of 3 replicas still suffices
    for the live rate; the sharding question is genuinely open at 10B+, and the
-   number that made it look closed was wrong.
+   number that made it look closed was wrong. **If it is ever answered, the
+   answer is scope sharding** — see the note below.
 2. **State size is the whole problem.** At the measured 160 B/link in RAM, 2B
    links is ~320 GB. Every design below attacks state cost, snapshot cost, or
    restart cost.
@@ -29,6 +30,63 @@ Three consequences of this profile shape everything below:
    7.5 MB), which is why [006](006-tiered-compaction.md) — not the stall fixes —
    is the current priority. Stall *duration* is cheap here: queries never take
    the union lock, and 50/s buffers away a 30-minute pause.
+
+### Note: if we shard, we shard on scope
+
+Not a design yet — a direction, recorded so the "sharding is open" line above
+has an answer attached rather than sitting as an open question nobody has
+thought about.
+
+**The shape.** Partition the *scopes* across shards; every shard also computes
+the full global tier. Two properties from the existing model make this nearly
+free to reason about:
+
+- `scope_root(s, x)` depends only on `G_global ∪ G_s`, so a shard holding the
+  global DSU plus the scopes it owns answers **entirely locally**. No
+  cross-shard reads.
+- DSU merges commute, so every shard independently applying the same global
+  edge stream converges on the identical global DSU with **no coordination**.
+  This is the same property that makes multi-partition consumption correct in
+  [010](010-stream-position.md).
+
+**Why it is the right axis.** The percolation cliff measured in `examples/soak`
+— throughput halving as roots collapsed 28.5M → 16.9M — is driven by `k`, the
+mean scopes per root, going 2.90 → 5.07: each global merge notifies every scope
+in the registry keyed on the roots it joined. Sharding scopes N ways divides `k`
+by N. It attacks the exact term that causes the cliff.
+
+**The ceiling.** Every shard consumes every global edge, so per-shard work is
+`g + (1 − g)/N` for a global share `g`, and speedup is capped at **1/g**
+regardless of N. Amdahl, with the global tier as the serial fraction:
+
+| global share | ceiling | at N=10 |
+|---|---|---|
+| 30% (`examples/soak` default) | 3.3x | 2.7x |
+| 15% (`SimulatorConfig` default) | 6.7x | 4.4x |
+| **2-5% (stated production profile)** | **20-50x** | **6.9-8.5x** |
+
+**So the harnesses are pessimistic, and by a lot.** Both defaults are 3-15x the
+global share this is actually expected to see. The percolation cliff, the
+effective ingest rate behind the ~7-hour backfill, and every soak number are
+therefore measured against a workload considerably harsher than production. The
+no-globals arm — **25M links in 4.2 min, ~99k links/s, no cliff** — is much
+closer to the real profile than the 30% arm is. Anyone re-measuring should set
+`GLOBAL_PCT` to the real share first; the numbers in these docs are a floor, not
+an estimate.
+
+**What it costs.** Shared pairs are replicated on every shard. At the measured
+~1.94 pairs/link roughly half the state is shared, so total state goes as
+`N x 0.5 + 0.5` — about 2.5x at N=4, 5.5x at N=10. Replicate the hot small tier,
+partition the large cold one; the usual broadcast-dimension trade.
+
+**What it needs.** Each shard is its own table (own prefix, catalog,
+put-if-absent, leader) — no new commit machinery. The stream shape is already
+[010](010-stream-position.md)'s: global edges on partitions every shard consumes,
+scoped edges partitioned by scope, and per-partition positions already handle a
+consumer reading a subset with absent-means-zero covering the rest. Open
+problems: scope rebalancing (moving a scope means moving its overlay), a
+scope-to-shard directory for query routing, and [005](005-union-tier.md)'s `all`
+tier, which wants a view across scopes and would need rethinking.
 
 ## Documents and priority order
 
