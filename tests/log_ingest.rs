@@ -112,7 +112,7 @@ async fn boot(dir: &std::path::Path, cache: &std::path::Path) -> Worker {
             worker_id: "log-ingest".into(),
             stream: None,
             base_dir: Some(cache.to_path_buf()),
-            fold_after_links: u64::MAX,
+            follower_fold_after_links: u64::MAX,
             max_delta_layers: 8,
             tier_fanout: 4,
             write: Default::default(),

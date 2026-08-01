@@ -186,7 +186,7 @@ async fn main() {
         worker_id: "soak".into(),
         stream: None,
         base_dir: Some(cache.path().to_path_buf()),
-        fold_after_links: u64::MAX,
+        follower_fold_after_links: u64::MAX,
         max_delta_layers: env("MAX_LAYERS", 12),
         tier_fanout: env("FANOUT", 10),
         write: Default::default(),

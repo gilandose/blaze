@@ -16,7 +16,7 @@ Four terms, and only two of them are yours to lose sleep over.
 | **Filters** | ~1.07 bytes per **pair** | **no — heap** |
 | **Sparse index** | ~0.2% of base bytes (inside the 1.07) | **no — heap** |
 | Leader memtable | `flush_interval x arrival_rate x 50 B` | no, but tiny |
-| Follower memtable | `fold_after_links x 50 B` | no, but tiny |
+| Follower memtable | `follower_fold_after_links x 50 B` | no, but tiny |
 | Mapped runs | up to the full base on disk | **yes — clean page cache** |
 
 The last row is why `RSS` misleads. Measured at 15M links, RSS was 719 MB against
@@ -175,7 +175,7 @@ it is the one number everything else scales from.
 
 ```
 --filter-bits 8 --tier-fanout 4 --max-delta-layers 6 --inline-merges
---fold-after-links 5000000
+--follower-fold-after-links 5000000
 ```
 Opposite of the serving config on three of four dials, which is the point. Keep
 filters (they buy ingest throughput). Keep depth *low*, since ingest resolves
@@ -190,7 +190,7 @@ ingest cannot outrun compaction and bury you in runs.
 | `--tier-fanout` | 10 | less rewriting (`amp ≈ log_T(F)`) | depth: `(T-1)·log_T(F)` runs to probe |
 | `--max-delta-layers` | 24 | fewer merges | every path pays per run |
 | `--flush-interval-secs` | 60 | fewer commits | leader memtable **and** your RPO |
-| `--fold-after-links` | 1M | fewer follower folds | follower heap only — see gotcha |
+| `--follower-fold-after-links` | 1M | fewer follower folds | follower heap only — a leader ignores it |
 | `--inline-merges` | off | ingest that cannot outrun compaction | tick blocks for the whole merge |
 | `--routing-base` | ram | — | `disk` is the low-memory mode |
 | `--edge-log` | unset | **production ingest** — see below | injection is refused while set |
@@ -202,10 +202,14 @@ ingest cannot outrun compaction and bury you in runs.
 | `--retention-grace-secs` | 3600 | slower merges | storage; **lowering it is the dangerous direction** |
 | `--allow-unsafe-commits` | off | **nothing** — see below | correctness, not performance |
 
-**The gotcha:** `--fold-after-links` does nothing on a leader. The check is
-`!force && links < fold_after_links`, and a leader always passes `force = true`
-because it needs a layer to commit. On the writer, memtable size is governed by
-`--flush-interval-secs`.
+**Why the name carries `follower-`:** the flag does nothing on a leader, and the
+old name (`--fold-after-links`) read like a global memory dial. The gate is
+`!force && links < follower_fold_after_links`, and a leader always passes
+`force = true` because *the folded layer is what it commits* — each snapshot's
+Puffin sidecar is that fold, so a commit without one would leave that sequence
+with no routing state to recover from. Leader fold frequency is pinned to commit
+frequency by construction, and `--flush-interval-secs` is what bounds a leader's
+memtable.
 
 ## Compaction and the page cache
 
@@ -405,6 +409,13 @@ election.
 Worth knowing that this is not hypothetical. `s3s-fs`, a real S3 server
 implementation, passes the sequential checks and fails the concurrent one —
 its `PutObject` tests `path.exists()` and then writes, with nothing in between.
+
+Both branches of the gate are tested through the real binary against that store
+(`tests/unsafe_commits.rs`): it refuses by default with a message naming the
+property that broke *and* the way out, and it starts with the flag while logging
+that it is doing so. The override matters more than it looks — it is the branch
+an operator reaches when they are already in trouble, so it is the worst one to
+discover is broken.
 
 ## Measured trade curves
 
