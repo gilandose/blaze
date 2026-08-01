@@ -11,6 +11,7 @@ pub mod layered;
 pub mod parquet_io;
 pub mod puffin;
 pub mod registry;
+pub mod retention;
 pub mod tier;
 
 pub use base::{PuffinBase, RegistryIter, ScanReader};
@@ -25,4 +26,5 @@ pub use flush::{
 };
 pub use layered::LayeredBase;
 pub use registry::{RegistryEncoding, RegistryWriter};
+pub use retention::{Reclaimed, RetentionPolicy, collect as collect_garbage};
 pub use tier::{DEFAULT_TIER_FANOUT, pick_merge};

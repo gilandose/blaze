@@ -4,7 +4,7 @@ use clap::Parser;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -117,6 +117,37 @@ struct Args {
     /// warning every minute for as long as the process runs.
     #[arg(long, default_value_t = false)]
     allow_unsafe_commits: bool,
+
+    /// Seconds between retention sweeps, or 0 to never reclaim storage.
+    ///
+    /// Nothing in the commit path deletes anything, and tiering writes several
+    /// times the bytes it keeps: every merge supersedes the runs it read. A
+    /// table left unswept grows at the write-amplification rate rather than at
+    /// the rate of the data — measured mid-soak at 80% of bytes unreachable, and
+    /// still climbing.
+    #[arg(long, default_value_t = 3600)]
+    retention_interval_secs: u64,
+
+    /// Snapshots to keep regardless of age.
+    ///
+    /// Each one is a point a worker can be restored to, so this is a durability
+    /// setting as much as a storage one.
+    #[arg(long, default_value_t = 10)]
+    keep_snapshots: usize,
+
+    /// Also keep every snapshot committed within this many hours.
+    #[arg(long, default_value_t = 24)]
+    keep_snapshots_hours: u64,
+
+    /// Never reclaim an object younger than this, reachable or not.
+    ///
+    /// A tick uploads its data and run objects and commits the metadata naming
+    /// them afterwards; in between they are reachable from nothing. Without this
+    /// window a sweep would collect an in-flight commit's own inputs and the
+    /// commit would publish a snapshot naming files that no longer exist. Must
+    /// exceed the slowest merge-and-commit, so it is measured in hours.
+    #[arg(long, default_value_t = 3600)]
+    retention_grace_secs: u64,
 
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
@@ -325,7 +356,7 @@ async fn main() -> anyhow::Result<()> {
         store: store.clone(),
         catalog: catalog.clone(),
         elector: elector.clone(),
-        table_prefix,
+        table_prefix: table_prefix.clone(),
         worker_id: worker_id.clone(),
         base_dir,
         fold_after_links: args.fold_after_links,
@@ -344,6 +375,53 @@ async fn main() -> anyhow::Result<()> {
             .clone()
             .run(Duration::from_secs(args.flush_interval_secs)),
     );
+
+    // Retention. A separate loop rather than part of the tick: reclaiming
+    // storage is not on the commit path, must not be able to slow it down, and
+    // runs on a far longer period than a flush. Leader-gated only to avoid
+    // duplicated work — a sweep is idempotent and safe from any worker.
+    if args.retention_interval_secs > 0 {
+        let policy = blaze::storage::RetentionPolicy {
+            keep_snapshots: args.keep_snapshots,
+            keep_for: Duration::from_secs(args.keep_snapshots_hours * 3600),
+            grace: Duration::from_secs(args.retention_grace_secs),
+        };
+        let (store, catalog, prefix, elector) = (
+            store.clone(),
+            catalog.clone(),
+            table_prefix,
+            elector.clone(),
+        );
+        let period = Duration::from_secs(args.retention_interval_secs);
+        info!(
+            period_secs = args.retention_interval_secs,
+            keep_snapshots = policy.keep_snapshots,
+            keep_hours = args.keep_snapshots_hours,
+            grace_secs = args.retention_grace_secs,
+            "retention enabled"
+        );
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(period);
+            // Skip the immediate first tick: a worker that just started has not
+            // yet observed the catalog it would be sweeping.
+            every.tick().await;
+            loop {
+                every.tick().await;
+                if !elector.is_leader() {
+                    continue;
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                if let Err(e) =
+                    blaze::storage::collect_garbage(&store, &catalog, &prefix, &policy, now).await
+                {
+                    warn!(error = %e, "retention sweep failed; will retry next period");
+                }
+            }
+        });
+    }
 
     // API server.
     let state = AppState {

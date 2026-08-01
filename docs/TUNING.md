@@ -194,6 +194,10 @@ ingest cannot outrun compaction and bury you in runs.
 | `--inline-merges` | off | ingest that cannot outrun compaction | tick blocks for the whole merge |
 | `--routing-base` | ram | — | `disk` is the low-memory mode |
 | `--registry-encoding` | blocked | — | `flat` is 1.6x the base for a 2.4x faster merge notification |
+| `--retention-interval-secs` | 3600 | rarer sweeps | storage grows at the amplification rate — see below |
+| `--keep-snapshots` | 10 | more restore points | storage |
+| `--keep-snapshots-hours` | 24 | more restore points | storage |
+| `--retention-grace-secs` | 3600 | slower merges | storage; **lowering it is the dangerous direction** |
 | `--allow-unsafe-commits` | off | **nothing** — see below | correctness, not performance |
 
 **The gotcha:** `--fold-after-links` does nothing on a leader. The check is
@@ -224,6 +228,52 @@ queries are using, which is the behaviour `MADV_COLD` would provide if memmap2
 exposed it. Nothing is tunable here and nothing needs to be; it is the default
 and the only reason to know about it is if you are reading `mincore` output and
 wondering why a compaction no longer moves the number.
+
+## Retention
+
+Nothing on the commit path deletes anything. A tick writes new objects and
+publishes a snapshot naming them; the runs the merge consumed are simply no
+longer named. So an unswept table does not grow at the rate of your data, it
+grows at the *write-amplification* rate — `amp ≈ log_T(F)`, measured 4.96x at
+the default fanout. On a real merged table the sweep reclaims **96% of run
+bytes**; mid-soak the live figure was 80% and still climbing.
+
+**Retention is on by default** (`--retention-interval-secs 3600`), so a worker
+that has been up an hour will start deleting objects. Set it to `0` to keep the
+old never-delete behaviour.
+
+What a sweep keeps is a *reachability closure*, not a list:
+
+1. Retain the newest `--keep-snapshots` snapshots, plus every snapshot committed
+   within `--keep-snapshots-hours`.
+2. Close that set over snapshot parentage — a legacy `SequencesOnly` snapshot
+   carries no run set of its own and is only meaningful with the chain behind it,
+   so retaining one retains its whole chain.
+3. The live object set is every `puffin_path`, `data_files` entry and run named
+   by anything in the closure.
+4. Delete everything else under the table prefix — objects first, then the
+   metadata that referenced them, so a crash mid-sweep leaves unreferenced
+   objects rather than a snapshot pointing at nothing.
+
+`--retention-grace-secs` is the safety property and the one number worth
+understanding. Between a tick uploading its objects and committing the snapshot
+that names them, those objects are reachable from nothing at all. Without a grace
+window a concurrent sweep would collect an in-flight commit's own inputs, and the
+commit would then publish a snapshot naming files that no longer exist. **The
+grace window must exceed your slowest merge-and-commit.** An hour is generous for
+a normal table; raise it if merges take longer than that, and understand that
+lowering it trades a correctness margin for storage.
+
+The sweep is leader-gated only to avoid duplicated work — it is idempotent and
+safe to run from any worker — and runs on its own loop rather than inside the
+tick, so it can never slow a commit down. A sweep that fails logs and retries
+next period.
+
+The thing to know if you are watching this: deleting a live run corrupts nothing
+you can see. The mappings stay valid, the catalog stays parseable, and the loss
+surfaces only when a worker hydrates from scratch — the one moment nobody is
+watching. `tests/retention.rs` therefore asserts against a cold start rather than
+against a byte count.
 
 ## The startup preflight
 
