@@ -4,9 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `labeled` is here so that adding the `e2e` label to an open pull request
+    # re-runs the workflow and picks up the oracle job. Listing types at all
+    # replaces the default set, so the other three have to be spelled out.
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+# Any label re-triggers the workflow, not just `e2e`, so supersede the previous
+# run on a pull request rather than building the same commit repeatedly. Pushes
+# to main are left alone: each one is a distinct commit worth its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -49,8 +61,17 @@ jobs:
       - name: cargo check --features k8s
         run: cargo check --features k8s
 
+  # Gated behind the `e2e` label on pull requests: it builds the binary in
+  # release, starts it, restarts it mid-stream and queries it back, so it costs
+  # minutes rather than seconds. It still runs unconditionally on every push to
+  # main, which is the part that matters — a labelled-only check would let a
+  # regression through on any pull request nobody thought to label, and this is
+  # the one test that grades us against something we did not write.
   oracle:
     name: connected components vs scipy
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'e2e')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -93,7 +93,13 @@ up to relabelling, and it runs three ways. `memory` and `storage` are in-process
 hydrated from the catalog, then queries the roots back through the API.
 
 The `words` dataset is vendored under `tests/data`, so the end-to-end run needs
-no network and gates every merge in CI.
+no network.
+
+In CI it runs on **every push to `main`**, and on a pull request only when the
+`e2e` label is applied — it builds in release, starts the binary and restarts it
+mid-stream, so it costs minutes where the other jobs cost seconds. Label a pull
+request that touches ingest, storage or recovery and it runs before the merge;
+everything else is still graded after it lands.
 
 ## Routing-state modes
 
