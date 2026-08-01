@@ -194,7 +194,7 @@ fn test_app(leader: bool) -> (AppState, mpsc::Receiver<EdgeEvent>) {
             forest,
             buffer: pipeline.buffer.clone(),
             pipeline_stats: pipeline.stats.clone(),
-            ingest_tx: tx,
+            ingest_tx: Some(tx),
             elector,
             worker_id: "api-test".into(),
             started_at: Instant::now(),

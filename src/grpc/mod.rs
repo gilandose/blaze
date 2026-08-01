@@ -114,8 +114,18 @@ impl BlazeService for GrpcService {
                 .as_millis() as i64,
             props: req.props,
         };
+        // Refused on a log-backed worker: an injected edge has no log position,
+        // so accepting it means minting an offset into the space the log is
+        // already assigning. See `AppState::ingest_tx`.
         self.state
             .ingest_tx
+            .as_ref()
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "this worker ingests from a log; its offsets are assigned there. \
+                     Produce to the log instead of injecting.",
+                )
+            })?
             .send(event)
             .await
             .map_err(|_| Status::unavailable("ingest pipeline is shut down"))?;

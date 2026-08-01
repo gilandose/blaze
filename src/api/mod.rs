@@ -24,7 +24,14 @@ pub struct AppState {
     pub forest: Arc<ScopedForest>,
     pub buffer: Arc<EdgeBuffer>,
     pub pipeline_stats: Arc<PipelineStats>,
-    pub ingest_tx: mpsc::Sender<EdgeEvent>,
+    /// Where directly-injected edges go, or `None` on a log-backed worker.
+    ///
+    /// An injected edge has no log position, so accepting one means minting an
+    /// offset locally — in the same offset space the log is assigning. The two
+    /// numberings would collide, and the committed watermark would stop meaning
+    /// "everything up to here is in the log". Injection is therefore refused
+    /// rather than quietly interleaved. Producing to the log is the way in.
+    pub ingest_tx: Option<mpsc::Sender<EdgeEvent>>,
     pub elector: Arc<dyn LeaderElector>,
     pub worker_id: String,
     pub started_at: Instant,
@@ -150,7 +157,15 @@ async fn inject_edge(
             .as_millis() as i64,
         props: body.props,
     };
-    s.ingest_tx.send(event).await.map_err(|_| {
+    let tx = s.ingest_tx.as_ref().ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "this worker ingests from a log; its offsets are assigned there. \
+             Produce to the log instead of injecting."
+                .into(),
+        )
+    })?;
+    tx.send(event).await.map_err(|_| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "ingest pipeline is shut down".into(),

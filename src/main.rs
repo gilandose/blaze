@@ -12,7 +12,7 @@ use blaze::api::{AppState, router};
 use blaze::core::ScopedForest;
 use blaze::grpc::GrpcService;
 use blaze::ha::{LeaderElector, StaticElector};
-use blaze::ingest::{EdgeBuffer, Pipeline, SimulatorConfig, run_simulator};
+use blaze::ingest::{EdgeBuffer, LogSource, Pipeline, SimulatorConfig, run_simulator};
 use blaze::storage::{Flusher, SnapshotCatalog, hydrate_from_catalog, open_base_from_catalog};
 
 #[derive(Parser, Debug)]
@@ -148,6 +148,39 @@ struct Args {
     /// exceed the slowest merge-and-commit, so it is measured in hours.
     #[arg(long, default_value_t = 3600)]
     retention_grace_secs: u64,
+
+    /// Consume edges from a newline-delimited JSON log instead of the API.
+    ///
+    /// This is the shape a production deployment has: the offset is assigned by
+    /// the log, not by the worker, so every consumer numbers the same record the
+    /// same way. That is what makes the committed watermark portable — a failover
+    /// worker resumes after it and replays exactly the events that were applied
+    /// but never committed. A worker that mints its own offsets has a watermark
+    /// only it can interpret.
+    ///
+    /// One line per event, offset = line number from 1. A single log, because
+    /// blaze tracks a scalar watermark; against Kafka that means a
+    /// single-partition topic.
+    ///
+    /// Injection over HTTP/gRPC is refused while this is set — those events have
+    /// no log position, and minting offsets for them would collide with the log's.
+    #[arg(long)]
+    edge_log: Option<String>,
+
+    /// Wait at the end of the log for more, rather than stopping when drained.
+    ///
+    /// On is the streaming deployment. Off turns the worker into a batch loader
+    /// that ingests a finite file, flushes, and idles serving queries.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    edge_log_follow: bool,
+
+    /// Records per poll from the edge log.
+    ///
+    /// The single largest difference between this path and the API: injection is
+    /// one event per request, so it is bound by request overhead rather than by
+    /// how fast edges can be applied. A batch amortises that to nothing.
+    #[arg(long, default_value_t = 10_000)]
+    edge_log_batch: usize,
 
     /// Seconds between micro-batch flushes.
     #[arg(long, default_value_t = 60)]
@@ -332,22 +365,63 @@ async fn main() -> anyhow::Result<()> {
         other => anyhow::bail!("unknown election mode '{other}' (static:true, static:false, k8s)"),
     };
 
-    // Ingest pipeline.
-    let (ingest_tx, ingest_rx) = mpsc::channel(65_536);
-    let pipeline = Pipeline::new(forest.clone(), buffer.clone(), watermark);
+    // Ingest pipeline. Offsets come either from a log or from a local counter,
+    // never both — see `--edge-log`.
+    let pipeline = Arc::new(Pipeline::new(forest.clone(), buffer.clone(), watermark));
     let pipeline_stats = pipeline.stats.clone();
-    let pipeline_handle = tokio::spawn(async move { pipeline.run(ingest_rx).await });
+    let stop_ingest = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    if args.simulate {
-        let cfg = SimulatorConfig {
-            rate: args.sim_rate,
-            nodes: args.sim_nodes,
-            scopes: args.sim_scopes,
-            ..Default::default()
-        };
-        info!(?cfg, "starting firehose simulator");
-        tokio::spawn(run_simulator(cfg, ingest_tx.clone()));
-    }
+    let (ingest_tx, pipeline_handle) = match &args.edge_log {
+        Some(path) => {
+            if args.simulate {
+                anyhow::bail!(
+                    "--simulate and --edge-log both feed the pipeline, and their offsets \
+                     would interleave in one space; pick one (generate a log with the \
+                     `edge_log` example if you want simulated data through the log path)"
+                );
+            }
+            let mut log = blaze::ingest::FileLog::open(path, args.edge_log_follow)?;
+            // Recovery: skip what the last committed snapshot already covers, so
+            // the replayed suffix is exactly the applied-but-uncommitted tail.
+            log.seek_after(watermark)?;
+            info!(
+                path,
+                watermark,
+                follow = args.edge_log_follow,
+                batch = args.edge_log_batch,
+                "consuming edges from a log"
+            );
+            let cfg = blaze::ingest::ConsumerConfig {
+                batch: args.edge_log_batch,
+                ..Default::default()
+            };
+            let (p, stop) = (pipeline.clone(), stop_ingest.clone());
+            // A blocking thread on purpose: applying an edge is CPU work, and
+            // leaving it on the runtime lets a batch stall query handlers.
+            let handle = tokio::task::spawn_blocking(move || {
+                match blaze::ingest::consume(log, &p, cfg, stop) {
+                    Ok(last) => info!(last_offset = last, "edge log drained"),
+                    Err(e) => error!(error = %e, "edge log consumer stopped"),
+                }
+            });
+            (None, handle)
+        }
+        None => {
+            let (tx, rx) = mpsc::channel(65_536);
+            if args.simulate {
+                let cfg = SimulatorConfig {
+                    rate: args.sim_rate,
+                    nodes: args.sim_nodes,
+                    scopes: args.sim_scopes,
+                    ..Default::default()
+                };
+                info!(?cfg, "starting firehose simulator");
+                tokio::spawn(run_simulator(cfg, tx.clone()));
+            }
+            let p = pipeline.clone();
+            (Some(tx), tokio::spawn(async move { p.run(rx).await }))
+        }
+    };
 
     // Micro-batch flusher.
     let flusher = Arc::new(Flusher {
@@ -452,6 +526,10 @@ async fn main() -> anyhow::Result<()> {
             grpc_handle.abort();
             info!("shutting down: attempting final flush");
             flush_handle.abort();
+            // A log consumer runs on a blocking thread, where `abort` does not
+            // interrupt anything; it checks this between batches instead. Setting
+            // the flag before aborting covers both ingest shapes.
+            stop_ingest.store(true, std::sync::atomic::Ordering::Relaxed);
             pipeline_handle.abort();
             if let Err(e) = flusher.tick().await {
                 tracing::warn!(error = %e, "final flush failed");
