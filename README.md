@@ -44,6 +44,34 @@ curl -X POST localhost:8080/v1/edges \
 Restarting against the same warehouse hydrates the in-memory DSU from the
 latest committed Puffin snapshot — no event replay needed for topology.
 
+### Ingesting from a log
+
+The API path above mints its own offsets, which is fine for one worker and a
+demo. A production deployment reads a log, so that the *log* assigns the offset:
+every consumer then numbers the same record the same way, which is what makes the
+committed watermark portable across a failover instead of being a private number
+only the worker that wrote it can interpret.
+
+```bash
+# Generate a log — newline-delimited JSON, offset = line number
+LINKS=50000000 OUT=edges.ndjson cargo run --release --example edge_log
+
+# Streaming: follow the tail, the way a consumer follows a topic
+cargo run --release -- --edge-log edges.ndjson \
+  --warehouse file:///tmp/blaze-warehouse
+
+# Batch: load a finite file, flush, then idle serving queries
+cargo run --release -- --edge-log edges.ndjson --edge-log-follow false ...
+```
+
+A restart seeks to the committed watermark and replays exactly the records that
+were applied but never committed; redelivery below the watermark is skipped, so
+the rows land once. `--edge-log` refuses `POST /v1/edges` while it is set, because
+an injected edge has no log position and minting one would collide with the log's
+numbering. Swapping the file for Kafka is an implementation of the `LogSource`
+trait — `poll` and `seek_after` — and a single-partition topic. See
+[docs/TUNING.md](docs/TUNING.md#where-edges-come-in).
+
 ## Checking the answers against something we did not write
 
 `tools/cc_oracle.py` grades `scope_root` against
@@ -65,7 +93,13 @@ up to relabelling, and it runs three ways. `memory` and `storage` are in-process
 hydrated from the catalog, then queries the roots back through the API.
 
 The `words` dataset is vendored under `tests/data`, so the end-to-end run needs
-no network and gates every merge in CI.
+no network.
+
+In CI it runs on **every push to `main`**, and on a pull request only when the
+`e2e` label is applied — it builds in release, starts the binary and restarts it
+mid-stream, so it costs minutes where the other jobs cost seconds. Label a pull
+request that touches ingest, storage or recovery and it runs before the merge;
+everything else is still graded after it lands.
 
 ## Routing-state modes
 
@@ -119,7 +153,7 @@ observe each committed watermark and discard their duplicate buffers.
 | `GET /v1/stats` | forest/buffer/ingest counters |
 | `GET /v1/scopes/{scope}/components/{node}` | canonical component id for `node` in `scope` — the lowest graph id in the component (`global` or numeric scope id) |
 | `GET /v1/scopes/{scope}/connected?u=&v=` | connectivity check in `scope`'s view |
-| `POST /v1/edges` | inject an edge event (`{"src", "dst", "scopes": [..], "props"}`; empty scopes = global) |
+| `POST /v1/edges` | inject an edge event (`{"src", "dst", "scopes": [..], "props"}`; empty scopes = global). 409 on a `--edge-log` worker |
 
 ### gRPC
 

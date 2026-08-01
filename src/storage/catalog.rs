@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::core::{StreamId, StreamPosition};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataFileMeta {
     pub path: String,
@@ -32,8 +34,36 @@ pub struct DataFileMeta {
 pub struct SnapshotMeta {
     pub sequence: u64,
     pub committed_at_ms: i64,
-    /// Highest event offset covered by this snapshot (inclusive).
+    /// Highest event offset covered by this snapshot (inclusive), as a scalar.
+    ///
+    /// **Legacy, and only meaningful for a single-partition stream.** Superseded
+    /// by `position`, which can describe more than one partition. Still written
+    /// when the position *has* an exact scalar form — a position covering
+    /// partition 0 alone is not approximated by this number, it is this number —
+    /// so a binary predating `position` reads a newer catalog correctly for the
+    /// only topology it could ever have handled.
+    ///
+    /// Written as `0` for a multi-partition position, because no `u64` describes
+    /// one. Read [`SnapshotMeta::stream_position`], never this field.
     pub watermark: u64,
+    /// Where the input stream stands as of this snapshot, per partition.
+    ///
+    /// Absent on snapshots written before it existed; use
+    /// [`SnapshotMeta::stream_position`], which synthesises `{0: watermark}` for
+    /// those, the same way [`SnapshotMeta::run_set`] synthesises a run set for
+    /// pre-`runs` snapshots.
+    #[serde(default, skip_serializing_if = "StreamPosition::is_empty")]
+    pub position: StreamPosition,
+    /// Which stream `position` is measured in.
+    ///
+    /// Offsets without this are numbers without units. A worker pointed at a
+    /// renamed or rebuilt topic resumes at an offset that exists and means
+    /// something else — it hydrates cleanly, replays a plausible suffix, and
+    /// produces a table nothing downstream can tell is wrong. Absent on
+    /// snapshots written before it existed, and on those the check cannot be
+    /// made rather than being made wrongly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamId>,
     pub data_files: Vec<DataFileMeta>,
     /// Puffin sidecar for *this* commit. A base layer when
     /// `base_sequence == sequence`, otherwise a delta over the chain below it.
@@ -86,6 +116,16 @@ pub struct SnapshotMeta {
 /// `format_version` for snapshots that describe themselves as a set of runs.
 pub const FORMAT_RUN_SETS: u32 = 1;
 
+/// `format_version` for snapshots carrying a per-partition [`StreamPosition`].
+///
+/// A **single**-partition snapshot at this version is still readable by an older
+/// binary, because `watermark` carries the same number. A multi-partition one is
+/// not, and cannot be: there is no scalar that describes it. That makes the
+/// upgrade one-way exactly when the topology stops being one a pre-010 binary
+/// could serve — the same bargain [`FORMAT_RUN_SETS`] struck, for the same
+/// reason.
+pub const FORMAT_STREAM_POSITION: u32 = 2;
+
 /// One immutable run of routing pairs — a folded memtable, or the output of
 /// merging several runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +165,67 @@ fn default_base_sequence() -> u64 {
 }
 
 impl SnapshotMeta {
+    /// Where the stream stands as of this snapshot — the single way readers
+    /// should ask.
+    ///
+    /// Falls back to `{0: watermark}` for snapshots written before `position`
+    /// existed. That is not a guess: every such snapshot was written by a worker
+    /// that could only consume one stream, and partition 0 is what a
+    /// single-partition source produces, so the synthesised position is exactly
+    /// what the scalar meant.
+    pub fn stream_position(&self) -> StreamPosition {
+        if self.position.is_empty() {
+            StreamPosition::single(self.watermark)
+        } else {
+            self.position.clone()
+        }
+    }
+
+    /// Set the position, keeping `watermark` in step where a scalar is exact.
+    ///
+    /// The two fields are written together and never independently, so the
+    /// invariant "`watermark` is either the same number or `0`" holds by
+    /// construction rather than by everyone remembering.
+    pub fn set_stream_position(&mut self, position: StreamPosition) {
+        self.watermark = position.as_scalar().unwrap_or(0);
+        if position.len() > 1 {
+            self.format_version = self.format_version.max(FORMAT_STREAM_POSITION);
+        }
+        self.position = position;
+    }
+
+    /// Whether this snapshot may follow `previous` in the same table.
+    ///
+    /// Every partition must be at or ahead of where it was. Under a scalar
+    /// watermark this was `>=` and needed no argument; under a partial order two
+    /// successive positions can be **incomparable**, and that is not a
+    /// tolerable state — it means some partition went backwards, which is a
+    /// second consumer applying records this one has not seen. Left alone it
+    /// double-writes rows and, on the buffer side, drops segments that are not
+    /// durable. Caught here it is one error at commit time.
+    pub fn advances_from(&self, previous: &SnapshotMeta) -> anyhow::Result<()> {
+        let (before, after) = (previous.stream_position(), self.stream_position());
+        anyhow::ensure!(
+            after.dominates(&before),
+            "snapshot {} moves the stream position backwards: {} does not cover {}. \
+             A partition can only advance, so this is another consumer committing \
+             to the same table.",
+            self.sequence,
+            after,
+            before,
+        );
+        if let (Some(a), Some(b)) = (&self.stream, &previous.stream) {
+            anyhow::ensure!(
+                a.same_stream(b),
+                "snapshot {} claims stream {a} but snapshot {} committed {b}; \
+                 offsets from one are meaningless in the other",
+                self.sequence,
+                previous.sequence,
+            );
+        }
+        Ok(())
+    }
+
     /// Sequences whose Puffin files must be read, oldest first, to reconstruct
     /// routing state as of this snapshot.
     pub fn chain(&self) -> std::ops::RangeInclusive<u64> {
@@ -335,11 +436,15 @@ mod tests {
     use super::*;
     use object_store::memory::InMemory;
 
+    /// Deliberately legacy-shaped: no `position`, no `stream`. The existing
+    /// tests keep exercising the pre-010 form, and the fallback that reads it.
     fn snap(seq: u64, watermark: u64) -> SnapshotMeta {
         SnapshotMeta {
             sequence: seq,
             committed_at_ms: 0,
             watermark,
+            position: StreamPosition::new(),
+            stream: None,
             data_files: vec![],
             puffin_path: format!("puffin/dsu-{seq}.puffin"),
             committer: "test".into(),
@@ -521,5 +626,122 @@ mod tests {
         let latest = catalog.latest().await.unwrap().unwrap();
         assert_eq!(latest.sequence, 2);
         assert_eq!(latest.watermark, 250);
+    }
+
+    /// The migration: a snapshot written before `position` existed reads as
+    /// `{0: watermark}`. Not a guess — every such snapshot came from a worker
+    /// that could only consume one stream, so partition 0 is where its offsets
+    /// were, and the synthesised position is exactly what the scalar meant.
+    #[test]
+    fn a_legacy_scalar_reads_as_partition_zero() {
+        let json = r#"{
+            "sequence": 7, "committed_at_ms": 0, "watermark": 4242,
+            "data_files": [], "puffin_path": "puffin/dsu-7.puffin",
+            "committer": "old-binary"
+        }"#;
+        let snap: SnapshotMeta = serde_json::from_str(json).unwrap();
+        assert!(snap.position.is_empty(), "nothing to deserialize into it");
+        assert_eq!(snap.stream, None);
+
+        let position = snap.stream_position();
+        assert_eq!(position.get(0), 4242);
+        assert_eq!(position.len(), 1);
+        assert!(position.dominates(&StreamPosition::single(4242)));
+    }
+
+    /// A single-partition snapshot stays readable by a binary that predates
+    /// `position`, because `watermark` carries the same number rather than an
+    /// approximation of it. That is what keeps rollback available for the only
+    /// topology an older binary could ever have served.
+    #[test]
+    fn a_single_partition_snapshot_still_writes_the_scalar() {
+        let mut snap = snap(3, 0);
+        snap.set_stream_position(StreamPosition::single(900));
+        assert_eq!(snap.watermark, 900);
+        assert_eq!(snap.format_version, 0, "no format bump for one partition");
+
+        let round: SnapshotMeta =
+            serde_json::from_slice(&serde_json::to_vec(&snap).unwrap()).unwrap();
+        assert_eq!(round.stream_position(), StreamPosition::single(900));
+    }
+
+    /// And a multi-partition one does not pretend: there is no `u64` that
+    /// describes it, so `watermark` goes to 0 and the format version names why.
+    #[test]
+    fn a_multi_partition_snapshot_refuses_to_invent_a_scalar() {
+        let mut snap = snap(4, 0);
+        snap.set_stream_position([(0, 10), (1, 20)].into_iter().collect());
+        assert_eq!(snap.watermark, 0);
+        assert_eq!(snap.format_version, FORMAT_STREAM_POSITION);
+
+        let round: SnapshotMeta =
+            serde_json::from_slice(&serde_json::to_vec(&snap).unwrap()).unwrap();
+        assert_eq!(round.stream_position().get(1), 20);
+        // The fallback must not fire when a real position is present, or the
+        // multi-partition snapshot would silently read as `{0: 0}`.
+        assert_eq!(round.stream_position().len(), 2);
+    }
+
+    /// Under a scalar this was `>=` and needed no argument. Under a partial
+    /// order two successive positions can be incomparable, which means some
+    /// partition went backwards — a second consumer committing to the same
+    /// table. One error here beats double-written rows and undurable segments
+    /// dropped from a follower's buffer.
+    #[test]
+    fn a_position_that_goes_backwards_is_rejected() {
+        let mut first = snap(1, 0);
+        first.set_stream_position([(0, 50), (1, 50)].into_iter().collect());
+
+        let mut forward = snap(2, 0);
+        forward.set_stream_position([(0, 60), (1, 50)].into_iter().collect());
+        forward.advances_from(&first).unwrap();
+
+        // Same total, redistributed: partition 1 moved backwards.
+        let mut sideways = snap(2, 0);
+        sideways.set_stream_position([(0, 60), (1, 40)].into_iter().collect());
+        let err = sideways.advances_from(&first).unwrap_err().to_string();
+        assert!(err.contains("backwards"), "{err}");
+
+        // A partition appearing for the first time is not going backwards: it
+        // was at 0 and now it is not.
+        let mut grown = snap(2, 0);
+        grown.set_stream_position([(0, 50), (1, 50), (2, 5)].into_iter().collect());
+        grown.advances_from(&first).unwrap();
+    }
+
+    #[test]
+    fn a_legacy_predecessor_still_constrains_its_successor() {
+        let old = snap(1, 500); // scalar only
+        let mut ahead = snap(2, 0);
+        ahead.set_stream_position(StreamPosition::single(600));
+        ahead.advances_from(&old).unwrap();
+
+        let mut behind = snap(2, 0);
+        behind.set_stream_position(StreamPosition::single(400));
+        assert!(behind.advances_from(&old).is_err());
+    }
+
+    #[test]
+    fn a_stream_identity_change_is_rejected() {
+        let mut a = snap(1, 0);
+        a.set_stream_position(StreamPosition::single(10));
+        a.stream = Some(StreamId::new("kafka", "edges"));
+
+        let mut b = snap(2, 0);
+        b.set_stream_position(StreamPosition::single(20));
+        b.stream = Some(StreamId::new("kafka", "edges-v2"));
+        let err = b.advances_from(&a).unwrap_err().to_string();
+        assert!(err.contains("meaningless in the other"), "{err}");
+
+        // A consumer group change is not a stream change.
+        let mut c = snap(2, 0);
+        c.set_stream_position(StreamPosition::single(20));
+        c.stream = Some(StreamId::new("kafka", "edges").with_group("blaze-b"));
+        c.advances_from(&a).unwrap();
+
+        // And a legacy predecessor with no identity cannot be checked against,
+        // so it is not checked rather than being failed.
+        let legacy = snap(1, 10);
+        c.advances_from(&legacy).unwrap();
     }
 }

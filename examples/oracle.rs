@@ -123,6 +123,7 @@ async fn run_storage(input: &Input) -> (Arc<ScopedForest>, usize, tempfile::Temp
         elector: Arc::new(StaticElector(true)),
         table_prefix: prefix,
         worker_id: "oracle".into(),
+        stream: None,
         base_dir: Some(cache.path().to_path_buf()),
         fold_after_links: u64::MAX,
         // Deliberately small: a shallow ceiling and a low fanout mean this run

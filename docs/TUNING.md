@@ -193,7 +193,13 @@ ingest cannot outrun compaction and bury you in runs.
 | `--fold-after-links` | 1M | fewer follower folds | follower heap only — see gotcha |
 | `--inline-merges` | off | ingest that cannot outrun compaction | tick blocks for the whole merge |
 | `--routing-base` | ram | — | `disk` is the low-memory mode |
+| `--edge-log` | unset | **production ingest** — see below | injection is refused while set |
+| `--edge-log-batch` | 10 000 | ingest throughput | memtable granularity, nothing else |
 | `--registry-encoding` | blocked | — | `flat` is 1.6x the base for a 2.4x faster merge notification |
+| `--retention-interval-secs` | 3600 | rarer sweeps | storage grows at the amplification rate — see below |
+| `--keep-snapshots` | 10 | more restore points | storage |
+| `--keep-snapshots-hours` | 24 | more restore points | storage |
+| `--retention-grace-secs` | 3600 | slower merges | storage; **lowering it is the dangerous direction** |
 | `--allow-unsafe-commits` | off | **nothing** — see below | correctness, not performance |
 
 **The gotcha:** `--fold-after-links` does nothing on a leader. The check is
@@ -224,6 +230,121 @@ queries are using, which is the behaviour `MADV_COLD` would provide if memmap2
 exposed it. Nothing is tunable here and nothing needs to be; it is the default
 and the only reason to know about it is if you are reading `mincore` output and
 wondering why a compaction no longer moves the number.
+
+## Where edges come in
+
+Two shapes, and the difference is not mainly about speed.
+
+**`POST /v1/edges` (and the gRPC equivalent) mints its own offset.** The worker
+holds a counter and hands out the next number. That works, and it is what the
+simulator and the tests use, but the numbering is *private to one process*. The
+committed watermark is measured in offsets, so a snapshot saying "committed
+through 4 001 337" only means something to the worker whose counter produced it.
+A replacement worker reading that watermark is interpreting a number from a
+sequence it never generated. It happens to work when exactly one worker ever
+produces the stream, from an unbroken sequence of events, and it is silently
+wrong otherwise.
+
+**`--edge-log` takes the offset from the log.** Kafka assigns it once, at the
+broker, and every consumer sees the same number against the same record. Now the
+watermark means the same thing everywhere: restart is "resume after it", and the
+records replayed are exactly the ones applied but never committed. This is the
+shape a production deployment should have, and the reason the flag exists is
+correctness before throughput.
+
+The file log stands in for a topic honestly, because it has the properties that
+matter: **offset = line number**, assigned by something other than the consumer,
+stable across readers and restarts, and replayable by seeking. It does not
+simulate broker election, rebalancing, or retention dropping the prefix from
+under a slow consumer.
+
+```bash
+LINKS=50000000 OUT=edges.ndjson cargo run --release --example edge_log
+blaze --edge-log edges.ndjson                      # streaming: follows the tail
+blaze --edge-log edges.ndjson --edge-log-follow false   # batch: load, flush, serve
+```
+
+**Injection is refused (409 / `FAILED_PRECONDITION`) while `--edge-log` is set.**
+An injected edge has no log position, so accepting one means minting an offset
+into the space the log is already assigning. The two numberings would collide and
+the watermark would stop meaning "everything up to here is in the log". Produce
+to the log instead.
+
+### What it costs per edge
+
+| path | per edge | measured |
+|---|---|---|
+| `--edge-log` | **3.9 µs** | 2M records drained in 7.8s by the release binary |
+| `POST /v1/edges` | 510 µs per connection | 0.51 ms p50, 0.86 ms p99, localhost |
+
+Read that as a *structural* difference, not a benchmark of the HTTP server. The
+server is fine — half a millisecond, and it scales across connections. But every
+edge costs a request, so reaching the log path's rate means roughly 130
+concurrent producers doing nothing but posting single edges. The log amortises
+the same work over a 10 000-record poll.
+
+The 3.9 µs figure is the ingest path only: `--flush-interval-secs` was set past
+the run, so no flush or compaction happened inside the window. It is the ceiling,
+not a sustained rate — the soak numbers below are what sustained looks like once
+tiering and percolation are in play.
+
+### One partition
+
+blaze tracks a **scalar** watermark, so it consumes one ordered log. Against
+Kafka that means a single-partition topic.
+
+Multiple partitions are not blocked by anything fundamental — DSU merges commute,
+so partitions would be independently correct — but the watermark would have to
+become a map of partition to offset in `SnapshotMeta`, and every comparison
+against it a per-partition comparison. Until that exists, the consumer takes one
+partition and says so rather than interleaving two and producing a watermark that
+means nothing.
+
+## Retention
+
+Nothing on the commit path deletes anything. A tick writes new objects and
+publishes a snapshot naming them; the runs the merge consumed are simply no
+longer named. So an unswept table does not grow at the rate of your data, it
+grows at the *write-amplification* rate — `amp ≈ log_T(F)`, measured 4.96x at
+the default fanout. On a real merged table the sweep reclaims **96% of run
+bytes**; mid-soak the live figure was 80% and still climbing.
+
+**Retention is on by default** (`--retention-interval-secs 3600`), so a worker
+that has been up an hour will start deleting objects. Set it to `0` to keep the
+old never-delete behaviour.
+
+What a sweep keeps is a *reachability closure*, not a list:
+
+1. Retain the newest `--keep-snapshots` snapshots, plus every snapshot committed
+   within `--keep-snapshots-hours`.
+2. Close that set over snapshot parentage — a legacy `SequencesOnly` snapshot
+   carries no run set of its own and is only meaningful with the chain behind it,
+   so retaining one retains its whole chain.
+3. The live object set is every `puffin_path`, `data_files` entry and run named
+   by anything in the closure.
+4. Delete everything else under the table prefix — objects first, then the
+   metadata that referenced them, so a crash mid-sweep leaves unreferenced
+   objects rather than a snapshot pointing at nothing.
+
+`--retention-grace-secs` is the safety property and the one number worth
+understanding. Between a tick uploading its objects and committing the snapshot
+that names them, those objects are reachable from nothing at all. Without a grace
+window a concurrent sweep would collect an in-flight commit's own inputs, and the
+commit would then publish a snapshot naming files that no longer exist. **The
+grace window must exceed your slowest merge-and-commit.** An hour is generous for
+a normal table; raise it if merges take longer than that, and understand that
+lowering it trades a correctness margin for storage.
+
+The sweep is leader-gated only to avoid duplicated work — it is idempotent and
+safe to run from any worker — and runs on its own loop rather than inside the
+tick, so it can never slow a commit down. A sweep that fails logs and retries
+next period.
+
+The thing to know if you are watching this: deleting a live run corrupts nothing
+you can see. The mappings stay valid, the catalog stays parseable, and the loss
+surfaces only when a worker hydrates from scratch — the one moment nobody is
+watching. `tests/retention.rs` therefore asserts against a cold start rather than
+against a byte count.
 
 ## The startup preflight
 

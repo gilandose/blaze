@@ -56,6 +56,7 @@ fn make_flusher(
         elector: Arc::new(StaticElector(leader)),
         table_prefix: prefix,
         worker_id: worker.into(),
+        stream: None,
         // RAM mode: the memtable is the state, so there is nothing to fold
         // into and nowhere to fold it.
         base_dir: None,
@@ -194,7 +195,7 @@ fn test_app(leader: bool) -> (AppState, mpsc::Receiver<EdgeEvent>) {
             forest,
             buffer: pipeline.buffer.clone(),
             pipeline_stats: pipeline.stats.clone(),
-            ingest_tx: tx,
+            ingest_tx: Some(tx),
             elector,
             worker_id: "api-test".into(),
             started_at: Instant::now(),

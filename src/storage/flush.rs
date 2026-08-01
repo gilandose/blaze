@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use crate::core::{RoutingBase, ScopedForest};
+use crate::core::{RoutingBase, ScopedForest, StreamId, StreamPosition};
 use crate::ha::LeaderElector;
 use crate::ingest::EdgeBuffer;
 use crate::storage::base::PuffinBase;
@@ -37,6 +37,11 @@ pub struct Flusher {
     pub elector: Arc<dyn LeaderElector>,
     pub table_prefix: Path,
     pub worker_id: String,
+    /// Which stream the committed offsets are measured in, recorded on every
+    /// snapshot. `None` when nothing authoritative names one — an API-fed worker
+    /// mints its own offsets, and claiming a stream identity for them would
+    /// assert a portability they do not have.
+    pub stream: Option<StreamId>,
     /// Where to write folded routing bases. `None` = RAM mode: the memtable
     /// *is* the state, so there is nothing to fold it into.
     pub base_dir: Option<std::path::PathBuf>,
@@ -558,6 +563,11 @@ impl Flusher {
             sequence,
             committed_at_ms: now_ms(),
             watermark,
+            // Stage 1 of design 010: the flush loop still consumes one ordered
+            // stream, so the position it commits has a single partition. What
+            // changed is that the *catalog* can now describe more.
+            position: StreamPosition::single(watermark),
+            stream: self.stream.clone(),
             data_files: vec![DataFileMeta {
                 path: data_path.to_string(),
                 rows,
@@ -572,6 +582,15 @@ impl Flusher {
             format_version: run_set_format(&runs),
             runs,
         };
+        // Every partition must be at or ahead of where the last snapshot left
+        // it. Checked here rather than inside `commit` because `latest` is
+        // already in hand, so it costs no extra round trip. A failure means
+        // something else is committing to this table — the put-if-absent stops
+        // two workers taking the *same* sequence, and this stops one from
+        // rewinding the stream underneath the other.
+        if let Some(previous) = latest.as_ref() {
+            meta.advances_from(previous)?;
+        }
         match self.catalog.commit(&meta).await? {
             CommitOutcome::Committed => {
                 self.buffer.drop_committed(watermark);
@@ -814,6 +833,8 @@ impl Flusher {
             sequence,
             committed_at_ms: now_ms(),
             watermark,
+            position: StreamPosition::single(watermark),
+            stream: self.stream.clone(),
             data_files: vec![],
             puffin_path: puffin_path.to_string(),
             committer: self.worker_id.clone(),

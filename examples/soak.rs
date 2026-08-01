@@ -20,8 +20,14 @@
 //! would confound every other column. Default 1.8 links/node matches the
 //! production profile this was sized against.
 //!
+//! `GLOBAL_PCT` is the sharpest knob here. A global edge merges once in the
+//! shared tier and then has to notify every scope keyed on the roots it joined,
+//! so its cost scales with scopes-per-root; a scoped edge touches exactly one
+//! overlay and notifies nobody. Setting it to 0 removes `apply_global` from the
+//! write path entirely.
+//!
 //! Tunables via env: `LINKS`, `LINKS_PER_NODE`, `SCOPES`, `CHECKPOINT`,
-//! `MAX_LAYERS`, `FANOUT`, `MIN_DISK_GB`.
+//! `MAX_LAYERS`, `FANOUT`, `MIN_DISK_GB`, `GLOBAL_PCT`.
 //!
 //! Run: `cargo run --release --example soak`
 
@@ -118,6 +124,7 @@ async fn main() {
     let scopes: u32 = env("SCOPES", 3_000);
     let checkpoint: u64 = env("CHECKPOINT", 5_000_000);
     let min_disk: f64 = env("MIN_DISK_GB", 3.0);
+    let global_pct: u32 = env("GLOBAL_PCT", 30);
     let nodes = ((links as f64) / per_node) as u64;
 
     let dir = tempfile::tempdir().unwrap();
@@ -144,7 +151,7 @@ async fn main() {
             let mut offset = 0u64;
             while offset < links && !stop.load(Ordering::Relaxed) {
                 for _ in 0..10_000 {
-                    let visibility = if rng.random_range(0..100u32) < 30 {
+                    let visibility = if rng.random_range(0..100u32) < global_pct {
                         Visibility::Global
                     } else {
                         Visibility::Scoped(
@@ -177,6 +184,7 @@ async fn main() {
         elector: Arc::new(StaticElector(true)),
         table_prefix: prefix,
         worker_id: "soak".into(),
+        stream: None,
         base_dir: Some(cache.path().to_path_buf()),
         fold_after_links: u64::MAX,
         max_delta_layers: env("MAX_LAYERS", 12),
@@ -188,7 +196,7 @@ async fn main() {
     };
 
     println!(
-        "{}M links at {per_node} links/node ({}M nodes), {scopes} scopes, fanout {}, ceiling {}\n",
+        "{}M links at {per_node} links/node ({}M nodes), {scopes} scopes, {global_pct}% global, fanout {}, ceiling {}\n",
         links / 1_000_000,
         nodes / 1_000_000,
         env("FANOUT", 10),
