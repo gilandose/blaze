@@ -13,7 +13,7 @@ pub mod puffin;
 pub mod registry;
 pub mod tier;
 
-pub use base::{PuffinBase, RegistryIter};
+pub use base::{PuffinBase, RegistryIter, ScanReader};
 pub use catalog::{CommitOutcome, DataFileMeta, RunMeta, RunSet, SnapshotCatalog, SnapshotMeta};
 pub use codec::WriteOptions;
 pub use compact::{CompactionStats, compact_layers};

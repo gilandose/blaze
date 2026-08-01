@@ -18,6 +18,7 @@ dashmap = "6.2.1"
 futures = "0.3.33"
 k8s-openapi = { version = "0.28.0", features = ["latest"], optional = true }
 kube = { version = "4.0.0", default-features = false, features = ["client", "rustls-tls"], optional = true }
+libc = "0.2.189"
 memmap2 = "0.9.11"
 object_store = { version = "0.14.1", features = ["aws"] }
 parking_lot = "0.12.5"
