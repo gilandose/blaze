@@ -1,0 +1,126 @@
+name: Release
+
+# Cutting a release is `git tag v0.1.0 && git push origin v0.1.0`. Everything
+# below is downstream of that tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One entry today. It is a matrix so that adding a target is a line rather
+      # than a restructure — deliberately *not* pre-populated with aarch64 or
+      # musl, because neither has ever been built or run for this project and a
+      # release workflow that fails on the first tag is worse than one that ships
+      # fewer artifacts. Linux x86_64 is also the only platform the code is
+      # tested on: the `posix_fadvise` paths are compiled out elsewhere and that
+      # fallback has never executed.
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The tag is the version people will quote in bug reports, so it had
+      # better be the version the binary reports. A mismatch here is a mistake
+      # that is very hard to notice afterwards and trivial to catch now.
+      - name: Tag matches Cargo.toml
+        run: |
+          crate="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          tagged="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tagged" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+        id: version
+
+      # A release is rare and expensive to get wrong, so the suite runs again
+      # here rather than trusting that the tag was cut from a green commit.
+      - name: cargo test
+        run: cargo test --all-targets
+
+      - name: cargo test --features k8s
+        run: cargo test --features k8s --lib
+
+      # Built with `k8s`: without it `--election k8s` is a runtime error, and
+      # leader election is not an optional part of the story a release tells.
+      - name: Build
+        run: cargo build --release --locked --features k8s --target ${{ matrix.target }} --bin blaze
+
+      - name: Package
+        run: |
+          name="blaze-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/blaze" "dist/$name/"
+          strip "dist/$name/blaze" || true
+          cp README.md CHANGELOG.md ARCHITECTURE.md "dist/$name/"
+          cp docs/TUNING.md "dist/$name/TUNING.md"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # `gh` is preinstalled on the runner, so this needs no third-party action
+      # in the path of publishing a binary.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$(python3 - <<'PY'
+          import re, pathlib, os
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          # The section for this version, up to the next version heading.
+          m = re.search(rf"^## \[{re.escape(tag)}\].*?$(.*?)(?=^## \[|\Z)",
+                        text, re.S | re.M)
+          print((m.group(1).strip() if m else "See CHANGELOG.md."))
+          PY
+          )"
+          printf '%s\n\n---\n\nBuilt from `%s`. Verify with the accompanying `.sha256`.\n' \
+            "$notes" "$GITHUB_SHA" > notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            dist/*.tar.gz dist/*.sha256
