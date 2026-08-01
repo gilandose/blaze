@@ -15,7 +15,7 @@
 use memmap2::Mmap;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::core::base::{BaseStats, RoutingBase, ScopeList};
@@ -103,6 +103,8 @@ struct PairTable {
 }
 
 impl PairTable {
+    /// Parse the header only. The sparse index is built afterwards, for every
+    /// table at once — see [`PuffinBase::build_indexes`].
     fn parse(data: &[u8], range: std::ops::Range<usize>) -> anyhow::Result<Self> {
         let payload = &data[range.clone()];
         anyhow::ensure!(payload.len() >= 8, "pair table truncated (no header)");
@@ -112,14 +114,14 @@ impl PairTable {
             "pair table length mismatch: header says {count} pairs, payload has {} bytes",
             payload.len() - 8
         );
-        let mut table = Self {
+        let table = Self {
             start: range.start + 8,
             count,
             index: None,
         };
         // One key read per block, so open time stays O(count/256) — a strided
-        // scan, not a deserialization.
-        table.index = SparseIndex::build(count, PAIR_STRIDE, |i| table.key_at(data, i));
+        // scan, not a deserialization. Cheap in CPU either way; the difference
+        // between the two sources is entirely about what ends up resident.
         Ok(table)
     }
 
@@ -292,10 +294,87 @@ impl Iterator for RegistryIter<'_> {
     }
 }
 
+/// How a full-table sweep reads its bytes.
+///
+/// Point lookups always go through the mapping — that is the whole design. This
+/// only decides how *compaction* reads, and it is a separate question because a
+/// sweep touches every page exactly once and a lookup touches almost none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanReader {
+    /// Read through a file descriptor, then `posix_fadvise(DONTNEED)` the range.
+    ///
+    /// Two effects, and the first matters more than the name suggests: bytes
+    /// read with `read(2)` never enter this process's page tables, so they never
+    /// count toward RSS and stay droppable. `DONTNEED` skips pages that are
+    /// mapped by anyone, so it would achieve very little on its own — it works
+    /// here precisely because the sweep no longer maps what it reads.
+    #[default]
+    Buffered,
+    /// Sweep through the mapping, advising `MADV_SEQUENTIAL` for the duration.
+    ///
+    /// Correct, and what this did originally, but it faults the whole table in
+    /// and leaves it resident: measured 8.4 GB RSS against a 5.4 GB base. Those
+    /// pages are also the most recently touched in the process, so LRU prefers
+    /// to evict the query working set over them — a recency inversion, not a
+    /// leak. Kept because it is the fallback when there is no file to reopen,
+    /// and because it is the comparator in `examples/compaction_reader`.
+    Mapped,
+}
+
+/// Bytes per `read(2)` during a sweep. A whole number of pairs at both strides,
+/// and large enough that the syscall is not the cost.
+const SCAN_CHUNK: usize = 1 << 20;
+
+/// `posix_fadvise`, where it exists.
+///
+/// This is the fd-side counterpart of `madvise`, and the reason the sweep can
+/// drop its own pages at all. `MADV_DONTNEED` on the mapping would be unsound:
+/// queries hold `&[u8]` borrows into it concurrently, and tearing pages out from
+/// under a live borrow is UB in Rust's model even though a read-only mapping of
+/// an immutable file would refault identical bytes. An fd has no borrows
+/// pointing into it, so there is no aliasing question to answer.
+#[cfg(target_os = "linux")]
+fn fadvise(file: &File, offset: usize, len: usize, advice: libc::c_int) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` is alive for the call, so the fd is valid. `posix_fadvise`
+    // only consults kernel-side page-cache state for the range; it cannot touch
+    // this process's address space, which is exactly what makes it safe here.
+    let rc = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset as libc::off_t,
+            len as libc::off_t,
+            advice,
+        )
+    };
+    // Advisory by definition — a filesystem that declines is not an error.
+    if rc != 0 {
+        debug!(rc, advice, "posix_fadvise declined");
+    }
+}
+
+/// No equivalent on macOS (`F_NOCACHE` is per-fd, not per-range) or Windows.
+/// The buffered reader is still worth having there: not populating the page
+/// tables is most of the win, and that part is portable.
+#[cfg(not(target_os = "linux"))]
+fn fadvise(_file: &File, _offset: usize, _len: usize, _advice: i32) {}
+
+#[cfg(target_os = "linux")]
+const FADV_SEQUENTIAL: libc::c_int = libc::POSIX_FADV_SEQUENTIAL;
+#[cfg(target_os = "linux")]
+const FADV_DONTNEED: libc::c_int = libc::POSIX_FADV_DONTNEED;
+#[cfg(not(target_os = "linux"))]
+const FADV_SEQUENTIAL: i32 = 0;
+#[cfg(not(target_os = "linux"))]
+const FADV_DONTNEED: i32 = 0;
+
 /// A [`RoutingBase`] served from an mmap'd Puffin file.
 #[derive(Debug)]
 pub struct PuffinBase {
     mmap: Mmap,
+    /// Where the mapping came from, so a sweep can reopen it as a plain file.
+    path: PathBuf,
+    reader: ScanReader,
     shared: Option<PairTable>,
     overlays: BTreeMap<ScopeId, PairTable>,
     registry: Option<RegistryTable>,
@@ -317,6 +396,16 @@ pub struct PuffinBase {
 impl PuffinBase {
     /// Map a Puffin routing snapshot from local disk.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with_reader(path, ScanReader::default())
+    }
+
+    /// As [`PuffinBase::open`], choosing how full-table sweeps read.
+    ///
+    /// Either way the tables' sparse indexes are built by reading the file
+    /// rather than by walking the mapping, so a freshly opened base is *cold*:
+    /// pages arrive from the lookups that actually need them. That is what the
+    /// disk-backed mode always claimed and did not do.
+    pub fn open_with_reader(path: &Path, reader: ScanReader) -> anyhow::Result<Self> {
         let file = File::open(path)
             .map_err(|e| anyhow::anyhow!("open routing base {}: {e}", path.display()))?;
         // SAFETY: the mapping is read-only and the file is an immutable
@@ -329,10 +418,10 @@ impl PuffinBase {
         if let Err(e) = mmap.advise(memmap2::Advice::Random) {
             debug!(error = %e, "MADV_RANDOM unavailable; readahead left at default");
         }
-        Self::from_mmap(mmap)
+        Self::build(mmap, path.to_path_buf(), reader, &file)
     }
 
-    fn from_mmap(mmap: Mmap) -> anyhow::Result<Self> {
+    fn build(mmap: Mmap, path: PathBuf, reader: ScanReader, file: &File) -> anyhow::Result<Self> {
         let index = puffin::read_index(&mmap)?;
         let mut shared = None;
         let mut overlays = BTreeMap::new();
@@ -381,6 +470,8 @@ impl PuffinBase {
 
         let mut base = Self {
             mmap,
+            path,
+            reader,
             shared,
             overlays,
             registry,
@@ -396,6 +487,7 @@ impl PuffinBase {
             );
             base.fallback_registry = Some(base.build_fallback_registry());
         }
+        base.build_indexes(file)?;
         let stats = base.stats();
         debug!(
             sequence = stats.sequence,
@@ -407,6 +499,103 @@ impl PuffinBase {
             "mapped routing base"
         );
         Ok(base)
+    }
+
+    /// Build every table's sparse index in **one forward pass over the file**,
+    /// then hand the whole file's pages back.
+    ///
+    /// Building an index samples the first key of each 4 KiB block — one read
+    /// per page of the table. Done through the mapping, that faults the entire
+    /// base in at open and *pins* it: measured 100% of a 330 MB base resident
+    /// before a single lookup, and `posix_fadvise(DONTNEED)` cannot reclaim a
+    /// page any process has mapped. So a disk-backed base was fully resident
+    /// from the moment it opened, which is precisely what it claimed not to be.
+    ///
+    /// One pass rather than one per table, and one `DONTNEED` at the end rather
+    /// than 3,001 of them, because ranged advice does not compose with
+    /// readahead: a table's own range gets dropped, and then the *next* table's
+    /// read pulls those same pages straight back. With per-table advice the base
+    /// still ended up 91% resident; with a single pass it is 2%.
+    fn build_indexes(&mut self, file: &File) -> anyhow::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        // Every sample point, in file order: (absolute offset, table id).
+        // Tables are laid out in blob order, but nothing promises that, and a
+        // forward-only reader needs them sorted.
+        let block = PAGE_BYTES / PAIR_STRIDE;
+        let mut wanted: Vec<(usize, usize)> = Vec::new();
+        let mut tables: Vec<&mut PairTable> = self
+            .shared
+            .iter_mut()
+            .chain(self.overlays.values_mut())
+            .collect();
+        let mut counts = Vec::with_capacity(tables.len());
+        for (id, table) in tables.iter().enumerate() {
+            let samples = if table.count <= block {
+                0
+            } else {
+                table.count.div_ceil(block)
+            };
+            counts.push(samples);
+            for i in 0..samples {
+                wanted.push((table.start + i * PAGE_BYTES, id));
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        wanted.sort_unstable();
+
+        let mut keys: Vec<Vec<NodeId>> = counts.iter().map(|n| Vec::with_capacity(*n)).collect();
+
+        // Slide a window forward over the span the samples cover, keeping eight
+        // bytes of overlap so a sample straddling a chunk boundary still reads
+        // as one value.
+        let span_start = wanted[0].0;
+        let span_end = wanted.last().unwrap().0 + 8;
+        let mut src = file;
+        fadvise(file, span_start, span_end - span_start, FADV_SEQUENTIAL);
+        src.seek(SeekFrom::Start(span_start as u64))?;
+
+        let mut buf = vec![0u8; SCAN_CHUNK.max(16)];
+        let mut base_off = span_start;
+        let mut filled = 0usize;
+        let mut next = 0usize;
+        while next < wanted.len() {
+            // Refill, preserving any tail bytes a straddling sample needs.
+            let keep = filled.min(8);
+            buf.copy_within(filled - keep..filled, 0);
+            base_off += filled - keep;
+            let want = (span_end - (base_off + keep)).min(buf.len() - keep);
+            if want == 0 {
+                break;
+            }
+            src.read_exact(&mut buf[keep..keep + want])?;
+            filled = keep + want;
+
+            while next < wanted.len() {
+                let (off, id) = wanted[next];
+                if off + 8 > base_off + filled {
+                    break;
+                }
+                let at = off - base_off;
+                keys[id].push(u64::from_le_bytes(buf[at..at + 8].try_into().unwrap()));
+                next += 1;
+            }
+        }
+
+        for (id, table) in tables.iter_mut().enumerate() {
+            let first_keys = std::mem::take(&mut keys[id]);
+            if first_keys.len() == counts[id] && counts[id] > 0 {
+                table.index = Some(SparseIndex { block, first_keys });
+            }
+        }
+
+        // The point of the exercise: nothing this pass read should outlive it.
+        // Queries repopulate what they touch, which is a small fraction of a
+        // narrowed block each.
+        fadvise(file, 0, 0, FADV_DONTNEED);
+        Ok(())
     }
 
     /// Rebuild `root -> scopes` by scanning overlay members and resolving each
@@ -429,15 +618,101 @@ impl PuffinBase {
         out
     }
 
-    /// Sweep one table front-to-back, telling the kernel so for the duration.
-    /// The mapping is advised `MADV_RANDOM` for point lookups, which is
-    /// exactly wrong for compaction's full scan — and leaving it that way
-    /// would cost one fault per page instead of one per readahead window.
+    /// Sweep one table front-to-back.
+    ///
+    /// This is compaction's read path, and it is deliberately not the lookup
+    /// path. A lookup touches one narrowed block of the mapping; a sweep touches
+    /// every page exactly once and then never again, which is the worst possible
+    /// thing to leave in a cache — see [`ScanReader`] for what that costs and why
+    /// reading through an fd fixes it.
     fn scan(&self, table: &PairTable, f: &mut dyn FnMut(NodeId, NodeId)) {
         let len = table.count * PAIR_STRIDE;
         if len == 0 {
             return;
         }
+        // Open before emitting anything. A failed open can fall back to the
+        // mapping safely because no pair has been handed to `f` yet; a failure
+        // *during* the read cannot, since there is no way to un-emit.
+        if self.reader == ScanReader::Buffered {
+            match File::open(&self.path) {
+                Ok(file) => return self.scan_fd(&file, table, len, f),
+                Err(e) => warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "could not reopen the base for a buffered sweep; reading through the mapping"
+                ),
+            }
+        }
+        self.scan_mapped(table, len, f);
+    }
+
+    /// Read the table's byte range with ordinary buffered I/O, then drop the
+    /// pages it brought in.
+    ///
+    /// # Panics
+    ///
+    /// On a read error partway through. The file is an immutable local cache
+    /// artifact that opened successfully a moment ago, so this means the device
+    /// is gone — and the mapped path answers that same condition with SIGBUS,
+    /// which is strictly less informative. There is no recovery available here
+    /// either way: `f` has already been handed part of the table and nothing can
+    /// take it back.
+    fn scan_fd(
+        &self,
+        file: &File,
+        table: &PairTable,
+        len: usize,
+        f: &mut dyn FnMut(NodeId, NodeId),
+    ) {
+        use std::io::{Read, Seek, SeekFrom};
+        fadvise(file, table.start, len, FADV_SEQUENTIAL);
+
+        // Unbuffered, for the same reason as `sample_keys_from_file`: a reader
+        // that fills its capacity reads past the range it was asked for, and
+        // those extra pages are exactly the ones `DONTNEED` will not cover.
+        let mut src = file;
+        let sought = src.seek(SeekFrom::Start(table.start as u64));
+        let mut buf = vec![0u8; SCAN_CHUNK.min(len)];
+        let mut left = len;
+        let read = sought.and_then(|_| {
+            while left > 0 {
+                // `len` and `SCAN_CHUNK` are both whole numbers of pairs, so
+                // `want` always is too and no pair straddles two reads.
+                let want = left.min(SCAN_CHUNK);
+                src.read_exact(&mut buf[..want])?;
+                for pair in buf[..want].chunks_exact(PAIR_STRIDE) {
+                    f(
+                        u64::from_le_bytes(pair[..8].try_into().unwrap()),
+                        u64::from_le_bytes(pair[8..].try_into().unwrap()),
+                    );
+                }
+                left -= want;
+            }
+            std::io::Result::Ok(())
+        });
+        if let Err(e) = read {
+            panic!(
+                "routing base became unreadable {} bytes into a {len}-byte sweep: {e}",
+                len - left
+            );
+        }
+
+        // The point of the exercise: hand back the page cache this sweep just
+        // filled, before it pushes out the pages queries are actually using.
+        fadvise(file, table.start, len, FADV_DONTNEED);
+    }
+
+    /// Sweep through the mapping, telling the kernel so for the duration.
+    ///
+    /// The mapping is advised `MADV_RANDOM` for point lookups, which is exactly
+    /// wrong for a full scan — leaving it that way would cost one fault per page
+    /// instead of one per readahead window.
+    ///
+    /// Nothing drops the pages afterwards, and nothing can: `MADV_COLD` is the
+    /// right tool and memmap2 0.9.11 does not expose it, while `MADV_DONTNEED`
+    /// is unsound under the `&[u8]` borrows concurrent queries hold into this
+    /// same mapping. That is the whole reason [`ScanReader::Buffered`] exists.
+    fn scan_mapped(&self, table: &PairTable, len: usize, f: &mut dyn FnMut(NodeId, NodeId)) {
         let _ = self
             .mmap
             .advise_range(memmap2::Advice::Sequential, table.start, len);
@@ -445,29 +720,6 @@ impl PuffinBase {
         let _ = self
             .mmap
             .advise_range(memmap2::Advice::Random, table.start, len);
-        // Deliberately *not* dropping the swept range, despite it being pure
-        // cache pollution: a compaction reads each of these pages exactly once
-        // and leaves all of them resident (measured, 8.4 GB RSS against a 5.4 GB
-        // base), and because they are the most recently touched, LRU prefers to
-        // evict the query working set over them. Recency inversion, not a leak.
-        //
-        // The right tool is `MADV_COLD`, which deprioritizes pages for reclaim
-        // without freeing them or changing any observable byte — safe to issue
-        // while other threads read the mapping. memmap2 0.9.11 does not expose
-        // it.
-        //
-        // `MADV_DONTNEED` *is* exposed, but only via `unsafe
-        // unchecked_advise_range`, and it is genuinely unsound here: queries hold
-        // `&[u8]` borrows into this same mapping concurrently with a compaction
-        // sweep, and freeing pages under a live borrow is UB in Rust's model even
-        // though a read-only mapping of an immutable file would refault identical
-        // bytes. Not worth an unsafe block whose precondition we cannot
-        // establish.
-        //
-        // The safe fix is to stop sweeping through the mapping at all — have
-        // compaction read layers with ordinary buffered file I/O and
-        // `posix_fadvise(DONTNEED)` the fd, which involves no borrows. That is a
-        // real change to the compaction reader, tracked in docs/design/007.
     }
 
     /// Number of pairs in the shared table.
@@ -846,6 +1098,49 @@ mod tests {
         assert_eq!(base.scopes_for_root(105).as_slice(), &[7]);
         assert_eq!(base.scopes_for_root(2).as_slice(), &[7]);
         assert_eq!(base.scopes_for_root(9).as_slice(), &[2999]);
+    }
+
+    /// The two readers must be indistinguishable to a caller. Compaction merges
+    /// these streams positionally, so a single extra, missing or reordered pair
+    /// would produce a base that disagrees with the forest — and the buffered
+    /// reader decodes from a byte buffer rather than the mapping, which is
+    /// exactly the kind of change that goes wrong at a chunk boundary.
+    ///
+    /// Sized past `SCAN_CHUNK` so the sweep really does span several reads.
+    #[test]
+    fn both_readers_yield_the_same_pairs() {
+        const N: u64 = 200_000;
+        let snap = ForestSnapshot {
+            global: (1..=N).map(|i| (i * 3, i)).collect(),
+            scopes: vec![(7, (1..=N).map(|i| (i * 5, i)).collect())],
+        };
+        let mut blobs = codec::snapshot_to_blobs(&snap, 7, WriteOptions::default());
+        blobs.retain(|b| b.blob_type != codec::REGISTRY_BLOB_TYPE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.puffin");
+        std::fs::write(&path, puffin::write(&blobs, Map::new())).unwrap();
+
+        let collect = |reader| {
+            let base = PuffinBase::open_with_reader(&path, reader).unwrap();
+            let mut shared = Vec::new();
+            base.for_each_shared_pair(&mut |k, v| shared.push((k, v)));
+            let mut overlay = Vec::new();
+            base.for_each_overlay_pair(7, &mut |k, v| overlay.push((k, v)));
+            (shared, overlay)
+        };
+        let (buffered_shared, buffered_overlay) = collect(ScanReader::Buffered);
+        let (mapped_shared, mapped_overlay) = collect(ScanReader::Mapped);
+
+        // Big enough to span several reads, or the boundary case is untested.
+        assert!(
+            buffered_shared.len() * PAIR_STRIDE > 3 * SCAN_CHUNK,
+            "table is only {} bytes; raise N",
+            buffered_shared.len() * PAIR_STRIDE
+        );
+        assert_eq!(buffered_shared, mapped_shared);
+        assert_eq!(buffered_overlay, mapped_overlay);
+        assert_eq!(buffered_shared.len(), N as usize);
+        assert_eq!(buffered_overlay.len(), N as usize);
     }
 
     #[test]

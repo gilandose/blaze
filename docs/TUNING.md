@@ -25,6 +25,15 @@ under pressure. The unreclaimable part was **~30 MB**. On a small box you do not
 OOM, you take more page faults; correctness is unaffected and latency degrades
 with cache-miss rate.
 
+**That last row used to be aspirational.** Building a table's sparse index samples
+the first key of every 4 KiB block — one read per *page* — so doing it through the
+mapping faulted the whole base in the moment it opened, and pinned it there:
+`posix_fadvise(DONTNEED)` cannot reclaim a page any process has mapped. A
+"disk-backed" base was therefore fully resident from startup. Indexes are now
+built in one pass over the file instead, and a freshly opened 330 MB base sits at
+**18% resident** rather than 100%, filling in from the lookups that actually need
+it. See `examples/compaction_reader`.
+
 So there are two budgets:
 
 - **Heap budget** (hard): filters + sparse index + memtable. Exceed it and you OOM.
@@ -191,6 +200,30 @@ ingest cannot outrun compaction and bury you in runs.
 `!force && links < fold_after_links`, and a leader always passes `force = true`
 because it needs a layer to commit. On the writer, memtable size is governed by
 `--flush-interval-secs`.
+
+## Compaction and the page cache
+
+A compaction sweep is the worst possible cache citizen: it reads every page of
+every run it merges, exactly once, and never again. Read through the mapping,
+all of it stays resident — and because those pages are the most recently touched
+in the process, LRU prefers evicting the *query* working set over them. Recency
+inversion, not a leak.
+
+Sweeps therefore read through a file descriptor and `posix_fadvise(DONTNEED)`
+the range afterwards. Measured on a 330 MB base:
+
+| sweep | resident after | warm lookup |
+|---|---|---|
+| through the mapping | 330 MB (100%) | 0.32 -> 0.36 µs |
+| through an fd | 82 MB (25%) | 0.34 -> 0.37 µs |
+
+The second column is the one to read twice. **The query working set survives.**
+Pages a lookup has touched are mapped into the process, and `DONTNEED` cannot
+reclaim a mapped page — so the sweep gives back what it read and leaves what
+queries are using, which is the behaviour `MADV_COLD` would provide if memmap2
+exposed it. Nothing is tunable here and nothing needs to be; it is the default
+and the only reason to know about it is if you are reading `mincore` output and
+wondering why a compaction no longer moves the number.
 
 ## The startup preflight
 
