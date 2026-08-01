@@ -45,11 +45,21 @@ struct Args {
     #[arg(long, default_value = "./blaze-data")]
     data_dir: String,
 
-    /// Fold the memtable into a fresh on-disk base once it holds this many
-    /// links (--routing-base disk only). Lower keeps heap smaller at the cost
-    /// of rewriting the base more often; the fold stalls ingest while it runs.
-    #[arg(long, default_value_t = blaze::storage::DEFAULT_FOLD_AFTER_LINKS)]
-    fold_after_links: u64,
+    /// Fold a follower's memtable into a fresh on-disk layer once it holds this
+    /// many links (--routing-base disk only).
+    ///
+    /// Followers only, and the name now says so because the old one did not. A
+    /// leader folds on every tick whatever this is set to: the folded layer is
+    /// what it commits, since each snapshot's Puffin sidecar is that fold, and a
+    /// commit with no layer would leave that sequence with no routing state to
+    /// recover from. Leader fold frequency is therefore pinned to commit
+    /// frequency, and --flush-interval-secs is the knob that bounds a leader's
+    /// memtable.
+    ///
+    /// On a follower: lower keeps heap smaller at the cost of rewriting more
+    /// often, and the fold stalls that worker's ingest while it runs.
+    #[arg(long, default_value_t = blaze::storage::DEFAULT_FOLLOWER_FOLD_AFTER_LINKS)]
+    follower_fold_after_links: u64,
 
     /// Depth ceiling: past this many runs, merge the lowest stretch available
     /// even when no level is due (--routing-base disk only). Higher means rarer
@@ -483,7 +493,7 @@ async fn main() -> anyhow::Result<()> {
         worker_id: worker_id.clone(),
         stream: stream_id.clone(),
         base_dir,
-        fold_after_links: args.fold_after_links,
+        follower_fold_after_links: args.follower_fold_after_links,
         max_delta_layers: args.max_delta_layers,
         tier_fanout: args.tier_fanout,
         write: blaze::storage::WriteOptions {

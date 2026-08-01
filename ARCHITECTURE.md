@@ -364,7 +364,7 @@ So the flush loop **folds**: compact, write the resulting Puffin file locally,
 map it, adopt it as the new base, and drop the memtable — all in one step.
 `ScopedForest::compact_and_fold` holds the union lock across the whole thing,
 because a two-call version would lose anything applied in between. Folds are
-triggered by memtable size (`--fold-after-links`, default 1M) rather than by
+triggered by memtable size (`--follower-fold-after-links`, default 1M) rather than by
 the flush clock, since that is the knob that trades write amplification against
 resident heap. **Every worker folds, leader or not** — a follower serves from
 the same structures and grows at the same rate, so leader-only folding would
@@ -606,7 +606,7 @@ path.
 **Backfill is already tractable.** Measured single-node ingest is **357k links/s**
 through the DSU and **308k/s** with Arrow buffering (`examples/throughput.rs`), so
 2B links is **~1.8 hours**. Memory during a backfill is bounded by the fold
-trigger rather than by state: `--fold-after-links 20000000` holds ~3 GB and folds
+trigger rather than by state: `--follower-fold-after-links 20000000` holds ~3 GB and folds
 ~100 times. Call it 2–3 hours on one node with single-digit GB of RAM.
 
 **Beyond, toward 10B+:** the registry restructure remains the best

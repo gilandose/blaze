@@ -274,7 +274,7 @@ impl Warehouse {
             .into(),
             stream: None,
             base_dir: Some(self.cache.path().to_path_buf()),
-            fold_after_links: fold_after,
+            follower_fold_after_links: fold_after,
             max_delta_layers,
             tier_fanout,
             write,

@@ -60,7 +60,7 @@ fn make_flusher(
         // RAM mode: the memtable is the state, so there is nothing to fold
         // into and nowhere to fold it.
         base_dir: None,
-        fold_after_links: u64::MAX,
+        follower_fold_after_links: u64::MAX,
         max_delta_layers: usize::MAX,
         // No level ever fills and the ceiling is never reached, so nothing merges.
         tier_fanout: usize::MAX,

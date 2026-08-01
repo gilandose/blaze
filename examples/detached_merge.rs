@@ -148,7 +148,7 @@ async fn drive(
         worker_id: "perf".into(),
         stream: None,
         base_dir: Some(cache.path().to_path_buf()),
-        fold_after_links: u64::MAX, // a leader folds every tick regardless
+        follower_fold_after_links: u64::MAX, // a leader folds every tick regardless
         max_delta_layers: env("MAX_LAYERS", 12),
         tier_fanout: env("FANOUT", 4),
         write: blaze::storage::WriteOptions {

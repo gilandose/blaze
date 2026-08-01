@@ -45,10 +45,15 @@ pub struct Flusher {
     /// Where to write folded routing bases. `None` = RAM mode: the memtable
     /// *is* the state, so there is nothing to fold it into.
     pub base_dir: Option<std::path::PathBuf>,
-    /// Fold once the memtable holds at least this many links. Only governs
-    /// workers that are *not* committing — a leader folds every tick, since it
-    /// has to produce a layer to commit anyway.
-    pub fold_after_links: u64,
+    /// Fold once the memtable holds at least this many links.
+    ///
+    /// Governs **followers only**, which is why the name says so. The gate is
+    /// `!force && links < follower_fold_after_links`, and a leader always passes
+    /// `force = true` because the folded layer is what it commits — each
+    /// snapshot's Puffin sidecar *is* that fold. A leader therefore folds every
+    /// tick regardless of this value, and `flush_interval` is what bounds its
+    /// memtable.
+    pub follower_fold_after_links: u64,
     /// Depth ceiling. Past this many runs, merge the lowest stretch available
     /// even when no level is due — lookups and ingest both pay per run, and
     /// cold-start fetches one file each.
@@ -387,7 +392,7 @@ fn merged_level(inputs: &[LocalRun]) -> u8 {
 
 /// Links a memtable may hold before a non-committing worker folds (~50 MB of
 /// DashMap).
-pub const DEFAULT_FOLD_AFTER_LINKS: u64 = 1_000_000;
+pub const DEFAULT_FOLLOWER_FOLD_AFTER_LINKS: u64 = 1_000_000;
 
 /// Delta layers to carry before compacting.
 ///
@@ -1010,7 +1015,7 @@ impl Flusher {
             return Ok(None);
         };
         let links = self.forest.memtable_links();
-        if !force && links < self.fold_after_links {
+        if !force && links < self.follower_fold_after_links {
             return Ok(None);
         }
         std::fs::create_dir_all(dir)?;

@@ -70,7 +70,7 @@ async fn build(ticks: u64, per_tick: u64) -> Table {
         worker_id: "retention".into(),
         stream: None,
         base_dir: Some(cache.path().to_path_buf()),
-        fold_after_links: u64::MAX,
+        follower_fold_after_links: u64::MAX,
         max_delta_layers: 4,
         tier_fanout: 2,
         write: Default::default(),

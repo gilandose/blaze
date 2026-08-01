@@ -21,7 +21,7 @@ pub use compact::{CompactionStats, compact_layers};
 pub use conformance::{ConformanceError, verify_conditional_put};
 pub use filter::{BlockedFilter, DEFAULT_FILTER_BITS};
 pub use flush::{
-    DEFAULT_FOLD_AFTER_LINKS, DEFAULT_MAX_DELTA_LAYERS, Flusher, LocalLayers, LocalRun,
+    DEFAULT_FOLLOWER_FOLD_AFTER_LINKS, DEFAULT_MAX_DELTA_LAYERS, Flusher, LocalLayers, LocalRun,
     PendingMerge, hydrate_from_catalog, open_base_from_catalog,
 };
 pub use layered::LayeredBase;
