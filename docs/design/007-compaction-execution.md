@@ -1,5 +1,12 @@
 # 007 — Where compaction runs: detached, separate process, or separate deployment
 
+> **The page-cache section below is fixed, not open.** "The safe fix is to stop
+> sweeping through the mapping … buffered file I/O and
+> `posix_fadvise(POSIX_FADV_DONTNEED)`" is what shipped
+> (`storage::base`, measured 100% → 25% resident on a 330 MB base). The
+> recommendation ranks deployment shapes partly on that eviction cost, so the
+> case for a separate compaction deployment is weaker than the text implies.
+
 ## First, a clarification: "async" here means detached, not async I/O
 
 The merge is `mmap` reads (page faults) plus CPU plus one large sequential write.

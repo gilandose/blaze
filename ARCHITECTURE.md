@@ -219,7 +219,7 @@ payload:    count:u64 LE, then count × (node:u64 LE, root:u64 LE)
 
 Roots in the payload are canonical (lowest graph id in the component as of
 this snapshot). Unknown blob types are ignored on read — the forward-compat
-hook the delta design (docs/design/001) extends with `*-delta-v1` types.
+hook the delta design (docs/design/001) considered and rejected `*-delta-v1` types; only `blaze-global-dsu-v1` and `blaze-scope-dsu-v1` exist.
 
 ### Snapshot metadata (`metadata/snap-*.json`)
 
@@ -605,7 +605,7 @@ path.
 
 **Backfill is already tractable.** Measured single-node ingest is **357k links/s**
 through the DSU and **308k/s** with Arrow buffering (`examples/throughput.rs`), so
-2B links is **~1.8 hours**. Memory during a backfill is bounded by the fold
+2B links is **~7 hours** — an earlier draft said ~1.8, from the rate the DSU sustains with no base attached; docs/design/006 retracts it. Memory during a backfill is bounded by the fold
 trigger rather than by state: `--follower-fold-after-links 20000000` holds ~3 GB and folds
 ~100 times. Call it 2–3 hours on one node with single-digit GB of RAM.
 

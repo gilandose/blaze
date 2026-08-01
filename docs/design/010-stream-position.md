@@ -44,7 +44,7 @@ fails closed.
 ///
 /// A partition absent from the map has had nothing applied. Offset 0 is
 /// reserved for exactly that meaning, so absent and zero agree.
-pub struct StreamPosition(BTreeMap<PartitionId, u64>);
+pub struct StreamPosition { offsets: BTreeMap<PartitionId, u64> }
 ```
 
 `BTreeMap` rather than `HashMap` so the serialized JSON is deterministic — two
@@ -87,6 +87,9 @@ escape hatch as `--allow-unsafe-commits`: fail closed, name the mismatch, and le
 an operator who knows better override it. Retopicking is a real operation; doing
 it silently is not.
 
+Shipped as `--allow-stream-change`. `stream` is `Option<StreamId>` so a snapshot
+written before this existed declines the check rather than failing it.
+
 `group` is recorded because operators reconcile blaze's watermark against the
 broker's committed offsets, and **those two numbers are supposed to differ**. The
 consumer group's committed offset is a checkpoint the client library advances on
@@ -109,7 +112,7 @@ The scalar appears in ~164 places. They are not 164 decisions; they are six.
 | `EdgeBuffer::append` | `(offset, event)` | `(partition, offset, event)`; per-partition min/max |
 | `Segment` | `min_offset`, `max_offset` | a `StreamPosition` span |
 | Parquet schema | `offset` column | `+ partition` column (`u32`, non-null) |
-| `SnapshotMeta` | `watermark: u64` | `position: StreamPosition`, `stream: StreamId` |
+| `SnapshotMeta` | `watermark: u64` | `position: StreamPosition`, `stream: Option<StreamId>` |
 | `DataFileMeta` | `min_offset`, `max_offset` | per-partition spans |
 | `Pipeline::apply_batch` | one `last` | per-partition last applied |
 | `EdgeBuffer::drop_committed` | `max_offset > watermark` | dominance test, below |

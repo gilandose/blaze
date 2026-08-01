@@ -37,7 +37,7 @@ triggers we have both misbehave here:
 
 | trigger | behaviour at 50 links/s |
 |---|---|
-| layer count > 60 (current default) | fires hourly; rewrites a 75 GB base to absorb 7.5 MB of delta |
+| layer count > 60 (the default when this was written; it is now **24**) | fires hourly; rewrites a 75 GB base to absorb 7.5 MB of delta |
 | delta bytes > 25% of base | fires every ~120 days; by then ~173,000 layers, and every lookup scans them |
 
 Neither is a tuning problem. A single base plus one flat run of deltas has no

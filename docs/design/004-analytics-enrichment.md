@@ -1,5 +1,14 @@
 # 004 — Routing Parquet & DataFusion enrichment
 
+> **Depends on a shape that no longer exists.** This doc keys the routing Parquet
+> on a single base (`routing-<base_seq>-<uuid>.parquet`, written "at compaction
+> time"), but [006](006-tiered-compaction.md) removed the privileged base — there
+> are runs at levels, and full-base merges are months-apart events rather than
+> hourly. The writer side needs rethinking against the run set before this is
+> implementable. The SQL sketch also predates [010](010-stream-position.md): the
+> edge schema now leads with a `partition` column.
+
+
 ## Problem
 
 The Puffin routing blobs are exact and fast for blaze itself, but opaque to
