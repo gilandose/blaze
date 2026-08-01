@@ -44,6 +44,25 @@ curl -X POST localhost:8080/v1/edges \
 Restarting against the same warehouse hydrates the in-memory DSU from the
 latest committed Puffin snapshot — no event replay needed for topology.
 
+## Checking the answers against something we did not write
+
+`tools/cc_oracle.py` grades `scope_root` against
+`scipy.sparse.csgraph.connected_components` on published graphs — Knuth's
+five-letter words (Stanford GraphBase, 1993) and the MUSAE Facebook page-page
+network (Rozemberczki et al., 2019). Every other correctness test here compares
+blaze to something blaze's authors wrote, which catches regressions well and
+shared misconceptions not at all.
+
+```
+pip install scipy numpy
+python3 tools/cc_oracle.py --dataset facebook --global-share 0.15
+```
+
+It checks the exact expected root for every node in every scope, not partitions
+up to relabelling, and it runs both against the in-heap forest and through a real
+flush loop so the answers have to survive folding, tiered merges, compaction and
+layered resolution over mmap'd runs.
+
 ## Routing-state modes
 
 | `--routing-base` | Committed state lives in | Cold start | Use when |
