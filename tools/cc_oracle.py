@@ -394,6 +394,11 @@ def main():
     )
     args = ap.parse_args()
 
+    # Scratch space for generated inputs and per-mode outputs. Created here
+    # rather than in `fetch`, which no longer runs at all for a vendored dataset
+    # — the CI job found that the hard way on a fresh checkout.
+    CACHE.mkdir(parents=True, exist_ok=True)
+
     spec = DATASETS[args.dataset]
     print(f"dataset: {args.dataset} — {spec['cite']}")
     src, dst = LOADERS[args.dataset](fetch(args.dataset))
@@ -434,7 +439,6 @@ def main():
                 )
         else:
             out_file = CACHE / f"{args.dataset}-{mode}-roots.txt"
-            CACHE.mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 ["cargo", "run", "--release", "--quiet", "--example", "oracle",
                  "--", str(edge_file), str(out_file), mode, str(args.scopes)],
