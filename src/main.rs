@@ -16,7 +16,13 @@ use blaze::ingest::{EdgeBuffer, LogSource, Pipeline, SimulatorConfig, run_simula
 use blaze::storage::{Flusher, SnapshotCatalog, hydrate_from_catalog, open_base_from_catalog};
 
 #[derive(Parser, Debug)]
-#[command(name = "blaze", about = "Multi-tenant streaming graph engine")]
+#[command(
+    name = "blaze",
+    about = "Multi-tenant streaming graph engine",
+    // Taken from Cargo.toml, which the release workflow checks against the tag,
+    // so the number in a bug report is the number that was built.
+    version
+)]
 struct Args {
     /// REST API listen address.
     #[arg(long, default_value = "0.0.0.0:8080")]
@@ -290,7 +296,14 @@ async fn main() -> anyhow::Result<()> {
             std::process::id()
         )
     });
-    info!(worker_id, warehouse = %args.warehouse, "starting blaze worker");
+    // Version in the first line of the log, so a support question that starts
+    // with a log paste does not need a second round trip to establish it.
+    info!(
+        worker_id,
+        version = env!("CARGO_PKG_VERSION"),
+        warehouse = %args.warehouse,
+        "starting blaze worker"
+    );
 
     let store = build_store(&args.warehouse)?;
     let table_prefix = if args.warehouse.starts_with("s3://") {

@@ -334,6 +334,36 @@ so the leader must own every partition. A second worker committing is **detected
 — the per-partition monotonicity check rejects a position that moves any
 partition backwards — but detection is not support.
 
+## Leader election
+
+`--election k8s` holds a `coordination.k8s.io/v1` Lease: acquire when absent,
+expired or already ours; renew at a third of the lease duration; and rely on the
+API server's `resourceVersion` optimistic concurrency so two candidates cannot
+both win a term.
+
+The lease duration is the trade. Shorter means a crashed leader is replaced
+sooner and the table is read-only for less time; longer tolerates more API-server
+latency and GC pause before a *live* leader is declared dead and something else
+takes over. The renew interval is derived (duration / 3), so there are three
+chances to renew before expiry.
+
+Three behaviours worth knowing, all of them now tested against a stand-in API
+server (`src/ha/kube_lease.rs` tests):
+
+- **A live lease held by someone else cannot be taken**, however often it is
+  asked for. This is the property everything downstream assumes.
+- **An expired lease is taken over**, and `leaseTransitions` increments — that
+  counter is what distinguishes a stable leader from a flapping one, and renewal
+  deliberately does not touch it.
+- **Losing the `resourceVersion` race is a clean loss**: not leader this round,
+  not an error, and never a silent success. If a 409 read as anything else, two
+  workers could believe they hold the same term — which is exactly the situation
+  the snapshot commit's put-if-absent is the last line of defence against.
+
+A worker that cannot reach an API server logs and runs as a permanent follower,
+so a misconfigured deployment degrades to "nobody writes" rather than "everybody
+does".
+
 ## Retention
 
 Nothing on the commit path deletes anything. A tick writes new objects and

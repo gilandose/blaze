@@ -2,6 +2,9 @@
 name = "blaze"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Multi-tenant streaming graph engine: connected components over a stream of edges, backed by object storage"
+repository = "https://github.com/gilandose/blaze"
 
 [dependencies]
 anyhow = "1.0.104"

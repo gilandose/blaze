@@ -43,7 +43,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: test + k8s feature check
+    name: test + k8s
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -58,8 +58,13 @@ jobs:
       - name: cargo test
         run: cargo test --all-targets
 
-      - name: cargo check --features k8s
-        run: cargo check --features k8s
+      # `--lib` rather than the whole suite: it compiles one extra test binary
+      # instead of eleven, and no integration test touches the k8s feature. This
+      # used to be `cargo check`, which type-checked the leader elector without
+      # ever running it — the thing that decides which worker may write was the
+      # least exercised code in the repository.
+      - name: cargo test --features k8s
+        run: cargo test --features k8s --lib
 
   # Gated behind the `e2e` label on pull requests: it builds the binary in
   # release, starts it, restarts it mid-stream and queries it back, so it costs
