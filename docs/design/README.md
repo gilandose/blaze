@@ -41,11 +41,12 @@ docs below are the design rationale behind those knobs.
 | [006](006-tiered-compaction.md) | Size-tiered compaction + backfill sizing | write amplification, layer count | **implemented** |
 | [007](007-compaction-execution.md) | Where compaction runs (detached / process / deployment) | compaction's cost to serving | **implemented** (detached in-process) |
 | [008](008-rocksdb-counterfactual.md) | Could this have been built on RocksDB? | whether the storage tier had to be written | evaluation |
-| [009](009-registry-encoding.md) | Registry encoding (delta-varint in indexed blocks) | 25-40% of base bytes | designed — **next** |
+| [009](009-registry-encoding.md) | Registry encoding (delta-varint in indexed blocks) | 25-40% of base bytes | **implemented** |
+| [010](010-stream-position.md) | Stream position (per-partition offsets + stream identity) | snapshot metadata cannot describe Kafka | designed — **next** |
 
-006 and 007 are in. Recommended order for what is left: **009** (the registry
-encoding, which supersedes the restructure 006 sketched — measured 4.8-7.1x
-against that proposal's 1.5-2.3x), then 002 folded in with 005's rename and union
+006, 007 and 009 are in. Recommended order for what is left: **010** (per-partition
+stream positions, which is what stands between the current single-partition log
+consumer and a Kafka deployment), then 002 folded in with 005's rename and union
 tier, then 004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
 packed u48 to serve the "well beyond 2B" goal.
 
@@ -69,7 +70,13 @@ model tests enforce most of them and must keep passing:
   a node loses no committed data.
 - **I5 — Exactly-once visibility**: whatever files exist, state becomes
   visible only via the put-if-absent catalog commit; watermarks advance
-  monotonically; sequences are dense.
+  monotonically; sequences are dense. ([010](010-stream-position.md) amends
+  "monotonically" to mean per-partition dominance once the watermark stops
+  being a scalar.)
 - **I6 — Cold-start fidelity**: a worker hydrated from the catalog answers
   exactly what the writer answered at the committed watermark, and keeps
   composing with new merges (registry rebuild).
+- **I7 — Stream identity** (proposed by [010](010-stream-position.md)): a
+  snapshot's offsets are only interpretable against the stream they were
+  committed against. A worker configured for a different stream refuses to
+  start rather than resuming at offsets that mean something else.
