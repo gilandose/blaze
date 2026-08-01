@@ -110,6 +110,7 @@ async fn boot(dir: &std::path::Path, cache: &std::path::Path) -> Worker {
             elector: Arc::new(StaticElector(true)),
             table_prefix: prefix.clone(),
             worker_id: "log-ingest".into(),
+            stream: None,
             base_dir: Some(cache.to_path_buf()),
             fold_after_links: u64::MAX,
             max_delta_layers: 8,

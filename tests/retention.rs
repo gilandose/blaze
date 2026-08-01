@@ -68,6 +68,7 @@ async fn build(ticks: u64, per_tick: u64) -> Table {
         elector: Arc::new(StaticElector(true)),
         table_prefix: prefix.clone(),
         worker_id: "retention".into(),
+        stream: None,
         base_dir: Some(cache.path().to_path_buf()),
         fold_after_links: u64::MAX,
         max_delta_layers: 4,

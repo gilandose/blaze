@@ -184,6 +184,7 @@ async fn main() {
         elector: Arc::new(StaticElector(true)),
         table_prefix: prefix,
         worker_id: "soak".into(),
+        stream: None,
         base_dir: Some(cache.path().to_path_buf()),
         fold_after_links: u64::MAX,
         max_delta_layers: env("MAX_LAYERS", 12),

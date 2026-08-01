@@ -58,6 +58,8 @@ fn meta(sequence: u64, committer: &str, watermark: u64) -> SnapshotMeta {
         sequence,
         committed_at_ms: 0,
         watermark,
+        position: blaze::core::StreamPosition::single(watermark),
+        stream: None,
         data_files: vec![DataFileMeta {
             path: format!("data/part-{sequence}-{committer}.parquet"),
             rows: 1,
@@ -104,6 +106,7 @@ impl Worker {
                 elector: Arc::new(StaticElector(true)),
                 table_prefix: prefix,
                 worker_id: id.into(),
+                stream: None,
                 base_dir: Some(cache.path().to_path_buf()),
                 fold_after_links: u64::MAX,
                 max_delta_layers: 24,

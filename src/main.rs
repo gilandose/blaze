@@ -365,6 +365,31 @@ async fn main() -> anyhow::Result<()> {
         other => anyhow::bail!("unknown election mode '{other}' (static:true, static:false, k8s)"),
     };
 
+    // What stream the committed offsets are measured in. Only a log has an
+    // answer: offsets minted locally for API-injected edges are not portable to
+    // any other worker, so claiming an identity for them would assert something
+    // untrue. See design 010.
+    let stream_id = args
+        .edge_log
+        .as_ref()
+        .map(|path| blaze::core::StreamId::new("file", path.clone()));
+    if let Some(id) = &stream_id {
+        let latest = catalog.latest().await?;
+        if let Some(committed) = latest.as_ref().and_then(|s| s.stream.as_ref())
+            && !committed.same_stream(id)
+        {
+            // Not a warning. Resuming here would seek to an offset that exists
+            // in this stream and means something else in the one the snapshots
+            // were built from — it hydrates cleanly and produces a table nothing
+            // downstream can tell is wrong.
+            anyhow::bail!(
+                "this table's snapshots were committed against {committed}, but this worker \
+                 is configured for {id}. Offsets from one stream are meaningless in the \
+                 other. Point --edge-log at the original stream, or start a new table."
+            );
+        }
+    }
+
     // Ingest pipeline. Offsets come either from a log or from a local counter,
     // never both — see `--edge-log`.
     let pipeline = Arc::new(Pipeline::new(forest.clone(), buffer.clone(), watermark));
@@ -432,6 +457,7 @@ async fn main() -> anyhow::Result<()> {
         elector: elector.clone(),
         table_prefix: table_prefix.clone(),
         worker_id: worker_id.clone(),
+        stream: stream_id.clone(),
         base_dir,
         fold_after_links: args.fold_after_links,
         max_delta_layers: args.max_delta_layers,

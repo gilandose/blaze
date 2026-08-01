@@ -313,6 +313,8 @@ mod tests {
             sequence,
             committed_at_ms: 0,
             watermark: sequence * 10,
+            position: crate::core::StreamPosition::single(sequence * 10),
+            stream: None,
             data_files: vec![DataFileMeta {
                 path: format!("graph/edges/data/part-{sequence}.parquet"),
                 rows: 1,
