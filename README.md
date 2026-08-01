@@ -59,9 +59,13 @@ python3 tools/cc_oracle.py --dataset facebook --global-share 0.15
 ```
 
 It checks the exact expected root for every node in every scope, not partitions
-up to relabelling, and it runs both against the in-heap forest and through a real
-flush loop so the answers have to survive folding, tiered merges, compaction and
-layered resolution over mmap'd runs.
+up to relabelling, and it runs three ways. `memory` and `storage` are in-process.
+`api` is the end-to-end one: it starts the real binary, ingests over HTTP,
+**restarts the worker mid-stream** so the rest is answered on top of state
+hydrated from the catalog, then queries the roots back through the API.
+
+The `words` dataset is vendored under `tests/data`, so the end-to-end run needs
+no network and gates every merge in CI.
 
 ## Routing-state modes
 

@@ -48,3 +48,31 @@ jobs:
 
       - name: cargo check --features k8s
         run: cargo check --features k8s
+
+  oracle:
+    name: connected components vs scipy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scipy
+        run: pip install --quiet scipy numpy
+
+      # The dataset is vendored under tests/data, so this needs no network of
+      # its own. `api` mode starts the real binary, ingests over HTTP, restarts
+      # it mid-stream so the second half is served on top of state hydrated from
+      # the catalog, and queries back through the API.
+      - name: Grade against scipy
+        run: python3 tools/cc_oracle.py --dataset words --scopes 4 --global-share 0.3

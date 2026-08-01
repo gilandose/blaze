@@ -34,25 +34,48 @@ below the percolation threshold, which produces hundreds of real components
 whose minima all have to be right. The script prints the component count per
 scope so a vacuous run is obvious.
 
+THREE MODES, ONE OF WHICH IS END TO END
+
+`memory` is the in-heap forest and `storage` drives a `Flusher` in-process. Both
+are convenient and neither is end to end.
+
+`api` starts the real binary, ingests every edge over HTTP, **restarts the worker
+mid-stream**, ingests the rest, and queries the roots back through the API. The
+restart is the reason it exists: the second half is answered on top of state the
+new process hydrated from the catalog, with a fresh local run cache so the runs
+have to come from the object store. Nothing in-process reaches that, and it is
+what a real deployment does on every rollout. Breaking hydration turns ~2000 of
+5086 roots wrong here and changes nothing in the other two modes.
+
 Usage:
     pip install scipy numpy
-    python3 tools/cc_oracle.py                     # default dataset, both modes
-    python3 tools/cc_oracle.py --dataset words     # a different graph shape
-    python3 tools/cc_oracle.py --global-share 0.1  # many small components
+    python3 tools/cc_oracle.py                       # vendored graph, all modes
+    python3 tools/cc_oracle.py --dataset facebook    # bigger, downloads
+    python3 tools/cc_oracle.py --global-share 0.1    # many small components
+    python3 tools/cc_oracle.py --modes api           # end to end only
 """
 
 import argparse
+import contextlib
 import gzip
+import http.client
+import json
 import pathlib
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-CACHE = pathlib.Path(__file__).resolve().parent / ".cache"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CACHE = ROOT / "tools" / ".cache"
+VENDORED = ROOT / "tests" / "data"
 
 # Published graphs, fetched from their upstream repositories. Two shapes on
 # purpose: a social network that is one giant component, and a word graph that
@@ -76,8 +99,17 @@ DATASETS = {
 
 
 def fetch(name):
+    """Vendored copy if there is one, otherwise download and cache.
+
+    `words` is checked in, so the end-to-end run has no network dependency and
+    can gate a merge. `facebook` is 1.9 MB and stays a download — it is the
+    bigger, slower run you reach for by hand.
+    """
     spec = DATASETS[name]
-    CACHE.mkdir(exist_ok=True)
+    vendored = VENDORED / spec["file"]
+    if vendored.exists():
+        return vendored
+    CACHE.mkdir(parents=True, exist_ok=True)
     path = CACHE / spec["file"]
     if not path.exists():
         print(f"fetching {spec['url']}")
@@ -165,6 +197,183 @@ def expected_roots(src, dst, keep, n_nodes):
     return roots[labels], n_comp
 
 
+# ---------------------------------------------------------------- end to end
+
+
+def free_port():
+    with contextlib.closing(socket.socket()) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class Worker:
+    """A real `blaze` process, driven over its HTTP API."""
+
+    def __init__(self, warehouse, data_dir, flush_secs=2):
+        self.warehouse, self.data_dir = warehouse, data_dir
+        self.flush_secs = flush_secs
+        self.proc = None
+        self.port = None
+
+    def start(self):
+        self.port = free_port()
+        self.proc = subprocess.Popen(
+            [
+                str(ROOT / "target" / "release" / "blaze"),
+                "--listen", f"127.0.0.1:{self.port}",
+                "--grpc-listen", f"127.0.0.1:{free_port()}",
+                "--warehouse", f"file://{self.warehouse}",
+                "--table", "graph/edges",
+                "--routing-base", "disk",
+                "--data-dir", str(self.data_dir),
+                "--election", "static:true",
+                "--flush-interval-secs", str(self.flush_secs),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"worker exited with {self.proc.returncode}")
+            try:
+                if self.get("/v1/health") is not None:
+                    return
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("worker never became healthy")
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=30)
+            self.proc = None
+
+    def conn(self):
+        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+
+    def get(self, path, conn=None):
+        c = conn or self.conn()
+        c.request("GET", path)
+        r = c.getresponse()
+        body = r.read()
+        if conn is None:
+            c.close()
+        if r.status != 200:
+            raise RuntimeError(f"GET {path} -> {r.status}")
+        return json.loads(body) if body else {}
+
+    def post_edges(self, edges, workers=8):
+        """POST every edge through the real ingest path, keepalive per thread."""
+
+        def send(chunk):
+            c = self.conn()
+            for src, dst, scope in chunk:
+                body = json.dumps(
+                    {
+                        "src": int(src),
+                        "dst": int(dst),
+                        # An empty scope list means global; `normalize()` on the
+                        # server folds it, and this is the documented shape.
+                        "scopes": [] if scope == 0 else [int(scope)],
+                    }
+                )
+                c.request(
+                    "POST", "/v1/edges", body,
+                    {"Content-Type": "application/json"},
+                )
+                r = c.getresponse()
+                r.read()
+                if r.status != 202:
+                    raise RuntimeError(f"POST /v1/edges -> {r.status}")
+            c.close()
+
+        n = max(1, len(edges) // workers)
+        chunks = [edges[i : i + n] for i in range(0, len(edges), n)]
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            list(pool.map(send, chunks))
+
+    def await_ingested(self, count, timeout=180):
+        """Wait until the pipeline has consumed `count` events."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            last = self.get("/v1/stats")["last_offset"]
+            # `last_offset` is the highest offset assigned, so `count` events
+            # means offsets 0..count-1.
+            if last + 1 >= count:
+                return
+            time.sleep(0.2)
+        raise RuntimeError(f"pipeline stalled below {count} events")
+
+    def await_committed(self, count, timeout=180):
+        """Wait until a snapshot covers `count` events.
+
+        Read from the catalog rather than the API because this is exactly the
+        durability boundary: anything above the committed watermark is lost on a
+        restart by design, so a restart before this point would be testing the
+        RPO, not hydration.
+        """
+        meta = pathlib.Path(self.warehouse) / "graph" / "edges" / "metadata"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            snaps = sorted(meta.glob("snap-*.json")) if meta.exists() else []
+            if snaps:
+                watermark = json.loads(snaps[-1].read_text())["watermark"]
+                if watermark + 1 >= count:
+                    return watermark
+            time.sleep(0.3)
+        raise RuntimeError(f"no snapshot covering {count} events")
+
+    def roots(self, scopes, nodes):
+        """Query every (scope, node) through the API."""
+        out = {}
+        for scope in scopes:
+            c = self.conn()
+            got = np.empty(len(nodes), dtype=np.int64)
+            for i, node in enumerate(nodes):
+                got[i] = self.get(
+                    f"/v1/scopes/{scope}/components/{int(node)}", conn=c
+                )["root"]
+            c.close()
+            out[scope] = got
+        return out
+
+
+def run_api_mode(edges, scopes, nodes, tmp):
+    """Ingest over HTTP, restart the worker mid-stream, then query over HTTP.
+
+    The restart is the reason this is worth doing at all. Everything else here
+    is reachable in-process; hydrating a fresh worker from the catalog and having
+    it keep answering correctly is not, and it is the step a real deployment
+    performs on every rollout.
+    """
+    warehouse = tmp / "warehouse"
+    warehouse.mkdir(parents=True, exist_ok=True)
+    worker = Worker(warehouse, tmp / "data-a")
+    half = len(edges) // 2
+
+    print("  starting worker")
+    worker.start()
+    print(f"  ingesting {half} edges over HTTP")
+    worker.post_edges(edges[:half])
+    worker.await_ingested(half)
+    watermark = worker.await_committed(half)
+    print(f"  committed through offset {watermark}; restarting")
+    worker.stop()
+
+    # A different data dir, so the new worker cannot reuse the old one's local
+    # run cache and has to pull the runs it needs from the object store.
+    worker = Worker(warehouse, tmp / "data-b")
+    worker.start()
+    print(f"  ingesting the remaining {len(edges) - half} edges")
+    worker.post_edges(edges[half:])
+    worker.await_ingested(len(edges) - half)
+    print(f"  querying {len(scopes)} scopes x {len(nodes)} nodes")
+    got = worker.roots(scopes, nodes)
+    worker.stop()
+    return got
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="facebook", choices=sorted(DATASETS))
@@ -178,7 +387,10 @@ def main():
     )
     ap.add_argument("--seed", type=int, default=20260801)
     ap.add_argument(
-        "--modes", default="memory,storage", help="comma-separated blaze modes"
+        "--modes",
+        default="memory,storage,api",
+        help="memory and storage run in-process; api starts the real binary, "
+        "ingests over HTTP, restarts it mid-stream and queries over HTTP",
     )
     args = ap.parse_args()
 
@@ -205,35 +417,51 @@ def main():
     if all(n == 1 for n in [len(np.unique(oracle[0]))]):
         print("  WARNING: the global graph is a single component; this run is weak")
 
+    seen = np.unique(np.concatenate([src, dst]))
+    all_scopes = sorted(oracle)
     failures = 0
-    for mode in args.modes.split(","):
-        out_file = CACHE / f"{args.dataset}-{mode}-roots.txt"
-        cmd = [
-            "cargo", "run", "--release", "--quiet", "--example", "oracle",
-            "--", str(edge_file), str(out_file), mode, str(args.scopes),
-        ]
-        print(f"\n=== {mode}")
-        subprocess.run(cmd, check=True)
 
-        got = np.loadtxt(out_file, dtype=np.int64)
-        seen = np.unique(np.concatenate([src, dst]))
-        for s in sorted(oracle):
-            rows = got[got[:, 0] == s]
-            # blaze is only asked about node ids that appear in the edge list;
-            # the oracle's dense array covers every id up to the maximum.
-            nodes, roots = rows[:, 1], rows[:, 2]
-            assert np.array_equal(np.sort(nodes), seen), (
-                f"mode {mode} scope {s}: blaze reported a different node set"
+    for mode in args.modes.split(","):
+        print(f"\n=== {mode}")
+        if mode == "api":
+            subprocess.run(
+                ["cargo", "build", "--release", "--quiet", "--bin", "blaze"],
+                check=True,
             )
-            want = oracle[s][nodes]
-            bad = np.nonzero(roots != want)[0]
+            with tempfile.TemporaryDirectory() as tmp:
+                got = run_api_mode(
+                    list(zip(src, dst, scope)), all_scopes, seen, pathlib.Path(tmp)
+                )
+        else:
+            out_file = CACHE / f"{args.dataset}-{mode}-roots.txt"
+            CACHE.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["cargo", "run", "--release", "--quiet", "--example", "oracle",
+                 "--", str(edge_file), str(out_file), mode, str(args.scopes)],
+                check=True,
+            )
+            rows = np.loadtxt(out_file, dtype=np.int64)
+            got = {}
+            for s in all_scopes:
+                sel = rows[rows[:, 0] == s]
+                # blaze is only asked about node ids that appear in the edge
+                # list; the oracle's dense array covers every id up to the max.
+                assert np.array_equal(np.sort(sel[:, 1]), seen), (
+                    f"mode {mode} scope {s}: blaze reported a different node set"
+                )
+                order = np.argsort(sel[:, 1])
+                got[s] = sel[order, 2]
+
+        for s in all_scopes:
+            want = oracle[s][seen]
+            bad = np.nonzero(got[s] != want)[0]
             if len(bad):
                 failures += 1
-                print(f"  scope {s}: {len(bad)} of {len(nodes)} roots wrong")
+                print(f"  scope {s}: {len(bad)} of {len(seen)} roots wrong")
                 for i in bad[:5]:
-                    print(f"    node {nodes[i]}: blaze {roots[i]}, scipy {want[i]}")
+                    print(f"    node {seen[i]}: blaze {got[s][i]}, scipy {want[i]}")
             else:
-                print(f"  scope {s}: {len(nodes)} roots match")
+                print(f"  scope {s}: {len(seen)} roots match")
 
     print()
     if failures:
