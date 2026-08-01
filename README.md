@@ -175,8 +175,18 @@ and is compiled at build time with the pure-Rust `protox` codegen — no
 ## Development
 
 ```bash
-cargo test              # unit + integration (includes a randomized model check
-                        # of the scoped DSU against a BFS reference)
+cargo test                      # unit + integration (includes a randomized model
+                                # check of the scoped DSU against a BFS reference)
 cargo clippy --all-targets
-cargo check --features k8s
+cargo test --features k8s --lib # the leader elector, against a stand-in API server
 ```
+
+## Releasing
+
+`git tag v0.1.0 && git push origin v0.1.0`. The release workflow checks the tag
+against `Cargo.toml`, runs the suite again, and publishes a Linux x86_64 tarball
+with a `sha256`. See [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -74,7 +74,7 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/blaze" "dist/$name/"
           strip "dist/$name/blaze" || true
-          cp README.md CHANGELOG.md ARCHITECTURE.md "dist/$name/"
+          cp LICENSE README.md CHANGELOG.md ARCHITECTURE.md "dist/$name/"
           cp docs/TUNING.md "dist/$name/TUNING.md"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           ( cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
