@@ -22,9 +22,14 @@ Three consequences of this profile shape everything below:
    for the live rate; the sharding question is genuinely open at 10B+, and the
    number that made it look closed was wrong. **If it is ever answered, the
    answer is scope sharding** — see the note below.
-2. **State size is the whole problem.** At the measured 160 B/link in RAM, 2B
-   links is ~320 GB. Every design below attacks state cost, snapshot cost, or
-   restart cost.
+2. **State size was the whole problem, and 003 changed its shape.** The 160
+   B/link in RAM that motivated most of these designs — ~320 GB at 2B links —
+   described a heap-resident DSU. Under [003](003-disk-backed-base.md) pairs live
+   in mmap'd runs and the unreclaimable floor is **~1.07 bytes per pair**, so the
+   hard budget at 2B links is ~4 GB rather than ~320. What is left is a
+   *page-cache* budget, which sets latency rather than whether you run. This is
+   why [002](002-dense-interning.md) is closed: it attacked a term that no longer
+   dominates.
 3. **The low change rate is itself a design constraint.** It makes full-base
    compaction absurdly expensive per unit of change (rewriting 75 GB to absorb
    7.5 MB), which is why [006](006-tiered-compaction.md) — not the stall fixes —
@@ -96,7 +101,7 @@ docs below are the design rationale behind those knobs.
 | # | Design | Attacks | Status |
 |---|---|---|---|
 | [001](001-delta-snapshots.md) | Delta snapshots & compaction | snapshot stall + payload | **implemented** — parts superseded by 006/007 |
-| [002](002-dense-interning.md) | Dense id interning | memory (200→~45 B/link) | designed |
+| [002](002-dense-interning.md) | Dense id interning | memory (200→~45 B/link) | **not pursued** — superseded by 003 |
 | [003](003-disk-backed-base.md) | Disk-backed routing base (LSM) | memory + cold start | **implemented** |
 | [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed |
 | [005](005-union-tier.md) | Union tier (`all` view) & shared/global naming | semantics gap | designed |
@@ -106,9 +111,13 @@ docs below are the design rationale behind those knobs.
 | [009](009-registry-encoding.md) | Registry encoding (delta-varint in indexed blocks) | 25-40% of base bytes | **implemented** |
 | [010](010-stream-position.md) | Stream position (per-partition offsets + stream identity) | snapshot metadata cannot describe Kafka | **implemented** |
 
-001, 003, 006, 007, 009 and 010 are in. Recommended order for what is left: **002** folded
-in with 005's rename and union tier, then 004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
-packed u48 to serve the "well beyond 2B" goal.
+001, 003, 006, 007, 009 and 010 are in. **002 is closed** — 003 removed its
+premise by moving pairs out of the heap, and the ~1.07 B/pair that remains is
+membership filter sized at 8 bits per *key*, so narrowing ids does not touch the
+term that binds. What is left is 004 and 005, neither of which is a scaling
+change: 005 is a semantics gap (the `all` view and the shared/global rename) and
+004 is analytics interop. Both need rework against the run set before they are
+implementable — see their headers.
 
 Cost impact at the target profile: an all-RAM design would need ~256–512 GB
 instances; with 003 shipped it is ~64 GB + NVMe (~$1.5k/mo for 3 replicas). The

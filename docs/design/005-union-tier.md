@@ -1,7 +1,9 @@
 # 005 — Union tier ("all edges from all scopes") & naming
 
-> **Cost model assumes [002](002-dense-interning.md)**, which was never built, so
-> the per-pair figures below are counterfactual. The composition story ("participates
+> **Cost model assumes [002](002-dense-interning.md)**, now **closed as not
+> pursued**, so the per-pair figures below are counterfactual and the "shares the
+> intern table" argument for why the increment is cheap no longer holds — the
+> union tier's cost has to be re-derived against the run set. The composition story ("participates
 > in 001 and 003 identically") is also dated: state is a tiered run set with
 > per-run membership filters and a delta-varint registry
 > ([006](006-tiered-compaction.md), [009](009-registry-encoding.md)).
