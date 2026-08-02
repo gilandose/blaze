@@ -80,11 +80,25 @@ pub trait RoutingBase: Send + Sync + std::fmt::Debug {
         false
     }
 
-    /// Nodes whose recorded shared parent is `parent`, appended to `out`.
-    fn shared_children(&self, _parent: NodeId, _out: &mut Vec<NodeId>) {}
+    /// At most `limit` nodes whose recorded shared parent is `parent`, appended
+    /// to `out`.
+    ///
+    /// **The limit is load-bearing, not an optimisation.** In a flattened run a
+    /// component's root has every member as a direct child, so an unbounded
+    /// fetch makes a capped query cost O(component) instead of O(cap) — measured
+    /// at 1.5 ms for `cap = 1000` past percolation before this existed.
+    /// Implementations may return fewer, never more.
+    fn shared_children(&self, _parent: NodeId, _limit: usize, _out: &mut Vec<NodeId>) {}
 
     /// Same within `scope`'s overlay.
-    fn overlay_children(&self, _scope: ScopeId, _parent: NodeId, _out: &mut Vec<NodeId>) {}
+    fn overlay_children(
+        &self,
+        _scope: ScopeId,
+        _parent: NodeId,
+        _limit: usize,
+        _out: &mut Vec<NodeId>,
+    ) {
+    }
 
     fn stats(&self) -> BaseStats;
 }

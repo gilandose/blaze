@@ -196,7 +196,7 @@ ingest cannot outrun compaction and bury you in runs.
 | `--edge-log` | unset | **production ingest** — see below | injection is refused while set |
 | `--edge-log-batch` | 10 000 | ingest throughput | memtable granularity, nothing else |
 | `--registry-encoding` | blocked | — | `flat` is 1.6x the base for a 2.4x faster merge notification |
-| `--member-index` | off | the `members` query | **+77% of run bytes** and ~2% ingest, measured — see below |
+| `--member-index` | off | the `members` query | **+34% of run bytes** and ~2% ingest, measured — see below |
 | `--retention-interval-secs` | 3600 | rarer sweeps | storage grows at the amplification rate — see below |
 | `--keep-snapshots` | 10 | more restore points | storage |
 | `--keep-snapshots-hours` | 24 | more restore points | storage |
@@ -225,20 +225,23 @@ Ingest cost is **-1.4% to -2.7%** with `--routing-base disk`, where the base
 probe dominates. (It is -21% to -31% all-RAM, but there the DSU is the entire
 cost of applying an edge; that is not the number to size a backfill against.)
 
-Query latency is linear in the answer — **~0.11 us per member from the heap,
-~1.1 us per member from a mapped run**, the 10x being one binary search per node
-because there is no filter over the member index's keys. At the default cap:
+Storage cost is **+34% of run bytes**, 7.1 B/pair, with the delta-varint
+encoding — down from +77% for the fixed-stride form it shipped as.
+
+Query latency is linear in the answer and bounded by `cap`, roughly 0.1 us per
+member from the heap and 0.15 us from a mapped run. At the default cap of 1000:
 
 | answer size | in-heap p50 | mmap'd run p50 |
 |---|---|---|
-| 1 (singleton) | 0.24 us | 0.54 us |
-| ~28 | 4.0 us | 7.8 us |
-| ~225 | 25 us | 59 us |
-| capped at 1000 | 51-85 us | **0.9-1.3 ms** |
+| 1 (singleton) | 0.36 us | 0.33 us |
+| ~27 | 7.5 us | 6.3 us |
+| ~187 | 38 us | 26 us |
+| capped at 1000 (a hub) | 60 us | 64 us |
 
-`scope_root` on the same state is 0.08 us in-heap, 0.31 us mapped, so this is
-three to four orders of magnitude more expensive than a component lookup. Budget
-for it separately.
+`scope_root` on the same state is 0.14 us in-heap, 0.56 us mapped, so a member
+query is two to three orders of magnitude more expensive than a component
+lookup. Budget for it separately. The mapped run costing about what the heap does
+is the point: work is bounded by `cap`, not by the size of the component.
 
 Three things to know before turning it on:
 
@@ -256,11 +259,11 @@ Three things to know before turning it on:
   `truncated: true` with exactly `cap` real members, and the right response is
   the analytics path, not a bigger cap. Default cap 1000, ceiling 10 000.
 
-  This is also where the latency lands: past percolation *every* query walks the
-  full cap, so a disk-backed worker serves 0.9-1.3 ms p50 and 2.3 ms p99 at the
-  default, and 1.3-1.5 ms at the ceiling. **The sub-millisecond claim does not
-  survive percolation on disk.** Lower `cap` if that matters — cost is linear in
-  it — or keep the working set in the heap.
+  Past percolation *every* query walks the full cap, so cost there is flat in the
+  cap rather than in the component: lowering `cap` lowers latency proportionally,
+  and raising it toward the 10 000 ceiling costs about 10x. Cost no longer tracks
+  component size — it did until the child fetches took a budget, and a hub query
+  cost 1.5 ms at `cap = 1000` for that reason.
 
 If the question is "how big is this component" rather than "who is in it", this
 is the wrong feature — a size counter per root is O(1) on union and free to read.

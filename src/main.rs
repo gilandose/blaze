@@ -585,6 +585,7 @@ async fn main() -> anyhow::Result<()> {
             filter_bits: args.filter_bits,
             registry: args.registry_encoding,
             member_index: args.member_index,
+            members: Default::default(),
         },
         inline_merges: args.inline_merges,
         pending_merge: parking_lot::Mutex::new(None),

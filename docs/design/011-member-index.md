@@ -61,31 +61,34 @@ as its own Puffin blob.
   run without the blob simply has no member index, a reader that does not
   recognise it ignores it, and a stack may mix runs with and without.
 
-### Size — measured, and worse than this design first claimed
+### Size — measured twice, and the second time it was encoded
 
-The estimate here used to be **+20–40% of base**, reasoning that parent-ordered
-pairs are the shape the registry had before [009](009-registry-encoding.md) — a
-repeated key with ascending values — and that delta-varint would do to them what
-it did to the registry (67.1 MB → 14.5 MB).
+The estimate here was **+20-40% of base**, reasoning that parent-ordered pairs
+are the shape the registry had before [009](009-registry-encoding.md) — a
+repeated key with an ascending value list — and that delta-varint would do to
+them what it did to the registry.
 
-It would. It is not what was built. The index ships as a plain fixed-stride
-16-byte pair table, so it costs what one costs. `examples/registry_shape` at 2M
-links / 4M nodes / 3000 scopes:
+It shipped as a plain fixed-stride 16-byte table first, and that measured
+**+77%**, so the estimate was recorded as wrong. Then the encoding was actually
+built (`storage::members`, deliberately the registry's layout record for
+record), which brings it back to where the estimate said. `examples/registry_shape`
+at 2M links / 4M nodes / 3000 scopes:
 
-| | run bytes |
-|---|---|
-| without the index | 81.0 MB |
-| with it | 143.6 MB |
-| **cost** | **+62.6 MB — +77%, 16.1 B/pair** |
+| | run bytes | vs no index |
+|---|---|---|
+| without the index | 81.0 MB | — |
+| flat, 16 B/pair | 143.6 MB | **+77%** |
+| blocked delta-varint | 108.5 MB | **+34%**, 7.1 B/pair |
 
-Self-edges are dropped, which is why it is 16.1 B/pair and not more, but nothing
-else compresses it. The naive number was the real number.
+The gain is smaller than the registry's 4.8-7.1x because the *values* here are
+worse: scopes are dense u32s so their gaps are one byte, while children are node
+ids scattered across the id space, so a child gap is 4-5 varint bytes. What
+compresses is the key side — one parent gap per record instead of eight bytes
+per pair — plus the count. So the win scales with how many parents have more
+than one child, and 2.3x is what this graph gives.
 
-**Delta-varint encoding it is the obvious next step** and would plausibly land it
-near the original estimate; `storage::registry::RegistryWriter` is the encoder,
-and the blob type makes it a compatible change — a reader that does not recognise
-a `v2` member blob simply reports the run as unindexed. Until then, `+77%` is what
-a deployment turning this on is agreeing to, and it is why the flag is off.
+Both encodings stay readable; the blob type is the switch, as everywhere else
+here, so a stack may mix and the change needed no rewrite.
 
 ## The query
 
@@ -137,46 +140,49 @@ A downward walk of the parent tree. Two things keep it cheap:
 - **Leaves are the common case.** Most members have no children of their own, so
   expanding them is one binary search that finds nothing.
 
-### Latency — measured
+### Latency, and the thing that actually bounded it
 
-`examples/member_bench`, 2M links / 3000 scopes / 30% global, p50 over 2000
-probes at the API's default cap of 1000. `scope_root` on the same state is the
-comparator.
+`examples/member_bench` sweeps query latency across the percolation threshold,
+in the heap and over a mapped run. Two findings, and the second is the one that
+mattered.
 
-| | `scope_root` | 1 member | ~4 | ~28 | ~225 | capped at 1000 |
-|---|---|---|---|---|---|---|
-| in-heap | 0.08 us | 0.24 | 0.79 | 4.0 | 25 | **51-85 us** |
-| mmap'd run | 0.31 us | 0.54 | 1.75 | 7.8 | 59 | **0.9-1.3 ms** |
+**Below percolation it is linear in the answer and cheap.** ~0.1 us per member
+from the heap, ~0.14 us from a mapped run; a 187-member component is 26 us from
+disk. That is comfortably the "sub-millisecond" the design claimed.
 
-Linear in the answer, as designed: **~0.11 us per member in the heap, ~1.1 us
-per member from a mapped run**, and that 10x gap is the missing filter. Every
-node expanded costs a full binary search over the member table, and roughly
-none of them have children.
+**Past percolation the cap did not bound the work.** In a flattened run a
+component's root has *every* member as a direct child, and the reader
+materialised all of them before the walk consulted the cap — so a `cap = 1000`
+query on a hub cost O(component) and tracked component size rather than the cap.
+No filter helps: the root is not a leaf, and the one lookup that dominates is a
+hit.
 
-**So the "sub-millisecond" claim needs qualifying.** It holds comfortably below
-percolation, where components are small — a 225-member component is 59 us from
-disk. It does *not* hold past percolation on a disk-backed worker: every query
-walks the full cap and p50 is 0.9-1.3 ms, p99 2.3 ms. At the `cap=10000`
-ceiling it is 1.3-1.5 ms from disk and 355-451 us in the heap. A deployment that
-wants this query on a percolated graph should either lower the cap or add the
-filter.
+The fix is a **budget** threaded from the walk into every child fetch, honoured
+by the flat reader, the blocked reader and the memtable alike:
 
-One reading to avoid: a tenant scope sometimes looks 13x *faster* than global
-past percolation (89 us against 1129). That is not the two-level walk being
-cheap. It is the overlay alone holding more than `cap` elements, so the answer
-fills from the small overlay table and the shared tree is never entered. The
-members are real and the cap is honoured; the number just is not measuring what
-it appears to.
+| `cap = 1000`, past percolation | before | after |
+|---|---|---|
+| in-heap p50 | 51-85 us | 60 us |
+| **mmap'd run p50** | **1.1-1.5 ms** | **64 us** |
+| ceiling `cap = 10000`, mmap'd | 1.3-1.5 ms | 583 us |
 
-**No filter over the index's keys, though**, and the first version of this
-section assumed one. `storage::filter` covers the *forward* tables; nothing
-covers the member index, so rejecting a leaf costs a binary search rather than a
-cache line. That is worth **10x** on a mapped run — see the table below — and it
-is the single highest-value follow-up here. What is not
-available is narrowing by the sparse page index: it narrows to the block holding
-a key, and this table has **duplicate** keys by construction, so a run of equal
-keys can begin in an earlier block. `PairTable::lower_bound` therefore searches
-the whole table. Correctness first.
+The mapped run now costs what the heap does, which is the shape to expect once
+the work is bounded by the cap rather than by the graph.
+
+Getting the budget right is subtler than it looks, and both wrong versions are
+recorded in `Walk::expand`:
+
+- *Room remaining* is wrong. A fetched child may already be in the visited set,
+  so it consumes budget without growing the answer, and the children dropped past
+  the budget are then lost silently. The two-level scoped walk re-encounters its
+  own seeds through the shared tree by construction, so this dropped real
+  members.
+- *Decode it all and truncate* is wrong for the blocked encoding: a hub record is
+  hundreds of thousands of varints, and throwing them away afterwards measured
+  **slower than the fixed-stride table it replaced**.
+
+`cap + 1` flat is right, and provably so — see `Walk::expand` for the argument
+that it is both sufficient and non-quadratic.
 
 Correctness follows from two properties already established:
 
@@ -203,6 +209,12 @@ gets `Truncated` has learned something real (this node is in a hub) and should
 not retry with a bigger cap. Bulk export belongs in the analytics path
 ([004](004-analytics-enrichment.md)) over the Parquet, not on the serving path.
 
+**And the cap has to bound the work, not just the answer.** It did not, for the
+first two implementations of the reader — see the latency section above. A cap
+that bounds only what is returned is a cap in name: the query still reads the
+whole component, so the hub case costs what an export costs and merely declines
+to hand it over. Every child fetch takes a budget for this reason.
+
 **The cheaper question is usually the one being asked.** "How big is this
 component" needs no index at all — a size counter per root, O(1) to maintain on
 union. It is not tracked today because union is by min-id rather than by size
@@ -223,10 +235,27 @@ explicit about because only one of them matches how the other index flags work:
   recorded as unions happen and cannot be reconstructed afterwards, so a worker
   started without the flag answers `None` until it is restarted with it.
 
-Off by default because it is the first index whose cost falls on deployments that
-may never use it. Filters pay for themselves on every lookup; a member index pays
-for itself only if someone calls `members`. And at +77% of run bytes, that is not
-a rounding error.
+### Should it be on by default now?
+
+The follow-up work was done to answer that, and the honest answer is **no, not
+yet** — with the reasons written down rather than the conclusion.
+
+What changed: storage +77% → **+34%**, the hub query 1.5 ms → **64 us**, and
+ingest was never the problem on a disk-backed worker (**-1.4% to -2.7%**). The
+query itself is no longer the argument against.
+
+What has not changed: **+34% of run bytes is paid by every deployment, and only
+some of them ever call `members`.** At 2B links that is tens of gigabytes of
+object storage and the page cache to match. Filters earn their keep on every
+lookup; this earns nothing until somebody asks a question many tables will never
+be asked.
+
+The thing that would change the answer is already visible in the numbers. The
+member index now costs **7.1 bytes per pair while the forward table it inverts
+costs 16** — the index is denser than the data. Applying the same encoding to the
+routing tables would save more than the index costs, at which point turning it on
+is free relative to today's base and the default should flip. That is the next
+piece of work, not this one.
 
 **The ingest cost is small in the configuration that matters.** Tracking adds one
 `DashMap` write per merge, which is **-21% to -31%** of an all-RAM ingest loop
@@ -279,7 +308,10 @@ the flag, rather than an empty list.
   makes this exact rather than approximate: scipy's labels give the true member
   set for every node in a published graph.
 - A component above the cap returns `Truncated` with exactly `cap` members, and
-  every one of them is a real member.
+  every one of them is a real member. Swept across *every* cap from 1 to past the
+  component size rather than checked at one point — the budget bugs above only
+  showed at caps near the component size
+  (`every_cap_returns_min_of_cap_and_the_component`).
 - A run written without the index is still readable — the same compatibility
   property 009's blob types have. But a stack that *mixes* indexed and unindexed
   runs does **not** answer "correctly for the indexed part", which is what this
@@ -299,7 +331,16 @@ every edge), `core::dsu` (compression does not hide a member), `tests/member_ind
 (five folds, cold start, tiered compaction, the mixed-stack refusal, truncation
 across the base/memtable boundary), `tests/integration.rs` and `tests/grpc.rs`
 (the two front ends and their refusals), and `tools/cc_oracle.py` in all three
-modes.
+modes, plus `storage::members` for the encoding and `examples/member_bench` for
+what any of it costs.
+
+**The benchmark earns its place too.** It found the tenant-scope truncation bug
+(1153 wrong answers in one sweep), then the unbounded child fetch, then the
+decode-and-truncate regression — three defects that every correctness test
+passed, because all three produced *right answers slowly* or right answers with
+the wrong count in a case no test constructed. A design whose whole premise is
+"this is cheap for small components" needs a harness that measures, not only one
+that verifies.
 
 **The oracle earns its place here.** Membership is a strictly stronger check than
 the roots, and not by a little: an implementation can name the right

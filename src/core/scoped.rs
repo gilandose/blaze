@@ -250,7 +250,39 @@ impl Walk {
     /// Stops the moment the cap is exceeded: an unbounded frontier is exactly
     /// the failure mode the cap exists to prevent, so there is no point
     /// draining it to discover the truncation a second time.
-    fn expand(&mut self, seeds: &[NodeId], mut children: impl FnMut(NodeId, &mut Vec<NodeId>)) {
+    ///
+    /// `children` is handed a **budget** as well as a node, and honouring it is
+    /// what makes the cap bound the *work* and not just the answer. In a
+    /// flattened run a component's root has every member as a direct child, so
+    /// an unbounded fetch reads the whole component into `buf` before the cap is
+    /// consulted — 1.5 ms for a `cap = 1000` query past percolation, measured,
+    /// against ~10 us once bounded.
+    ///
+    /// # Why the budget is `cap + 1` flat, and not the room remaining
+    ///
+    /// The room remaining is the obvious choice and it is wrong: a fetched child
+    /// may already be in `seen`, so it consumes budget without growing `out`,
+    /// and the children dropped past the budget are then lost silently. That is
+    /// not hypothetical — the two-level scoped walk re-encounters its own seeds
+    /// through the shared tree by construction, and this dropped real members
+    /// until the randomized model test caught it.
+    ///
+    /// `cap + 1` is provably enough. Let `s = |seen| < cap` (otherwise the walk
+    /// has already truncated). Of `cap + 1` fetched children at most `s` are
+    /// already seen, so at least `cap + 1 - s` are new — exactly the `cap - s`
+    /// needed to fill the answer, plus the one more that proves truncation. So
+    /// either the fetch was short, meaning it returned all of the node's
+    /// children, or it fills the cap and the walk ends.
+    ///
+    /// That same argument bounds the total work. A fetch can only come back full
+    /// when it also fills the cap, so **at most one fetch in a walk is large**;
+    /// every other returns a node's entire child list. The quadratic reading of
+    /// "cap + 1 per node, up to cap nodes" cannot happen.
+    fn expand(
+        &mut self,
+        seeds: &[NodeId],
+        mut children: impl FnMut(NodeId, usize, &mut Vec<NodeId>),
+    ) {
         let mut frontier: Vec<NodeId> = Vec::new();
         for &s in seeds {
             if self.admit(s) {
@@ -265,7 +297,7 @@ impl Walk {
         let mut buf: Vec<NodeId> = Vec::new();
         while let Some(k) = frontier.pop() {
             buf.clear();
-            children(k, &mut buf);
+            children(k, self.cap + 1, &mut buf);
             for &c in &buf {
                 if self.admit(c) {
                     frontier.push(c);
@@ -558,10 +590,10 @@ impl ScopedForest {
         let shared = Self::shared_root(&t, node, false);
         let mut walk = Walk::new(cap);
         if scope == GLOBAL_SCOPE {
-            walk.expand(&[shared], |k, out| {
-                t.mem.global.children_of(k, out);
+            walk.expand(&[shared], |k, limit, out| {
+                t.mem.global.children_of(k, limit, out);
                 if let Some(b) = t.base() {
-                    b.shared_children(k, out);
+                    b.shared_children(k, limit.saturating_sub(out.len()), out);
                 }
             });
         } else {
@@ -581,22 +613,22 @@ impl ScopedForest {
             // pre-set flag aborted the shared walk after its first seed. Caught
             // by `examples/member_bench` at 2.5 links/node, not by a test.
             let mut seeds = Walk::new(cap.saturating_add(1));
-            seeds.expand(&[root], |k, out| {
+            seeds.expand(&[root], |k, limit, out| {
                 if let Some(o) = t.mem.overlays.get(&scope) {
-                    o.children_of(k, out);
+                    o.children_of(k, limit, out);
                 }
                 if let Some(b) = t.base() {
-                    b.overlay_children(scope, k, out);
+                    b.overlay_children(scope, k, limit.saturating_sub(out.len()), out);
                 }
             });
             debug_assert!(
                 !seeds.truncated || seeds.out.len() == cap + 1,
                 "a truncated walk must hold exactly its cap, or the argument above breaks"
             );
-            walk.expand(&seeds.out, |k, out| {
-                t.mem.global.children_of(k, out);
+            walk.expand(&seeds.out, |k, limit, out| {
+                t.mem.global.children_of(k, limit, out);
                 if let Some(b) = t.base() {
-                    b.shared_children(k, out);
+                    b.shared_children(k, limit.saturating_sub(out.len()), out);
                 }
             });
         }
@@ -1424,6 +1456,64 @@ mod tests {
         }
         // And the boundary, which is the other half of the same off-by-one.
         assert!(!f.members(5, 200, 400).unwrap().is_truncated());
+    }
+
+    /// The cap bounds the *answer*, and must never cost a member below it.
+    ///
+    /// Sweeping every cap from 1 to past the component size is the shape that
+    /// catches a budget bug: fetches are bounded by the cap now, so a formula
+    /// that shrinks the budget as the answer fills silently drops children —
+    /// which is exactly what "room remaining" did, and what only showed up at
+    /// caps close to the component size.
+    #[test]
+    fn every_cap_returns_min_of_cap_and_the_component() {
+        let mut rng = StdRng::seed_from_u64(0xCA9_5EE9);
+        const NODES: u64 = 40;
+        let f = ScopedForest::new().tracking_members();
+        let mut model = Model {
+            global_edges: vec![],
+            scope_edges: vec![],
+        };
+        for _ in 0..120 {
+            let (u, v) = (rng.random_range(0..NODES), rng.random_range(0..NODES));
+            if rng.random_range(0..100) < 40 {
+                f.apply(&global_edge(u, v));
+                model.global_edges.push((u, v));
+            } else {
+                f.apply(&scoped_edge(u, v, &[1]));
+                model.scope_edges.push((1, u, v));
+            }
+        }
+
+        for node in 0..NODES {
+            for scope in [GLOBAL_SCOPE, 1] {
+                let want = model.component(scope, node);
+                for cap in 1..=want.len() + 3 {
+                    let got = f.members(scope, node, cap).unwrap();
+                    let n = got.nodes().len();
+                    assert_eq!(
+                        n,
+                        cap.min(want.len()),
+                        "scope {scope} members({node}) at cap {cap}: \
+                         component has {} members",
+                        want.len()
+                    );
+                    assert_eq!(
+                        got.is_truncated(),
+                        cap < want.len(),
+                        "scope {scope} members({node}) at cap {cap} mislabelled"
+                    );
+                    let mut sorted = got.into_nodes();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    assert_eq!(sorted.len(), n, "duplicates at cap {cap}");
+                    assert!(
+                        sorted.iter().all(|m| want.binary_search(m).is_ok()),
+                        "scope {scope} members({node}) at cap {cap} invented a member"
+                    );
+                }
+            }
+        }
     }
 
     /// Off by default, and a forest that was not tracking says so rather than

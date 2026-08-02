@@ -22,6 +22,7 @@ use crate::core::base::{BaseStats, RoutingBase, ScopeList};
 use crate::core::{NodeId, ScopeId};
 use crate::storage::codec;
 use crate::storage::filter::{BlockedFilter, overlay_key};
+use crate::storage::members::BlockedMembers;
 use crate::storage::puffin;
 use crate::storage::registry::BlockedRegistry;
 
@@ -177,11 +178,23 @@ impl PairTable {
     }
 
     /// Values stored against `key`, contiguous because the table is sorted.
-    fn values_for(&self, data: &[u8], key: NodeId, out: &mut Vec<NodeId>) {
+    /// Append at most `limit` values recorded for `key`.
+    ///
+    /// The limit is not a nicety. A component's root in a flattened run has
+    /// *every* member as a direct child, so without it a capped walk pays for
+    /// the whole component before the cap is ever consulted — measured at 1.5 ms
+    /// for a `cap = 1000` query on a graph past percolation, where the work
+    /// tracked component size rather than the cap. See `Walk::expand`.
+    fn values_for(&self, data: &[u8], key: NodeId, limit: usize, out: &mut Vec<NodeId>) {
+        if limit == 0 {
+            return;
+        }
         let mut i = self.lower_bound(data, key);
-        while i < self.count && self.key_at(data, i) == key {
+        let mut taken = 0usize;
+        while i < self.count && taken < limit && self.key_at(data, i) == key {
             out.push(self.value_at(data, i));
             i += 1;
+            taken += 1;
         }
     }
 
@@ -410,8 +423,8 @@ pub struct PuffinBase {
     /// The same pairs keyed by parent, so a component can be listed downward.
     /// `None` on a run written without `--member-index`; absence means "this run
     /// cannot answer members", not "this run has no members".
-    shared_members: Option<PairTable>,
-    overlay_members: BTreeMap<ScopeId, PairTable>,
+    shared_members: Option<MemberTable>,
+    overlay_members: BTreeMap<ScopeId, MemberTable>,
     registry: Option<RegistryTable>,
     /// Populated only when the file predates the registry blob: rebuilt at
     /// load time so runtime lookups stay O(1)-ish either way.
@@ -425,7 +438,50 @@ pub struct PuffinBase {
     /// to searching, which is correct and merely slower.
     shared_filter: Option<BlockedFilter>,
     overlay_filter: Option<BlockedFilter>,
+    /// The same idea over the member index's *parent* keys. A leaf is the common
+    /// case in a downward walk and the member tables cannot be narrowed by the
+    /// sparse index, so without these every childless node costs a full binary
+    /// search. `None` on a run written before they existed: the walk then probes
+    /// the table directly, which is correct and merely slower.
+    shared_members_filter: Option<BlockedFilter>,
+    overlay_members_filter: Option<BlockedFilter>,
     sequence: u64,
+}
+
+/// A member index in whichever encoding its run was written with.
+///
+/// The blob type is the switch, as everywhere else here, so a stack may mix —
+/// which is what let the encoding change without a rewrite.
+#[derive(Debug)]
+enum MemberTable {
+    /// `blaze-*-members-v1`: fixed 16-byte stride. Cannot use the sparse index,
+    /// because duplicate keys mean a run of equal keys can begin in an earlier
+    /// block, so a lookup binary-searches the whole table.
+    Flat(PairTable),
+    /// `blaze-*-members-v2`: delta-varint records in offset-indexed blocks. Its
+    /// index *is* usable — block boundaries fall between records, so a parent's
+    /// children never straddle two blocks.
+    Blocked(BlockedMembers),
+}
+
+impl MemberTable {
+    fn children_of(&self, data: &[u8], parent: NodeId, limit: usize, out: &mut Vec<NodeId>) {
+        match self {
+            Self::Flat(t) => t.values_for(data, parent, limit, out),
+            Self::Blocked(m) => m.children_of(data, parent, limit, out),
+        }
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Self::Flat(t) => t
+                .index
+                .as_ref()
+                .map(|ix| (ix.first_keys.len() * std::mem::size_of::<NodeId>()) as u64)
+                .unwrap_or(0),
+            Self::Blocked(m) => m.heap_bytes(),
+        }
+    }
 }
 
 impl PuffinBase {
@@ -439,16 +495,37 @@ impl PuffinBase {
     }
 
     /// Nodes whose recorded shared parent is `parent`, appended to `out`.
-    pub fn shared_children(&self, parent: NodeId, out: &mut Vec<NodeId>) {
+    ///
+    /// The filter probe is what makes a downward walk affordable from a mapping:
+    /// most nodes admitted by the walk are leaves, and a negative answer here is
+    /// definitive and costs one cache line instead of a binary search over a
+    /// table the sparse index cannot narrow.
+    pub fn shared_children(&self, parent: NodeId, limit: usize, out: &mut Vec<NodeId>) {
+        if let Some(f) = &self.shared_members_filter
+            && !f.may_contain(parent)
+        {
+            return;
+        }
         if let Some(t) = &self.shared_members {
-            t.values_for(&self.mmap, parent, out);
+            t.children_of(&self.mmap, parent, limit, out);
         }
     }
 
     /// Same within `scope`'s overlay.
-    pub fn overlay_children(&self, scope: ScopeId, parent: NodeId, out: &mut Vec<NodeId>) {
+    pub fn overlay_children(
+        &self,
+        scope: ScopeId,
+        parent: NodeId,
+        limit: usize,
+        out: &mut Vec<NodeId>,
+    ) {
+        if let Some(f) = &self.overlay_members_filter
+            && !f.may_contain(overlay_key(scope, parent))
+        {
+            return;
+        }
         if let Some(t) = self.overlay_members.get(&scope) {
-            t.values_for(&self.mmap, parent, out);
+            t.children_of(&self.mmap, parent, limit, out);
         }
     }
 
@@ -486,6 +563,8 @@ impl PuffinBase {
         let mut registry = None;
         let mut shared_filter = None;
         let mut overlay_filter = None;
+        let mut shared_members_filter = None;
+        let mut overlay_members_filter = None;
         let mut shared_members = None;
         let mut overlay_members = BTreeMap::new();
         let mut sequence = 0u64;
@@ -518,9 +597,16 @@ impl PuffinBase {
                     )?));
                 }
                 codec::SHARED_MEMBERS_BLOB_TYPE => {
-                    shared_members = Some(PairTable::parse(&mmap, blob.range())?);
+                    shared_members =
+                        Some(MemberTable::Flat(PairTable::parse(&mmap, blob.range())?));
                 }
-                codec::OVERLAY_MEMBERS_BLOB_TYPE => {
+                codec::SHARED_MEMBERS_V2_BLOB_TYPE => {
+                    shared_members = Some(MemberTable::Blocked(BlockedMembers::parse(
+                        &mmap,
+                        blob.range(),
+                    )?));
+                }
+                codec::OVERLAY_MEMBERS_BLOB_TYPE | codec::OVERLAY_MEMBERS_V2_BLOB_TYPE => {
                     let scope: ScopeId = blob
                         .properties
                         .get(codec::SCOPE_ID_PROP)
@@ -528,13 +614,24 @@ impl PuffinBase {
                             anyhow::anyhow!("overlay member blob missing {}", codec::SCOPE_ID_PROP)
                         })?
                         .parse()?;
-                    overlay_members.insert(scope, PairTable::parse(&mmap, blob.range())?);
+                    let table = if blob.blob_type == codec::OVERLAY_MEMBERS_BLOB_TYPE {
+                        MemberTable::Flat(PairTable::parse(&mmap, blob.range())?)
+                    } else {
+                        MemberTable::Blocked(BlockedMembers::parse(&mmap, blob.range())?)
+                    };
+                    overlay_members.insert(scope, table);
                 }
                 codec::SHARED_FILTER_BLOB_TYPE => {
                     shared_filter = Some(BlockedFilter::decode(&mmap[blob.range()])?);
                 }
                 codec::OVERLAY_FILTER_BLOB_TYPE => {
                     overlay_filter = Some(BlockedFilter::decode(&mmap[blob.range()])?);
+                }
+                codec::SHARED_MEMBERS_FILTER_BLOB_TYPE => {
+                    shared_members_filter = Some(BlockedFilter::decode(&mmap[blob.range()])?);
+                }
+                codec::OVERLAY_MEMBERS_FILTER_BLOB_TYPE => {
+                    overlay_members_filter = Some(BlockedFilter::decode(&mmap[blob.range()])?);
                 }
                 // Unknown blob types are ignored (forward compatibility).
                 _ => {}
@@ -553,6 +650,8 @@ impl PuffinBase {
             fallback_registry: None,
             shared_filter,
             overlay_filter,
+            shared_members_filter,
+            overlay_members_filter,
             sequence,
         };
         if base.registry.is_none() && !base.overlays.is_empty() {
@@ -850,6 +949,8 @@ impl PuffinBase {
         self.shared_filter
             .iter()
             .chain(self.overlay_filter.iter())
+            .chain(self.shared_members_filter.iter())
+            .chain(self.overlay_members_filter.iter())
             .map(|f| f.heap_bytes() as u64)
             .sum()
     }
@@ -862,7 +963,13 @@ impl PuffinBase {
             .filter_map(|t| t.index.as_ref())
             .map(|ix| (ix.first_keys.len() * std::mem::size_of::<NodeId>()) as u64)
             .sum();
-        pair + self.registry.as_ref().map(|r| r.heap_bytes()).unwrap_or(0)
+        let members: u64 = self
+            .shared_members
+            .iter()
+            .chain(self.overlay_members.values())
+            .map(|t| t.heap_bytes())
+            .sum();
+        pair + members + self.registry.as_ref().map(|r| r.heap_bytes()).unwrap_or(0)
     }
 }
 
@@ -871,12 +978,18 @@ impl RoutingBase for PuffinBase {
         PuffinBase::has_member_index(self)
     }
 
-    fn shared_children(&self, parent: NodeId, out: &mut Vec<NodeId>) {
-        PuffinBase::shared_children(self, parent, out)
+    fn shared_children(&self, parent: NodeId, limit: usize, out: &mut Vec<NodeId>) {
+        PuffinBase::shared_children(self, parent, limit, out)
     }
 
-    fn overlay_children(&self, scope: ScopeId, parent: NodeId, out: &mut Vec<NodeId>) {
-        PuffinBase::overlay_children(self, scope, parent, out)
+    fn overlay_children(
+        &self,
+        scope: ScopeId,
+        parent: NodeId,
+        limit: usize,
+        out: &mut Vec<NodeId>,
+    ) {
+        PuffinBase::overlay_children(self, scope, parent, limit, out)
     }
 
     fn shared_parent(&self, node: NodeId) -> Option<NodeId> {
