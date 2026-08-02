@@ -8,6 +8,14 @@ each one below says whether it does.
 
 ### Added
 
+- **`forest.member_heap_bytes` in `/v1/stats`** and `PuffinBase::member_index_bytes()`,
+  so the member index's RAM cost is visible rather than inferred. The split is
+  the point: the written index is evictable page cache, its in-heap block
+  offsets and filters are **0.2-3.6% of the mapping** and scale with total state,
+  and the memtable merge edges are ~30 B/link but bounded by the fold trigger
+  (~30 MB at the default follower trigger, ~3.6 MB on a leader at 2k/s). Sizing
+  guidance in `docs/TUNING.md`.
+
 - **Delta-varint member index** (`storage::members`, blob types
   `blaze-shared-members-v2` / `blaze-overlay-members-v2`), the registry's blocked
   layout applied to the parent-ordered pairs. **+34% of run bytes, 7.1 B/pair**,

@@ -105,6 +105,28 @@ impl Dsu {
         }
     }
 
+    /// Heap held by the merge-edge index, or 0 when it is off.
+    ///
+    /// Counted rather than estimated because this is the *unreclaimable* half of
+    /// the member index: the on-disk half is clean file-backed pages the kernel
+    /// evicts, and this is not. Includes the `SmallVec` spill, which is where
+    /// hub parents live — inline capacity covers a parent with one or two
+    /// children, and past that the list is a separate allocation.
+    pub fn children_heap_bytes(&self) -> u64 {
+        let Some(children) = &self.children else {
+            return 0;
+        };
+        let per_entry =
+            (std::mem::size_of::<NodeId>() + std::mem::size_of::<SmallVec<[NodeId; 2]>>()) as u64;
+        let mut total = children.len() as u64 * per_entry;
+        for e in children.iter() {
+            if e.value().spilled() {
+                total += (e.value().capacity() * std::mem::size_of::<NodeId>()) as u64;
+            }
+        }
+        total
+    }
+
     /// Record `child -> parent` in both directions.
     fn link(&self, child: NodeId, parent: NodeId) {
         self.parents.insert(child, parent);

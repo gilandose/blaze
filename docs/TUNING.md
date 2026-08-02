@@ -243,6 +243,35 @@ query is two to three orders of magnitude more expensive than a component
 lookup. Budget for it separately. The mapped run costing about what the heap does
 is the point: work is bounded by `cap`, not by the size of the component.
 
+### Where the bytes actually live
+
+Both on disk and in RAM, and the split is what matters for sizing. Measured by
+`examples/member_bench`:
+
+| | where | scales with | cost |
+|---|---|---|---|
+| the written index | mmap'd run — **evictable page cache** | total state | +34% of run bytes |
+| its in-heap index (block offsets + member filters) | **heap, unreclaimable** | total state | **0.2-3.6% of the mapping** |
+| memtable merge edges | **heap, unreclaimable** | **the fold trigger** | ~30 B/link |
+
+The bulk is the first row and the kernel can evict it. The second row is the one
+to add to your instance sizing: it is the same *kind* of cost as `--filter-bits`
+and roughly the same order — extrapolated to a ~108 GB indexed base at 2B links,
+0.2-4 GB on top of the ~3.8 GB the forward filters already cost. It shrinks as
+the graph densifies (3.6% at 0.5 links/node, 0.22% at 5) because a giant
+component has one parent with millions of children, so there are few distinct
+parents to index or filter.
+
+The third row looks alarming in the benchmark — 83-129 MB — and is not: that is
+an *unfolded* memtable holding several million links, which no worker runs. It is
+bounded by the fold trigger, like the rest of the memtable:
+
+- a follower at the default `--follower-fold-after-links 1000000`: **~30 MB**
+- a leader at 2k/s with a 60s tick: **~3.6 MB**, since a leader folds every tick
+
+Raising `--follower-fold-after-links` moves that number linearly.
+`forest.member_heap_bytes` in `/v1/stats` reports it live.
+
 Three things to know before turning it on:
 
 - **It is not retroactive.** Half the answer comes from merge edges the memtable
@@ -583,6 +612,9 @@ difference between roughly one page fault per lookup and seven.
 - **Tick duration p99.** A slow tick is watermark not advancing, i.e. your RPO.
 - **Heap versus RSS.** Rising RSS with flat heap is page cache doing its job, not
   a leak.
+- **`forest.member_heap_bytes`, if you run `--member-index`.** The memtable half
+  of the index, which is heap rather than page cache. It should track the fold
+  trigger; if it climbs while `folds` does not, folds have stopped.
 - **`forest.members_available`, if you run `--member-index`.** False means a run
   was written without the index and the members query is off for the whole stack.
   Nothing else degrades, and nothing logs it.
