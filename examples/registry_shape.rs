@@ -225,6 +225,41 @@ fn main() {
     row("registry (parquet)", parquet_plain);
     row("registry (pq+zstd)", parquet_zstd);
 
+    // Design 011's member index, measured rather than estimated. The estimate in
+    // the design (+20-40%, by analogy with what delta-varint did for the
+    // registry) assumes an encoding the index does not yet have: it is written
+    // as a plain fixed-stride pair table, so it costs what one costs.
+    {
+        // Both arms at the *same* registry encoding, or the comparison measures
+        // the registry rather than the index. `base_bytes` above is the flat
+        // arm, which is not the default.
+        let mut sizes = [0u64; 2];
+        for (i, member_index) in [false, true].into_iter().enumerate() {
+            let path = dir
+                .path()
+                .join(format!("base-members-{member_index}.puffin"));
+            let blobs = codec::compact_to_blobs(
+                &forest,
+                1,
+                WriteOptions {
+                    member_index,
+                    ..Default::default()
+                },
+            );
+            std::fs::write(&path, puffin::write(&blobs, BTreeMap::new())).unwrap();
+            sizes[i] = std::fs::metadata(&path).unwrap().len();
+        }
+        let (without, with) = (sizes[0], sizes[1]);
+        println!(
+            "\nmember index         +{:.1} MB   run {:.1} -> {:.1} MB   (+{:.0}%, {:.1} B/pair)",
+            (with - without) as f64 / 1e6,
+            without as f64 / 1e6,
+            with as f64 / 1e6,
+            100.0 * (with - without) as f64 / without as f64,
+            (with - without) as f64 / pairs as f64
+        );
+    }
+
     println!("\nscopes per root:");
     for (bucket, count) in &hist {
         let share = 100.0 * *count as f64 / roots.max(1) as f64;

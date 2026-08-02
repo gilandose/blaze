@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/stats", get(stats))
         .route("/v1/scopes/{scope}/components/{node}", get(component))
+        .route("/v1/scopes/{scope}/members/{node}", get(members))
         .route("/v1/scopes/{scope}/connected", get(connected))
         .route("/v1/edges", post(inject_edge))
         .with_state(state)
@@ -106,6 +107,79 @@ async fn component(
         scope,
         node,
         root: s.forest.scope_root(scope, node),
+    }))
+}
+
+/// Members returned when the caller does not ask for a cap.
+///
+/// Small on purpose. This endpoint answers "who else is in this component" for
+/// components that are small; the giant one past the percolation threshold is
+/// an export, not a query, and a generous default would mostly serve to make
+/// that mistake expensive.
+pub const DEFAULT_MEMBER_CAP: usize = 1_000;
+
+/// The largest cap the serving path will accept. Above this, the honest answer
+/// is the analytics path over the Parquet (design 004), not a bigger HTTP
+/// response built while holding a tier generation alive.
+pub const MAX_MEMBER_CAP: usize = 10_000;
+
+#[derive(Deserialize)]
+struct MembersParams {
+    cap: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct MembersResponse {
+    scope: ScopeId,
+    node: NodeId,
+    root: NodeId,
+    /// Parent-tree order, which is arbitrary. Sorting is the caller's job.
+    members: Vec<NodeId>,
+    count: usize,
+    /// True when `members` is exactly `cap` long and there is at least one more.
+    /// A client that sees this has learned the node is in a hub; retrying with a
+    /// bigger cap is the wrong move.
+    truncated: bool,
+}
+
+/// List a component from one of its nodes ([design
+/// 011](../../docs/design/011-member-index.md)).
+///
+/// `501` when the worker cannot answer — started without `--member-index`, or
+/// serving a stack containing a run written without it. Deliberately not an
+/// empty list: a caller cannot tell a singleton from an unindexed run, and this
+/// is the one failure mode where a plausible answer is worse than an error.
+async fn members(
+    State(s): State<AppState>,
+    AxumPath((scope, node)): AxumPath<(String, NodeId)>,
+    Query(p): Query<MembersParams>,
+) -> Result<Json<MembersResponse>, ApiError> {
+    let scope = parse_scope(&scope)?;
+    let cap = p.cap.unwrap_or(DEFAULT_MEMBER_CAP);
+    if cap == 0 || cap > MAX_MEMBER_CAP {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("cap must be between 1 and {MAX_MEMBER_CAP}, got {cap}"),
+        ));
+    }
+    let found = s.forest.members(scope, node, cap).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "this worker has no member index: start it with --member-index, and \
+             check forest.members_available in /v1/stats — a run written without \
+             the flag disables the query for the whole stack"
+                .into(),
+        )
+    })?;
+    let truncated = found.is_truncated();
+    let members = found.into_nodes();
+    Ok(Json(MembersResponse {
+        scope,
+        node,
+        root: s.forest.scope_root(scope, node),
+        count: members.len(),
+        members,
+        truncated,
     }))
 }
 

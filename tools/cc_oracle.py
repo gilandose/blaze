@@ -197,7 +197,36 @@ def expected_roots(src, dst, keep, n_nodes):
     return roots[labels], n_comp
 
 
+def expected_members(src, dst, keep, n_nodes):
+    """`node -> the exact set of node ids in its component`, from scipy labels.
+
+    A strictly stronger check than the roots. An implementation can name the
+    right representative for every node and still lose members: a lost member
+    still resolves upward through its parent chain, so `scope_root` is unmoved
+    while `members` under-reports. Only a set comparison sees it.
+    """
+    s, d = src[keep], dst[keep]
+    adj = coo_matrix(
+        (np.ones(len(s), dtype=np.int8), (s, d)), shape=(n_nodes, n_nodes)
+    )
+    _, labels = connected_components(adj, directed=False)
+    order = np.argsort(labels, kind="stable")
+    bounds = np.searchsorted(labels[order], np.arange(labels.max() + 2))
+    return labels, order, bounds
+
+
+def members_of(node, labels, order, bounds):
+    lab = labels[node]
+    return order[bounds[lab]:bounds[lab + 1]]
+
+
 # ---------------------------------------------------------------- end to end
+
+
+# Kept in step with `examples/oracle.rs`, which strides its own sorted node set
+# the same way so every mode asks about the same nodes.
+MEMBER_SAMPLE = 150
+MEMBER_CAP = 2000
 
 
 def free_port():
@@ -228,6 +257,10 @@ class Worker:
                 "--data-dir", str(self.data_dir),
                 "--election", "static:true",
                 "--flush-interval-secs", str(self.flush_secs),
+                # Design 011. On here so the API mode grades membership too —
+                # including across the restart, where the second worker answers
+                # from runs the first one wrote.
+                "--member-index",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -339,6 +372,60 @@ class Worker:
         return out
 
 
+    def members(self, scopes, nodes, cap):
+        """Query members for a sample of nodes, through the API."""
+        out = {}
+        for scope in scopes:
+            c = self.conn()
+            rows = []
+            for node in nodes:
+                got = self.get(
+                    f"/v1/scopes/{scope}/members/{int(node)}?cap={cap}", conn=c
+                )
+                if got is None:
+                    raise RuntimeError(
+                        f"the worker refused members for scope {scope}: it was "
+                        "started with --member-index, so this is a real failure"
+                    )
+                rows.append((int(node), bool(got["truncated"]), got["members"]))
+            c.close()
+            out[scope] = rows
+        return out
+
+
+def compare_members(mode, scope, rows, labels, order, bounds, cap):
+    """Grade one scope's member sets against scipy. Returns the failure count.
+
+    Truncation is not a free pass: a truncated answer still has to be exactly
+    `cap` real members of the right component, which is the contract
+    `docs/design/011-member-index.md` states and the one a caller relies on.
+    """
+    bad = []
+    for node, truncated, got in rows:
+        want = set(int(x) for x in members_of(node, labels, order, bounds))
+        got_set = set(int(x) for x in got)
+        if len(got_set) != len(got):
+            bad.append((node, "duplicate members"))
+        elif truncated:
+            if len(got) != cap:
+                bad.append((node, f"truncated at {len(got)}, not {cap}"))
+            elif not got_set <= want:
+                bad.append((node, f"{len(got_set - want)} members not in the component"))
+        elif got_set != want:
+            bad.append((
+                node,
+                f"{len(want - got_set)} missing, {len(got_set - want)} extra "
+                f"(blaze {len(got_set)}, scipy {len(want)})",
+            ))
+    if bad:
+        print(f"  scope {scope}: {len(bad)} of {len(rows)} member sets wrong")
+        for node, why in bad[:5]:
+            print(f"    node {node}: {why}")
+        return 1
+    print(f"  scope {scope}: {len(rows)} member sets match")
+    return 0
+
+
 def run_api_mode(edges, scopes, nodes, tmp):
     """Ingest over HTTP, restart the worker mid-stream, then query over HTTP.
 
@@ -370,8 +457,11 @@ def run_api_mode(edges, scopes, nodes, tmp):
     worker.await_ingested(len(edges) - half)
     print(f"  querying {len(scopes)} scopes x {len(nodes)} nodes")
     got = worker.roots(scopes, nodes)
+    sample = nodes[::max(1, len(nodes) // MEMBER_SAMPLE)]
+    print(f"  querying members for {len(sample)} nodes per scope")
+    members = worker.members(scopes, sample, MEMBER_CAP)
     worker.stop()
-    return got
+    return got, members
 
 
 def main():
@@ -414,10 +504,12 @@ def main():
     # The oracle, per scope: global edges plus that scope's own.
     is_global = scope == 0
     oracle = {}
+    member_oracle = {}
     for s in [0] + list(range(1, args.scopes + 1)):
         keep = is_global if s == 0 else (is_global | (scope == s))
         roots, n_comp = expected_roots(src, dst, keep, n_nodes)
         oracle[s] = roots
+        member_oracle[s] = expected_members(src, dst, keep, n_nodes)
         print(f"  scope {s:<3} {n_comp:>7} components")
     if all(n == 1 for n in [len(np.unique(oracle[0]))]):
         print("  WARNING: the global graph is a single component; this run is weak")
@@ -434,16 +526,22 @@ def main():
                 check=True,
             )
             with tempfile.TemporaryDirectory() as tmp:
-                got = run_api_mode(
+                got, got_members = run_api_mode(
                     list(zip(src, dst, scope)), all_scopes, seen, pathlib.Path(tmp)
                 )
         else:
             out_file = CACHE / f"{args.dataset}-{mode}-roots.txt"
+            members_file = CACHE / f"{args.dataset}-{mode}-members.txt"
             subprocess.run(
                 ["cargo", "run", "--release", "--quiet", "--example", "oracle",
-                 "--", str(edge_file), str(out_file), mode, str(args.scopes)],
+                 "--", str(edge_file), str(out_file), mode, str(args.scopes),
+                 str(members_file)],
                 check=True,
             )
+            got_members = {s: [] for s in all_scopes}
+            for line in members_file.read_text().splitlines():
+                f = [int(x) for x in line.split()]
+                got_members[f[0]].append((f[1], bool(f[2]), f[3:]))
             rows = np.loadtxt(out_file, dtype=np.int64)
             got = {}
             for s in all_scopes:
@@ -466,6 +564,10 @@ def main():
                     print(f"    node {seen[i]}: blaze {got[s][i]}, scipy {want[i]}")
             else:
                 print(f"  scope {s}: {len(seen)} roots match")
+            labels, order, bounds = member_oracle[s]
+            failures += compare_members(
+                mode, s, got_members[s], labels, order, bounds, MEMBER_CAP
+            )
 
     print()
     if failures:

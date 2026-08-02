@@ -12,7 +12,10 @@ use blaze::api::AppState;
 use blaze::core::{EdgeEvent, ScopedForest, Visibility};
 use blaze::grpc::GrpcService;
 use blaze::grpc::pb::blaze_service_client::BlazeServiceClient;
-use blaze::grpc::pb::{CheckConnectedRequest, GetComponentRequest, InjectEdgeRequest};
+use blaze::grpc::pb::{
+    CheckConnectedRequest, GetComponentRequest, GetMembersRequest, GetStatsRequest,
+    InjectEdgeRequest,
+};
 use blaze::ha::{LeaderElector, StaticElector};
 use blaze::ingest::{EdgeBuffer, Pipeline};
 
@@ -170,5 +173,112 @@ async fn grpc_inject_edge_reaches_channel() {
     let event = rx.recv().await.unwrap();
     assert_eq!(event.visibility, Visibility::Global);
 
+    server.abort();
+}
+
+/// `GetMembers`, and the refusal that is the whole point of it returning a
+/// status rather than an empty list.
+#[tokio::test]
+async fn grpc_get_members_lists_a_component_or_refuses() {
+    // The default fixture has no member index.
+    let (state, _rx) = test_state();
+    let (mut client, server) = serve(state).await;
+    let err = client
+        .get_members(GetMembersRequest {
+            scope: 0,
+            node: 500,
+            cap: 0,
+        })
+        .await
+        .expect_err("a worker with no index must refuse");
+    assert_eq!(err.code(), tonic::Code::Unimplemented);
+    assert!(
+        err.message().contains("--member-index"),
+        "{}",
+        err.message()
+    );
+
+    let stats = client
+        .get_stats(GetStatsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stats.forest.unwrap().members_available);
+    server.abort();
+
+    // The same state with the index on.
+    let forest = Arc::new(ScopedForest::new().tracking_members());
+    forest.apply(&global_edge(500, 105));
+    forest.apply(&global_edge(105, 42));
+    forest.apply(&scoped_edge(1, 2, &[7]));
+    let (tx, _rx) = mpsc::channel(16);
+    let pipeline = Pipeline::new(forest.clone(), Arc::new(EdgeBuffer::new()), 0);
+    let elector: Arc<dyn LeaderElector> = Arc::new(StaticElector(true));
+    let (mut client, server) = serve(AppState {
+        forest,
+        buffer: pipeline.buffer.clone(),
+        pipeline_stats: pipeline.stats.clone(),
+        ingest_tx: Some(tx),
+        elector,
+        worker_id: "grpc-test".into(),
+        started_at: Instant::now(),
+    })
+    .await;
+
+    let got = client
+        .get_members(GetMembersRequest {
+            scope: 0,
+            node: 500,
+            cap: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.root, 42);
+    assert!(!got.truncated);
+    let mut members = got.members;
+    members.sort_unstable();
+    assert_eq!(members, vec![42, 105, 500]);
+
+    // Scope isolation, same as every other query.
+    let scoped = client
+        .get_members(GetMembersRequest {
+            scope: 8,
+            node: 1,
+            cap: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(scoped.members, vec![1], "scope 8 never saw that edge");
+
+    // The cap: honoured, and rejected above the serving ceiling.
+    let capped = client
+        .get_members(GetMembersRequest {
+            scope: 0,
+            node: 500,
+            cap: 2,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(capped.members.len(), 2);
+    assert!(capped.truncated);
+    let err = client
+        .get_members(GetMembersRequest {
+            scope: 0,
+            node: 500,
+            cap: 999_999,
+        })
+        .await
+        .expect_err("above the ceiling");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    let stats = client
+        .get_stats(GetStatsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stats.forest.unwrap().members_available);
     server.abort();
 }

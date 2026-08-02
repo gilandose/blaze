@@ -126,12 +126,19 @@ struct Args {
     /// Off by default because it is the one index whose cost falls on
     /// deployments that may never query it: filters pay for themselves on every
     /// lookup, a member index only if someone asks for members. Per-run like
-    /// `--filter-bits` — runs already written keep whatever they were written
-    /// with, a stack may mix, and turning it on takes effect from the next fold
-    /// rather than requiring a rewrite.
+    /// `--filter-bits` for the *written* half — runs already written keep
+    /// whatever they were written with, a stack may mix, and turning it on
+    /// takes effect from the next fold rather than requiring a rewrite.
     ///
-    /// Only useful with `--routing-base disk`: it is written into runs, and a
-    /// RAM-mode worker has none.
+    /// The **memtable** half is neither per-run nor retroactive: merge edges
+    /// are recorded as unions happen, so a worker started without this flag
+    /// cannot answer members until it is restarted with it. And one run written
+    /// without it makes the whole stack unable to answer — it says so rather
+    /// than under-reporting, and `forest.members_available` in `/v1/stats` is
+    /// where an operator sees that.
+    ///
+    /// Works in both `--routing-base` modes: in `ram` the whole answer comes
+    /// from the heap, in `disk` from the runs plus the memtable.
     #[arg(long, default_value_t = false)]
     member_index: bool,
 
@@ -380,9 +387,19 @@ async fn main() -> anyhow::Result<()> {
     // Layer stack the flusher folds onto, seeded from whatever the catalog
     // already has so the first fold can be a delta rather than a rewrite.
     let mut local_layers = None;
+    // Memtable-side member tracking has to be on from the first edge — the
+    // merge edges it records cannot be reconstructed later — so it is decided
+    // here, before anything is applied, rather than at the first query.
+    let new_forest = |f: ScopedForest| {
+        if args.member_index {
+            f.tracking_members()
+        } else {
+            f
+        }
+    };
     let (forest, watermark) = match args.routing_base.as_str() {
         "ram" => {
-            let forest = Arc::new(ScopedForest::new());
+            let forest = Arc::new(new_forest(ScopedForest::new()));
             let watermark = hydrate_from_catalog(&forest, &store, &catalog).await?;
             (forest, watermark)
         }
@@ -391,11 +408,14 @@ async fn main() -> anyhow::Result<()> {
             match open_base_from_catalog(&store, &catalog, &dir).await? {
                 Some((base, watermark, local)) => {
                     local_layers = Some(local);
-                    (Arc::new(ScopedForest::with_base(base)), watermark)
+                    (
+                        Arc::new(new_forest(ScopedForest::with_base(base))),
+                        watermark,
+                    )
                 }
                 None => {
                     info!("no committed snapshot yet; starting with an empty memtable");
-                    (Arc::new(ScopedForest::new()), 0)
+                    (Arc::new(new_forest(ScopedForest::new())), 0)
                 }
             }
         }

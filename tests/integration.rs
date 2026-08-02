@@ -246,6 +246,79 @@ async fn api_component_and_connectivity() {
     assert!(body["forest"]["global_merges"].as_u64().unwrap() >= 1);
 }
 
+/// `GET /v1/scopes/{scope}/members/{node}` — design 011's endpoint, including
+/// the refusal, which is the part that matters operationally: a worker without
+/// the index must not answer with a short list.
+#[tokio::test]
+async fn api_members_lists_a_component_or_refuses() {
+    // Default state: no member index.
+    let (state, _rx) = test_app(true);
+    let app = router(state);
+    let (status, body) = get_json(app.clone(), "/v1/scopes/global/members/500").await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        body["error"].as_str().unwrap().contains("--member-index"),
+        "the refusal must name the flag: {body}"
+    );
+    let (_, stats) = get_json(app, "/v1/stats").await;
+    assert_eq!(
+        stats["forest"]["members_available"],
+        serde_json::Value::Bool(false)
+    );
+
+    // The same state with the index on.
+    let forest = Arc::new(ScopedForest::new().tracking_members());
+    forest.apply(&global_edge(500, 105));
+    forest.apply(&global_edge(105, 42));
+    forest.apply(&scoped_edge(1, 2, &[7]));
+    let (tx, _rx) = mpsc::channel(16);
+    let pipeline = Pipeline::new(forest.clone(), Arc::new(EdgeBuffer::new()), 0);
+    let app = router(AppState {
+        forest,
+        buffer: pipeline.buffer.clone(),
+        pipeline_stats: pipeline.stats.clone(),
+        ingest_tx: Some(tx),
+        elector: Arc::new(StaticElector(true)),
+        worker_id: "api-test".into(),
+        started_at: Instant::now(),
+    });
+
+    let (status, body) = get_json(app.clone(), "/v1/scopes/global/members/500").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["root"], 42);
+    assert_eq!(body["count"], 3);
+    assert_eq!(body["truncated"], serde_json::Value::Bool(false));
+    let mut members: Vec<u64> = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    members.sort_unstable();
+    assert_eq!(members, vec![42, 105, 500]);
+
+    // Scope isolation holds here exactly as it does for connectivity.
+    let (_, body) = get_json(app.clone(), "/v1/scopes/7/members/1").await;
+    assert_eq!(body["count"], 2);
+    let (_, body) = get_json(app.clone(), "/v1/scopes/8/members/1").await;
+    assert_eq!(body["count"], 1, "scope 8 never saw that edge");
+
+    // The cap, and its bounds.
+    let (_, body) = get_json(app.clone(), "/v1/scopes/global/members/500?cap=2").await;
+    assert_eq!(body["count"], 2);
+    assert_eq!(body["truncated"], serde_json::Value::Bool(true));
+    let (status, _) = get_json(app.clone(), "/v1/scopes/global/members/500?cap=0").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get_json(app.clone(), "/v1/scopes/global/members/500?cap=99999").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, stats) = get_json(app, "/v1/stats").await;
+    assert_eq!(
+        stats["forest"]["members_available"],
+        serde_json::Value::Bool(true)
+    );
+}
+
 #[tokio::test]
 async fn api_edge_injection_feeds_pipeline() {
     let (state, mut rx) = test_app(false);

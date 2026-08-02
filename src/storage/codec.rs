@@ -81,7 +81,7 @@ pub const OVERLAY_MEMBERS_BLOB_TYPE: &str = "blaze-overlay-members-v1";
 /// **Self-edges are excluded and that is load-bearing.** A root's own entry
 /// maps it to itself; kept, it would make the downward walk revisit the root
 /// forever.
-fn invert_table(data: &[u8]) -> Bytes {
+pub(crate) fn invert_table(data: &[u8]) -> Bytes {
     let mut pairs: Vec<(NodeId, NodeId)> = table_keys(data)
         .filter(|(node, parent)| node != parent)
         .map(|(node, parent)| (parent, node))

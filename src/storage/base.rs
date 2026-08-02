@@ -155,6 +155,36 @@ impl PairTable {
         None
     }
 
+    /// First index whose key is >= `node`, over the whole table.
+    ///
+    /// Deliberately not narrowed by the sparse index: that narrows to the block
+    /// containing a key, and in a table with **duplicate** keys — which the
+    /// member index has by construction, one row per child — the run of equal
+    /// keys can start in an earlier block. Correctness first; narrowing this
+    /// safely is a later optimisation, and the cost is a full binary search
+    /// (~27 steps at 100M) rather than a block-local one.
+    fn lower_bound(&self, data: &[u8], node: NodeId) -> usize {
+        let (mut lo, mut hi) = (0usize, self.count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.key_at(data, mid) < node {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Values stored against `key`, contiguous because the table is sorted.
+    fn values_for(&self, data: &[u8], key: NodeId, out: &mut Vec<NodeId>) {
+        let mut i = self.lower_bound(data, key);
+        while i < self.count && self.key_at(data, i) == key {
+            out.push(self.value_at(data, i));
+            i += 1;
+        }
+    }
+
     /// Stream every pair in stored (ascending key) order: a sequential scan of
     /// the mapping with nothing collected, which is what keeps compaction at
     /// O(memtable) heap instead of O(state).
@@ -377,6 +407,11 @@ pub struct PuffinBase {
     reader: ScanReader,
     shared: Option<PairTable>,
     overlays: BTreeMap<ScopeId, PairTable>,
+    /// The same pairs keyed by parent, so a component can be listed downward.
+    /// `None` on a run written without `--member-index`; absence means "this run
+    /// cannot answer members", not "this run has no members".
+    shared_members: Option<PairTable>,
+    overlay_members: BTreeMap<ScopeId, PairTable>,
     registry: Option<RegistryTable>,
     /// Populated only when the file predates the registry blob: rebuilt at
     /// load time so runtime lookups stay O(1)-ish either way.
@@ -394,6 +429,29 @@ pub struct PuffinBase {
 }
 
 impl PuffinBase {
+    /// Whether this run carries a member index at all.
+    ///
+    /// Distinguishes "written without `--member-index`" from "indexed, and this
+    /// node has no children". A query that cannot tell those apart would report
+    /// a component as complete when it had merely not been indexed.
+    pub fn has_member_index(&self) -> bool {
+        self.shared_members.is_some()
+    }
+
+    /// Nodes whose recorded shared parent is `parent`, appended to `out`.
+    pub fn shared_children(&self, parent: NodeId, out: &mut Vec<NodeId>) {
+        if let Some(t) = &self.shared_members {
+            t.values_for(&self.mmap, parent, out);
+        }
+    }
+
+    /// Same within `scope`'s overlay.
+    pub fn overlay_children(&self, scope: ScopeId, parent: NodeId, out: &mut Vec<NodeId>) {
+        if let Some(t) = self.overlay_members.get(&scope) {
+            t.values_for(&self.mmap, parent, out);
+        }
+    }
+
     /// Map a Puffin routing snapshot from local disk.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_reader(path, ScanReader::default())
@@ -428,6 +486,8 @@ impl PuffinBase {
         let mut registry = None;
         let mut shared_filter = None;
         let mut overlay_filter = None;
+        let mut shared_members = None;
+        let mut overlay_members = BTreeMap::new();
         let mut sequence = 0u64;
         for blob in &index {
             sequence = sequence.max(blob.sequence_number.max(0) as u64);
@@ -457,6 +517,19 @@ impl PuffinBase {
                         blob.range(),
                     )?));
                 }
+                codec::SHARED_MEMBERS_BLOB_TYPE => {
+                    shared_members = Some(PairTable::parse(&mmap, blob.range())?);
+                }
+                codec::OVERLAY_MEMBERS_BLOB_TYPE => {
+                    let scope: ScopeId = blob
+                        .properties
+                        .get(codec::SCOPE_ID_PROP)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("overlay member blob missing {}", codec::SCOPE_ID_PROP)
+                        })?
+                        .parse()?;
+                    overlay_members.insert(scope, PairTable::parse(&mmap, blob.range())?);
+                }
                 codec::SHARED_FILTER_BLOB_TYPE => {
                     shared_filter = Some(BlockedFilter::decode(&mmap[blob.range()])?);
                 }
@@ -474,6 +547,8 @@ impl PuffinBase {
             reader,
             shared,
             overlays,
+            shared_members,
+            overlay_members,
             registry,
             fallback_registry: None,
             shared_filter,
@@ -792,6 +867,18 @@ impl PuffinBase {
 }
 
 impl RoutingBase for PuffinBase {
+    fn has_member_index(&self) -> bool {
+        PuffinBase::has_member_index(self)
+    }
+
+    fn shared_children(&self, parent: NodeId, out: &mut Vec<NodeId>) {
+        PuffinBase::shared_children(self, parent, out)
+    }
+
+    fn overlay_children(&self, scope: ScopeId, parent: NodeId, out: &mut Vec<NodeId>) {
+        PuffinBase::overlay_children(self, scope, parent, out)
+    }
+
     fn shared_parent(&self, node: NodeId) -> Option<NodeId> {
         // A negative filter answer is definitive, and costs one cache line
         // instead of a narrowed binary search over the mapping.

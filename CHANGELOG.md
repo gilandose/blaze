@@ -4,6 +4,33 @@ Notable changes, newest first. Versions follow [semver](https://semver.org);
 while the major is `0`, a minor bump may change on-disk formats or CLI flags —
 each one below says whether it does.
 
+## Unreleased
+
+### Added
+
+- **Member index (design 011), behind `--member-index` (off).** Answers *who else
+  is in this component*: `GET /v1/scopes/{scope}/members/{node}?cap=` and
+  `BlazeService.GetMembers`, plus `ScopedForest::members`. Two halves — a
+  parent-ordered Puffin blob emitted by folds and by tiered compaction, and
+  merge-edge tracking in the memtable — walked downward together, capped, and
+  returned as `Complete` or `Truncated` so a hub can never be mistaken for a
+  small component.
+  - **New blob types** `blaze-shared-members-v1` and `blaze-overlay-members-v1`.
+    Additive: a reader that does not know them ignores them, and a run written
+    without them is unchanged.
+  - **A stack containing one unindexed run refuses the query** rather than
+    under-reporting. Watch `forest.members_available` in `/v1/stats` — it goes
+    false at the next base swap, not at startup.
+  - **Not retroactive**: memtable merge edges are recorded as unions happen, so
+    the flag needs a restart to take effect.
+  - **Costs +77% of run bytes** (+62.6 MB on 81.0 MB, 16.1 B/pair, measured by
+    `examples/registry_shape`). The design estimated +20-40% by assuming a
+    delta-varint encoding that was not built; that correction is recorded in
+    `docs/design/011-member-index.md`.
+- `tools/cc_oracle.py` now grades **member sets** against scipy in all three
+  modes, not just roots. Strictly stronger: dropping one child per parent leaves
+  every root correct and breaks ~60% of the member sets.
+
 ## [0.1.0] — 2026-08-01
 
 First tagged release. Everything below landed before it; the sections group the

@@ -92,6 +92,9 @@ Query composition (lock-free, read-only):
 ```text
 scope_root(s, x) = overlay(s).find_ro(global.find_ro(x))   // falls back to global root
 connected(s, u, v) = scope_root(s, u) == scope_root(s, v)
+members(s, x, cap) = walk overlay(s) down from scope_root, then each shared
+                     subtree beneath it — Complete or Truncated, never a
+                     promise (--member-index; docs/design/011)
 ```
 
 **Canonical roots — lowest graph id wins.** Both layers union by minimum id,
@@ -154,11 +157,13 @@ classDiagram
         union_lock: Mutex
         apply(EdgeEvent)
         scope_root(scope, node) NodeId
+        members(scope, node, cap) Option~Members~
         snapshot() ForestSnapshot
         hydrate(ForestSnapshot)
     }
     class Dsu {
         parents: DashMap~NodeId, NodeId~
+        children: Option~DashMap~NodeId, SmallVec~~
         find(x) NodeId
         find_ro(x) NodeId
         union(u, v) Option~Merge~
@@ -211,15 +216,27 @@ zstd-compressed, one row group per sealed segment.
 
 ```text
 container:  "PFA1" | blob₀ … blobₙ | "PFA1" | footer JSON | len:u32 LE | flags:u32 | "PFA1"
-blob types: blaze-global-dsu-v1                  (one)
-            blaze-scope-dsu-v1 {scope-id: "N"}   (one per active scope)
+blob types: blaze-global-dsu-v1                       (one)
+            blaze-scope-dsu-v1 {scope-id: "N"}        (one per active scope)
+            blaze-shared-members-v1                   (--member-index only)
+            blaze-overlay-members-v1 {scope-id: "N"}  (--member-index only)
 payload:    count:u64 LE, then count × (node:u64 LE, root:u64 LE)
             sorted by node — binary-searchable in place / via mmap
+            the *-members-v1 blobs are the same pairs sorted by root, so a
+            component can be listed downward; keys repeat there by
+            construction, so lookups cannot use the sparse page index
 ```
 
 Roots in the payload are canonical (lowest graph id in the component as of
 this snapshot). Unknown blob types are ignored on read — the forward-compat
-hook the delta design (docs/design/001) considered and rejected `*-delta-v1` types; only `blaze-global-dsu-v1` and `blaze-scope-dsu-v1` exist.
+hook the delta design (docs/design/001) considered and rejected `*-delta-v1`
+types. What a run actually carries is decided by the flags it was written with:
+the two DSU blobs always, plus `blaze-registry-*` and the filter blobs, plus the
+member blobs above under `--member-index`. **The blob type is the interface** —
+a reader that does not recognise one ignores it, and a stack may mix runs
+written with different flags. The one place that is not enough is the member
+index, where a missing blob means members are *unreachable* rather than absent,
+so the query refuses for the whole stack instead of under-reporting.
 
 ### Snapshot metadata (`metadata/snap-*.json`)
 
@@ -629,8 +646,8 @@ write path and retains storage-side compaction as follow-on work.
 
 - **gRPC** (`src/grpc`): a tonic `BlazeService` over the same `AppState` as
   the Axum API, served on a second port (`--grpc-listen`). The query RPCs stay
-  lock-free (`forest.scope_root` / `forest.connected`) and `InjectEdge` feeds
-  the same ingest channel as `POST /v1/edges`. The proto is compiled in
+  lock-free (`forest.scope_root` / `forest.connected` / `forest.members`) and
+  `InjectEdge` feeds the same ingest channel as `POST /v1/edges`. The proto is compiled in
   `build.rs` with the pure-Rust `protox` compiler, so no `protoc` is needed.
 - **Log sources**: implement a consumer feeding the pipeline channel with
   log-native offsets.
