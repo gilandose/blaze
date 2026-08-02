@@ -8,6 +8,16 @@ each one below says whether it does.
 
 ### Added
 
+- **Delta-varint member index** (`storage::members`, blob types
+  `blaze-shared-members-v2` / `blaze-overlay-members-v2`), the registry's blocked
+  layout applied to the parent-ordered pairs. **+34% of run bytes, 7.1 B/pair**,
+  down from +77% and 16.1 B/pair for the fixed-stride form. Both encodings stay
+  readable and a stack may mix, so the change needed no rewrite.
+- **Membership filters over the member index's parent keys**
+  (`blaze-*-members-filter-v1`), sized per distinct parent rather than per pair.
+  A downward walk probes mostly leaves, and this makes rejecting one a cache line
+  instead of a binary search.
+
 - **Member index (design 011), behind `--member-index` (off).** Answers *who else
   is in this component*: `GET /v1/scopes/{scope}/members/{node}?cap=` and
   `BlazeService.GetMembers`, plus `ScopedForest::members`. Two halves — a
@@ -38,6 +48,18 @@ each one below says whether it does.
 
 ### Fixed
 
+- **The cap bounded the answer but not the work.** In a flattened run a
+  component's root has every member as a direct child, and the reader
+  materialised all of them before the walk consulted the cap — so a `cap = 1000`
+  query on a hub cost O(component) rather than O(cap): **1.1-1.5 ms** on a mapped
+  run, tracking graph size. Child fetches now take a budget, and the same query
+  is **64 us**, matching what the in-heap walk costs.
+
+  Two wrong budgets are recorded alongside the right one in `Walk::expand`:
+  "room remaining" silently drops members when a fetched child is already
+  visited (which the two-level scoped walk causes by construction), and
+  "decode it all, then truncate" made the blocked encoding *slower than the
+  fixed-stride table it replaced* on a hub record.
 - **`members` in a tenant scope returned a single member** when the scope's
   overlay was larger than the cap, instead of `cap` members. The seed stage's
   truncation was OR'd into the outer walk before it ran, and the walk stops as

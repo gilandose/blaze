@@ -88,16 +88,20 @@ impl Dsu {
         self.children.is_some()
     }
 
-    /// Roots absorbed directly into `parent`, appended to `out`.
+    /// At most `limit` roots absorbed directly into `parent`, appended to `out`.
+    ///
+    /// Bounded for the same reason the on-disk side is: a hub root can have
+    /// hundreds of thousands of children, and a capped walk must not pay for all
+    /// of them to hand back a thousand.
     ///
     /// Never deduplicated against `out`: a root is absorbed exactly once, so
     /// this map cannot contain a duplicate, and the caller's visited set covers
     /// the case where two sources offer the same node.
-    pub fn children_of(&self, parent: NodeId, out: &mut Vec<NodeId>) {
+    pub fn children_of(&self, parent: NodeId, limit: usize, out: &mut Vec<NodeId>) {
         if let Some(children) = &self.children
             && let Some(kids) = children.get(&parent)
         {
-            out.extend_from_slice(&kids);
+            out.extend_from_slice(&kids[..kids.len().min(limit)]);
         }
     }
 
@@ -268,7 +272,7 @@ mod tests {
 
     fn children(d: &Dsu, parent: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
-        d.children_of(parent, &mut out);
+        d.children_of(parent, usize::MAX, &mut out);
         out.sort_unstable();
         out
     }

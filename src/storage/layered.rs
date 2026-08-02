@@ -176,15 +176,34 @@ impl RoutingBase for LayeredBase {
     /// first hit. Disjointness applies to a *node's* parent entry, not to a
     /// parent's children: the same parent can collect children in several runs
     /// as the component grows, so all of them count.
-    fn shared_children(&self, parent: NodeId, out: &mut Vec<NodeId>) {
+    fn shared_children(&self, parent: NodeId, limit: usize, out: &mut Vec<NodeId>) {
+        let start = out.len();
         for layer in &self.layers {
-            layer.shared_children(parent, out);
+            // The budget is what the caller still has room for, so it shrinks as
+            // earlier layers contribute; a stack must not hand back more than a
+            // single run would.
+            let taken = out.len() - start;
+            if taken >= limit {
+                return;
+            }
+            layer.shared_children(parent, limit - taken, out);
         }
     }
 
-    fn overlay_children(&self, scope: ScopeId, parent: NodeId, out: &mut Vec<NodeId>) {
+    fn overlay_children(
+        &self,
+        scope: ScopeId,
+        parent: NodeId,
+        limit: usize,
+        out: &mut Vec<NodeId>,
+    ) {
+        let start = out.len();
         for layer in &self.layers {
-            layer.overlay_children(scope, parent, out);
+            let taken = out.len() - start;
+            if taken >= limit {
+                return;
+            }
+            layer.overlay_children(scope, parent, limit - taken, out);
         }
     }
 

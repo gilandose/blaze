@@ -57,6 +57,7 @@ use crate::storage::base::RegistryIter;
 use crate::storage::codec::{self, WriteOptions};
 use crate::storage::filter::{self, BlockedFilter};
 use crate::storage::layered::LayeredBase;
+use crate::storage::members;
 use crate::storage::puffin::Blob;
 use crate::storage::registry::{RegistryEncoding, RegistryWriter};
 
@@ -190,19 +191,41 @@ pub fn compact_layers(
     // (`LayeredBase::has_member_index` requires every layer), so a deployment
     // would lose the query silently the first time tiering fired. Inverted from
     // the payloads just written, exactly as the two write paths in `codec` do.
+    // The member index has to survive compaction or it does not survive at all:
+    // a merged run without it makes the whole stack unable to answer members
+    // (`LayeredBase::has_member_index` requires every layer), so a deployment
+    // would lose the query silently the first time tiering fired.
     if opts.member_index {
-        blobs.push(blob(
-            codec::SHARED_MEMBERS_BLOB_TYPE,
-            codec::invert_table(&shared_payload),
-            BTreeMap::new(),
-        ));
-        for (scope, data, _) in &overlay_payloads {
-            blobs.push(blob(
-                codec::OVERLAY_MEMBERS_BLOB_TYPE,
-                codec::invert_table(data),
-                BTreeMap::from([(codec::SCOPE_ID_PROP.into(), scope.to_string())]),
-            ));
+        let mut members = Vec::new();
+        let mut shared_parents: Vec<NodeId> = Vec::new();
+        let mut overlay_parents: Vec<(ScopeId, Vec<NodeId>)> = Vec::new();
+        if let Some((blob_type, data, parents)) =
+            codec::encode_members(&shared_payload, opts.members, members::Tier::Shared)
+        {
+            shared_parents = parents;
+            members.push(blob(blob_type, data, BTreeMap::new()));
         }
+        for (scope, data, _) in &overlay_payloads {
+            if let Some((blob_type, payload, parents)) =
+                codec::encode_members(data, opts.members, members::Tier::Overlay)
+            {
+                overlay_parents.push((*scope, parents));
+                members.push(blob(
+                    blob_type,
+                    payload,
+                    BTreeMap::from([(codec::SCOPE_ID_PROP.into(), scope.to_string())]),
+                ));
+            }
+        }
+        // Same filters the fold path emits. A compacted run without them would
+        // be the one run in the stack whose leaves cost a binary search, and
+        // tiering means it is also the largest.
+        for (blob_type, filter) in
+            codec::member_filters(&shared_parents, &overlay_parents, opts.filter_bits)
+        {
+            members.push(blob(blob_type, filter.encode(), BTreeMap::new()));
+        }
+        blobs.append(&mut members);
     }
 
     (blobs, stats)

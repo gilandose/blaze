@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::core::{ForestSnapshot, NodeId, ScopeId, ScopedForest, SnapshotSink};
 use crate::storage::filter::BlockedFilter;
+use crate::storage::members::{MemberEncoding, MemberWriter, Tier};
 use crate::storage::puffin::Blob;
 use crate::storage::registry::{RegistryEncoding, RegistryWriter};
 
@@ -30,6 +31,11 @@ pub struct WriteOptions {
     /// any node in it. Off by default: it is the one index whose cost falls on
     /// deployments that may never query it. See design 011.
     pub member_index: bool,
+    /// How that index is encoded. `Blocked` is delta-varint records in indexed
+    /// blocks; `Flat` is the fixed 16-byte stride it shipped as, kept readable
+    /// and writable so a run can be produced for a reader that predates the
+    /// blocked form. See [`crate::storage::members`].
+    pub members: MemberEncoding,
 }
 
 impl Default for WriteOptions {
@@ -38,6 +44,7 @@ impl Default for WriteOptions {
             filter_bits: crate::storage::filter::DEFAULT_FILTER_BITS,
             registry: RegistryEncoding::default(),
             member_index: false,
+            members: MemberEncoding::default(),
         }
     }
 }
@@ -69,31 +76,103 @@ pub const OVERLAY_FILTER_BLOB_TYPE: &str = "blaze-overlay-filter-v1";
 /// never rewritten once written, only superseded by a fixup further up the
 /// chain, whereas the root of a component moves downward as smaller ids join.
 /// An index keyed on the root would go stale; this one cannot.
-pub const SHARED_MEMBERS_BLOB_TYPE: &str = "blaze-shared-members-v1";
-pub const OVERLAY_MEMBERS_BLOB_TYPE: &str = "blaze-overlay-members-v1";
+pub use crate::storage::members::{
+    OVERLAY_BLOCKED_BLOB_TYPE as OVERLAY_MEMBERS_V2_BLOB_TYPE,
+    OVERLAY_FLAT_BLOB_TYPE as OVERLAY_MEMBERS_BLOB_TYPE,
+    SHARED_BLOCKED_BLOB_TYPE as SHARED_MEMBERS_V2_BLOB_TYPE,
+    SHARED_FLAT_BLOB_TYPE as SHARED_MEMBERS_BLOB_TYPE,
+};
 
-/// Re-sort an encoded `(node, parent)` table by parent, dropping self-edges.
+/// Membership filters over the member index's **parent** keys.
 ///
-/// Built by re-reading the payload already in hand, like the filters, so
-/// nothing extra is buffered during the streaming write and the index cannot
-/// drift from the table it describes.
+/// The downward walk expands every node it admits, and almost none of them have
+/// children — a leaf is the common case, and without this rejecting one costs a
+/// full binary search over a table that cannot be narrowed by the sparse index
+/// (duplicate keys; see [`crate::storage::base::PairTable::lower_bound`]).
+/// Measured at ~1.1 us per member from a mapped run before these existed.
 ///
-/// **Self-edges are excluded and that is load-bearing.** A root's own entry
-/// maps it to itself; kept, it would make the downward walk revisit the root
-/// forever.
-pub(crate) fn invert_table(data: &[u8]) -> Bytes {
+/// Cheaper than the forward filters, too: they are sized per *pair*, and these
+/// are sized per **distinct parent**, which is far fewer.
+pub const SHARED_MEMBERS_FILTER_BLOB_TYPE: &str = "blaze-shared-members-filter-v1";
+pub const OVERLAY_MEMBERS_FILTER_BLOB_TYPE: &str = "blaze-overlay-members-filter-v1";
+
+/// The member-index filters, from the distinct parents each table contributed.
+///
+/// Two filters, not one per scope, matching how the forward filters are laid
+/// out: overlay keys are hashed as `(scope, node)` so one blob covers every
+/// scope, and a shared key is hashed bare.
+///
+/// Sized per **distinct parent** rather than per pair, which is far fewer — the
+/// cheapest filter in the file, and the one with the most to gain, since a
+/// downward walk probes mostly leaves.
+pub(crate) fn member_filters(
+    shared_parents: &[NodeId],
+    overlay_parents: &[(ScopeId, Vec<NodeId>)],
+    bits: usize,
+) -> Vec<(&'static str, BlockedFilter)> {
+    let overlay_keys: usize = overlay_parents.iter().map(|(_, p)| p.len()).sum();
+    [
+        (
+            SHARED_MEMBERS_FILTER_BLOB_TYPE,
+            BlockedFilter::build_with(shared_parents.iter().copied(), shared_parents.len(), bits),
+        ),
+        (
+            OVERLAY_MEMBERS_FILTER_BLOB_TYPE,
+            BlockedFilter::build_with(
+                overlay_parents.iter().flat_map(|(scope, parents)| {
+                    let scope = *scope;
+                    parents
+                        .iter()
+                        .map(move |k| crate::storage::filter::overlay_key(scope, *k))
+                }),
+                overlay_keys,
+                bits,
+            ),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(t, f)| f.map(|f| (t, f)))
+    .collect()
+}
+
+/// The scope a per-scope blob carries in its properties.
+fn scope_of(blob: &Blob) -> ScopeId {
+    blob.properties
+        .get(SCOPE_ID_PROP)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Re-sort an encoded `(node, parent)` table by parent, dropping self-edges, and
+/// encode it as a member index.
+///
+/// Returns the blob type, the payload, and the **distinct parents**, which the
+/// filters are built from. Both come out of the one sorted vector rather than by
+/// re-reading the encoded payload: the blocked form is not a fixed stride, so a
+/// second pass would have to decode it, and deriving both from a single source
+/// keeps the filter unable to describe a table that was not written.
+///
+/// **Self-edges are excluded and that is load-bearing.** A root's own entry maps
+/// it to itself; kept, it would make the downward walk revisit the root forever.
+pub(crate) fn encode_members(
+    data: &[u8],
+    encoding: MemberEncoding,
+    tier: Tier,
+) -> Option<(&'static str, Bytes, Vec<NodeId>)> {
     let mut pairs: Vec<(NodeId, NodeId)> = table_keys(data)
         .filter(|(node, parent)| node != parent)
         .map(|(node, parent)| (parent, node))
         .collect();
     pairs.sort_unstable();
-    let mut out = BytesMut::with_capacity(8 + pairs.len() * 16);
-    out.put_u64_le(pairs.len() as u64);
+    let mut w = MemberWriter::new(encoding, tier);
+    let mut parents: Vec<NodeId> = Vec::new();
     for (parent, child) in pairs {
-        out.put_u64_le(parent);
-        out.put_u64_le(child);
+        if parents.last() != Some(&parent) {
+            parents.push(parent);
+        }
+        w.push(parent, child);
     }
-    out.freeze()
+    w.finish().map(|(t, b)| (t, b, parents))
 }
 
 fn encode_pairs(pairs: &[(NodeId, NodeId)]) -> Bytes {
@@ -248,16 +327,37 @@ pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64, opts: WriteOption
         // Inverted from the payloads already encoded above, so both write paths
         // produce byte-identical member indexes for the same forest.
         let mut members: Vec<Blob> = Vec::with_capacity(1 + snap.scopes.len());
+        let mut shared_parents: Vec<NodeId> = Vec::new();
+        let mut overlay_parents: Vec<(ScopeId, Vec<NodeId>)> = Vec::new();
         for blob in &blobs {
-            let (blob_type, properties) = match blob.blob_type.as_str() {
-                GLOBAL_BLOB_TYPE => (SHARED_MEMBERS_BLOB_TYPE, BTreeMap::new()),
-                SCOPE_BLOB_TYPE => (OVERLAY_MEMBERS_BLOB_TYPE, blob.properties.clone()),
+            let (tier, properties) = match blob.blob_type.as_str() {
+                GLOBAL_BLOB_TYPE => (Tier::Shared, BTreeMap::new()),
+                SCOPE_BLOB_TYPE => (Tier::Overlay, blob.properties.clone()),
                 _ => continue,
             };
+            let Some((blob_type, data, parents)) = encode_members(&blob.data, opts.members, tier)
+            else {
+                continue;
+            };
+            match tier {
+                Tier::Shared => shared_parents = parents,
+                Tier::Overlay => overlay_parents.push((scope_of(blob), parents)),
+            }
             members.push(Blob {
                 blob_type: blob_type.into(),
-                data: invert_table(&blob.data),
+                data,
                 properties,
+                snapshot_id: seq,
+                sequence_number: seq,
+            });
+        }
+        for (blob_type, filter) in
+            member_filters(&shared_parents, &overlay_parents, opts.filter_bits)
+        {
+            members.push(Blob {
+                blob_type: blob_type.into(),
+                data: filter.encode(),
+                properties: BTreeMap::new(),
                 snapshot_id: seq,
                 sequence_number: seq,
             });
@@ -392,32 +492,38 @@ impl BlobWriter {
         if self.opts.member_index {
             // Derived from the encoded tables rather than from a second buffer,
             // so the index describes exactly what was written.
-            let shared_members = {
-                let table = blobs
-                    .iter()
-                    .find(|b| b.blob_type == GLOBAL_BLOB_TYPE)
-                    .expect("shared table was pushed first");
-                invert_table(&table.data)
-            };
-            blobs.push(self.blob(SHARED_MEMBERS_BLOB_TYPE, shared_members, BTreeMap::new()));
-            let overlays: Vec<(ScopeId, Bytes)> = blobs
+            let sources: Vec<(Tier, ScopeId, Bytes)> = blobs
                 .iter()
-                .filter(|b| b.blob_type == SCOPE_BLOB_TYPE)
-                .map(|b| {
-                    let scope: ScopeId = b
-                        .properties
-                        .get(SCOPE_ID_PROP)
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    (scope, invert_table(&b.data))
+                .filter_map(|b| match b.blob_type.as_str() {
+                    GLOBAL_BLOB_TYPE => Some((Tier::Shared, 0, b.data.clone())),
+                    SCOPE_BLOB_TYPE => Some((Tier::Overlay, scope_of(b), b.data.clone())),
+                    _ => None,
                 })
                 .collect();
-            for (scope, data) in overlays {
-                blobs.push(self.blob(
-                    OVERLAY_MEMBERS_BLOB_TYPE,
-                    data,
-                    BTreeMap::from([(SCOPE_ID_PROP.to_string(), scope.to_string())]),
-                ));
+            let mut shared_parents: Vec<NodeId> = Vec::new();
+            let mut overlay_parents: Vec<(ScopeId, Vec<NodeId>)> = Vec::new();
+            for (tier, scope, data) in sources {
+                let Some((blob_type, payload, parents)) =
+                    encode_members(&data, self.opts.members, tier)
+                else {
+                    continue;
+                };
+                let properties = match tier {
+                    Tier::Shared => {
+                        shared_parents = parents;
+                        BTreeMap::new()
+                    }
+                    Tier::Overlay => {
+                        overlay_parents.push((scope, parents));
+                        BTreeMap::from([(SCOPE_ID_PROP.to_string(), scope.to_string())])
+                    }
+                };
+                blobs.push(self.blob(blob_type, payload, properties));
+            }
+            for (blob_type, filter) in
+                member_filters(&shared_parents, &overlay_parents, self.opts.filter_bits)
+            {
+                blobs.push(self.blob(blob_type, filter.encode(), BTreeMap::new()));
             }
         }
         blobs
@@ -577,8 +683,23 @@ mod member_index_tests {
         encode_pairs(pairs)
     }
 
-    fn decode_inverse(data: &[u8]) -> Vec<(NodeId, NodeId)> {
-        table_keys(data).collect()
+    /// Decode a member payload back to pairs, whichever encoding it used.
+    fn decode_inverse(data: &[u8], blob_type: &str) -> Vec<(NodeId, NodeId)> {
+        if blob_type.ends_with("-v1") {
+            return table_keys(data).collect();
+        }
+        let m = crate::storage::members::BlockedMembers::parse(data, 0..data.len()).unwrap();
+        let mut out = Vec::new();
+        m.for_each(data, &mut |p, c| out.push((p, c)));
+        out
+    }
+
+    fn invert(pairs: &[(NodeId, NodeId)], encoding: MemberEncoding) -> Vec<(NodeId, NodeId)> {
+        let t = table(pairs);
+        match encode_members(&t, encoding, Tier::Shared) {
+            Some((blob_type, data, _)) => decode_inverse(&data, blob_type),
+            None => Vec::new(),
+        }
     }
 
     /// The inverse is the same pairs with the columns swapped, sorted by parent
@@ -586,18 +707,20 @@ mod member_index_tests {
     #[test]
     fn inverts_and_groups_children_together() {
         // 2 and 3 both hang off 1; 4 hangs off 2. Plus self-edges for the roots.
-        let t = table(&[(1, 1), (2, 1), (3, 1), (4, 2)]);
-        let inv = decode_inverse(&invert_table(&t));
-        assert_eq!(inv, vec![(1, 2), (1, 3), (2, 4)]);
+        for encoding in [MemberEncoding::Flat, MemberEncoding::Blocked] {
+            let inv = invert(&[(1, 1), (2, 1), (3, 1), (4, 2)], encoding);
+            assert_eq!(inv, vec![(1, 2), (1, 3), (2, 4)], "{encoding}");
+        }
     }
 
     /// Self-edges must not survive: a root maps to itself, and keeping that
     /// entry would make a downward walk revisit the root forever.
     #[test]
     fn self_edges_are_dropped() {
-        let t = table(&[(7, 7), (9, 9)]);
-        let inv = decode_inverse(&invert_table(&t));
-        assert!(inv.is_empty(), "a self-edge would loop the walk: {inv:?}");
+        for encoding in [MemberEncoding::Flat, MemberEncoding::Blocked] {
+            let inv = invert(&[(7, 7), (9, 9)], encoding);
+            assert!(inv.is_empty(), "a self-edge would loop the walk: {inv:?}");
+        }
     }
 
     /// Both write paths must produce the same index, or a snapshot-built layer
@@ -627,19 +750,19 @@ mod member_index_tests {
         }
         let from_stream = w.finish();
 
-        for blob_type in [SHARED_MEMBERS_BLOB_TYPE, OVERLAY_MEMBERS_BLOB_TYPE] {
+        for prefix in ["blaze-shared-members-v", "blaze-overlay-members-v"] {
             let a: Vec<_> = from_snapshot
                 .iter()
-                .filter(|b| b.blob_type == blob_type)
-                .map(|b| (&b.properties, decode_inverse(&b.data)))
+                .filter(|b| b.blob_type.starts_with(prefix))
+                .map(|b| (&b.properties, decode_inverse(&b.data, &b.blob_type)))
                 .collect();
             let b: Vec<_> = from_stream
                 .iter()
-                .filter(|b| b.blob_type == blob_type)
-                .map(|b| (&b.properties, decode_inverse(&b.data)))
+                .filter(|b| b.blob_type.starts_with(prefix))
+                .map(|b| (&b.properties, decode_inverse(&b.data, &b.blob_type)))
                 .collect();
-            assert_eq!(a, b, "{blob_type} differs between write paths");
-            assert!(!a.is_empty(), "{blob_type} was not written at all");
+            assert_eq!(a, b, "{prefix}* differs between write paths");
+            assert!(!a.is_empty(), "{prefix}* was not written at all");
         }
     }
 
@@ -655,6 +778,106 @@ mod member_index_tests {
         assert!(
             !blobs.iter().any(|b| b.blob_type.contains("members")),
             "member index written despite being off"
+        );
+    }
+
+    /// A membership filter may say yes when the answer is no; it must never say
+    /// no when the answer is yes, because the walk takes a negative as final and
+    /// a false negative silently drops members.
+    ///
+    /// Checked against every key of the tables the filters were built from, in
+    /// both tiers and both encodings, rather than by sampling — the property is
+    /// absolute and the key set is right there.
+    #[test]
+    fn the_member_filters_never_reject_a_key_that_is_present() {
+        let snap = ForestSnapshot {
+            global: (2..500).map(|n| (n, 1)).collect(),
+            scopes: vec![
+                (7, (600..800).map(|n| (n, 3)).collect()),
+                (9, (800..900).map(|n| (n, 5)).collect()),
+            ],
+        };
+        for encoding in [MemberEncoding::Flat, MemberEncoding::Blocked] {
+            let blobs = snapshot_to_blobs(
+                &snap,
+                1,
+                WriteOptions {
+                    member_index: true,
+                    members: encoding,
+                    ..Default::default()
+                },
+            );
+            let by_type = |t: &str| blobs.iter().find(|b| b.blob_type == t).expect(t);
+            let shared =
+                BlockedFilter::decode(&by_type(SHARED_MEMBERS_FILTER_BLOB_TYPE).data).unwrap();
+            let overlay =
+                BlockedFilter::decode(&by_type(OVERLAY_MEMBERS_FILTER_BLOB_TYPE).data).unwrap();
+
+            let mut checked = 0usize;
+            for blob in &blobs {
+                let tier = if blob.blob_type.starts_with("blaze-shared-members-v") {
+                    Tier::Shared
+                } else if blob.blob_type.starts_with("blaze-overlay-members-v") {
+                    Tier::Overlay
+                } else {
+                    continue;
+                };
+                let scope = scope_of(blob);
+                let parents: Vec<NodeId> = decode_inverse(&blob.data, &blob.blob_type)
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect();
+                for parent in parents {
+                    let ok = match tier {
+                        Tier::Shared => shared.may_contain(parent),
+                        Tier::Overlay => {
+                            overlay.may_contain(crate::storage::filter::overlay_key(scope, parent))
+                        }
+                    };
+                    assert!(ok, "{encoding}: parent {parent} in scope {scope} rejected");
+                    checked += 1;
+                }
+            }
+            assert!(checked >= 3, "{encoding}: filters covered nothing");
+
+            // And they do reject: a filter that always said yes would pass the
+            // assertion above while buying nothing.
+            let absent = (10_000..11_000u64)
+                .filter(|n| !shared.may_contain(*n))
+                .count();
+            assert!(
+                absent > 900,
+                "{encoding}: the shared member filter rejects almost nothing ({absent}/1000)"
+            );
+        }
+    }
+
+    /// Off with `--filter-bits 0`, like every other filter, and the index still
+    /// works — the walk just probes the table.
+    #[test]
+    fn no_filter_bits_means_no_member_filters() {
+        let snap = ForestSnapshot {
+            global: vec![(2, 1), (3, 1)],
+            scopes: vec![],
+        };
+        let blobs = snapshot_to_blobs(
+            &snap,
+            1,
+            WriteOptions {
+                member_index: true,
+                filter_bits: 0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            blobs
+                .iter()
+                .any(|b| b.blob_type.starts_with("blaze-shared-members-v")),
+            "the index itself must still be written"
+        );
+        assert!(
+            !blobs.iter().any(|b| b.blob_type.contains("members-filter")),
+            "filters written at 0 bits"
         );
     }
 }

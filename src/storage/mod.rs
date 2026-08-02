@@ -8,6 +8,7 @@ pub mod conformance;
 pub mod filter;
 pub mod flush;
 pub mod layered;
+pub mod members;
 pub mod parquet_io;
 pub mod puffin;
 pub mod registry;
@@ -25,6 +26,7 @@ pub use flush::{
     PendingMerge, hydrate_from_catalog, open_base_from_catalog,
 };
 pub use layered::LayeredBase;
+pub use members::{BlockedMembers, MemberEncoding, MemberWriter};
 pub use registry::{RegistryEncoding, RegistryWriter};
 pub use retention::{Reclaimed, RetentionPolicy, collect as collect_garbage};
 pub use tier::{DEFAULT_TIER_FANOUT, pick_merge};
