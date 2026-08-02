@@ -115,6 +115,7 @@ docs below are the design rationale behind those knobs.
 | [008](008-rocksdb-counterfactual.md) | Could this have been built on RocksDB? | whether the storage tier had to be written | evaluation |
 | [009](009-registry-encoding.md) | Registry encoding (delta-varint in indexed blocks) | 25-40% of base bytes | **implemented** |
 | [010](010-stream-position.md) | Stream position (per-partition offsets + stream identity) | snapshot metadata cannot describe Kafka | **implemented** |
+| [011](011-member-index.md) | Member index (list a component from one node) | a query the store cannot answer | designed |
 
 001, 003, 006, 007, 009 and 010 are in. **002 and 005 are closed**, for
 different reasons:
@@ -127,9 +128,11 @@ different reasons:
   locally. The `Global` → `Shared` rename is dropped separately, as not worth a
   breaking change to the enum, the proto and the REST contract.
 
-**004 is the only design still open**, and it is analytics interop rather than a
-scaling change. It needs rework before it is implementable: its writer keys the
-routing Parquet on a single base, and 006 removed the privileged base.
+Two designs are open. **011** adds a query the store cannot currently answer —
+who else is in this component — for small components, behind a flag that is off
+by default. **004** is analytics interop and needs rework before it is
+implementable: its writer keys the routing Parquet on a single base, and 006
+removed the privileged base. Neither is a scaling change.
 
 Nothing on this list is now load-bearing for scale. The open questions that are
 live are measurements and tests rather than designs — see the note on sharding
