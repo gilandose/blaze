@@ -120,6 +120,21 @@ struct Args {
     #[arg(long, default_value_t = Default::default())]
     registry_encoding: blaze::storage::RegistryEncoding,
 
+    /// Write the member index into newly folded and merged runs, so
+    /// `GET /v1/scopes/{scope}/members/{node}` can list a component.
+    ///
+    /// Off by default because it is the one index whose cost falls on
+    /// deployments that may never query it: filters pay for themselves on every
+    /// lookup, a member index only if someone asks for members. Per-run like
+    /// `--filter-bits` — runs already written keep whatever they were written
+    /// with, a stack may mix, and turning it on takes effect from the next fold
+    /// rather than requiring a rewrite.
+    ///
+    /// Only useful with `--routing-base disk`: it is written into runs, and a
+    /// RAM-mode worker has none.
+    #[arg(long, default_value_t = false)]
+    member_index: bool,
+
     /// Start even if the object store fails the put-if-absent preflight.
     ///
     /// The snapshot commit is a conditional put, and it is the *only* thing
@@ -549,6 +564,7 @@ async fn main() -> anyhow::Result<()> {
         write: blaze::storage::WriteOptions {
             filter_bits: args.filter_bits,
             registry: args.registry_encoding,
+            member_index: args.member_index,
         },
         inline_merges: args.inline_merges,
         pending_merge: parking_lot::Mutex::new(None),
