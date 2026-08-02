@@ -69,6 +69,45 @@ impl BlazeService for GrpcService {
         }))
     }
 
+    /// The REST handler's twin, including the refusal: `UNIMPLEMENTED` rather
+    /// than an empty list when the worker has no member index, because a short
+    /// list is indistinguishable from a small component.
+    async fn get_members(
+        &self,
+        request: Request<pb::GetMembersRequest>,
+    ) -> Result<Response<pb::GetMembersResponse>, Status> {
+        let req = request.into_inner();
+        let cap = match req.cap as usize {
+            0 => crate::api::DEFAULT_MEMBER_CAP,
+            n if n > crate::api::MAX_MEMBER_CAP => {
+                return Err(Status::invalid_argument(format!(
+                    "cap must be at most {}, got {n}",
+                    crate::api::MAX_MEMBER_CAP
+                )));
+            }
+            n => n,
+        };
+        let found = self
+            .state
+            .forest
+            .members(req.scope, req.node, cap)
+            .ok_or_else(|| {
+                Status::unimplemented(
+                    "this worker has no member index: start it with --member-index, and \
+                     check forest.members_available in GetStats — a run written without \
+                     the flag disables the query for the whole stack",
+                )
+            })?;
+        let truncated = found.is_truncated();
+        Ok(Response::new(pb::GetMembersResponse {
+            scope: req.scope,
+            node: req.node,
+            root: self.state.forest.scope_root(req.scope, req.node),
+            members: found.into_nodes(),
+            truncated,
+        }))
+    }
+
     async fn get_stats(
         &self,
         _request: Request<pb::GetStatsRequest>,
@@ -85,6 +124,7 @@ impl BlazeService for GrpcService {
                 scope_links: forest.scope_links,
                 active_scopes: forest.active_scopes,
                 merge_fixups: forest.merge_fixups,
+                members_available: forest.members_available,
             }),
             buffer: Some(pb::BufferStats {
                 active_rows: buffer.active_rows as u64,

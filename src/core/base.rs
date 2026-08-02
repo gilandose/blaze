@@ -71,6 +71,21 @@ pub trait RoutingBase: Send + Sync + std::fmt::Debug {
     /// Same, for `scope`'s overlay: ascending node order, no allocation.
     fn for_each_overlay_pair(&self, scope: ScopeId, f: &mut dyn FnMut(NodeId, NodeId));
 
+    /// Whether this base can answer downward queries at all.
+    ///
+    /// Default `false`: a base written without the member index says so rather
+    /// than reporting every component as childless, which would look like a
+    /// correct answer for a singleton.
+    fn has_member_index(&self) -> bool {
+        false
+    }
+
+    /// Nodes whose recorded shared parent is `parent`, appended to `out`.
+    fn shared_children(&self, _parent: NodeId, _out: &mut Vec<NodeId>) {}
+
+    /// Same within `scope`'s overlay.
+    fn overlay_children(&self, _scope: ScopeId, _parent: NodeId, _out: &mut Vec<NodeId>) {}
+
     fn stats(&self) -> BaseStats;
 }
 

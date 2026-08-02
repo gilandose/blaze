@@ -56,6 +56,11 @@ pub struct ScopedForest {
     /// mutated in place across it — see [`Tier`] and
     /// [`ScopedForest::compact_and_fold`].
     tier: ArcSwap<Tier>,
+    /// Whether memtables track merge edges downward, so
+    /// [`ScopedForest::members`] can answer. Set once at construction and
+    /// carried across folds — a memtable created without it can never be
+    /// retrofitted, because the edges it would have recorded are gone.
+    member_index: bool,
     /// Serializes all mutations (global unions, overlay unions, fix-ups) and
     /// the fold.
     union_lock: Mutex<()>,
@@ -99,6 +104,27 @@ struct Memtable {
     overlays: DashMap<ScopeId, Dsu>,
     /// global root -> scopes with overlay state keyed by that root.
     registry: DashMap<NodeId, HashSet<ScopeId>>,
+    /// Propagated to overlays as they are created on demand.
+    member_index: bool,
+}
+
+impl Memtable {
+    fn new(member_index: bool) -> Self {
+        Self {
+            global: Dsu::tracking_members(member_index),
+            member_index,
+            ..Self::default()
+        }
+    }
+
+    /// `scope`'s overlay, created with this memtable's index setting rather
+    /// than by `or_default` — a scope first seen after the flag was read must
+    /// not silently opt out of it.
+    fn overlay(&self, scope: ScopeId) -> dashmap::mapref::one::RefMut<'_, ScopeId, Dsu> {
+        self.overlays
+            .entry(scope)
+            .or_insert_with(|| Dsu::tracking_members(self.member_index))
+    }
 }
 
 impl Tier {
@@ -150,6 +176,116 @@ pub trait SnapshotSink {
 /// The base a resolution is running against.
 type Base<'a> = Option<&'a dyn RoutingBase>;
 
+/// The answer to [`ScopedForest::members`].
+///
+/// Two variants rather than a `Vec` plus a flag nobody checks: past the
+/// percolation threshold a component is a large fraction of the graph, and
+/// "here are 1000 of them" must not be mistakable for "here are all of them".
+/// A caller that gets `Truncated` has learned something real — this node is in
+/// a hub — and should ask the analytics path, not retry with a bigger cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Members {
+    /// Every member of the component. Includes the queried node and the root.
+    Complete(Vec<NodeId>),
+    /// Exactly `cap` members, all real, with at least one more not listed.
+    Truncated(Vec<NodeId>),
+}
+
+impl Members {
+    pub fn nodes(&self) -> &[NodeId] {
+        match self {
+            Members::Complete(v) | Members::Truncated(v) => v,
+        }
+    }
+
+    pub fn into_nodes(self) -> Vec<NodeId> {
+        match self {
+            Members::Complete(v) | Members::Truncated(v) => v,
+        }
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        matches!(self, Members::Truncated(_))
+    }
+}
+
+/// A capped, deduplicating downward traversal of a parent forest.
+///
+/// The visited set is not an optimisation. The same node can be offered by
+/// several layers and by both levels of a scoped walk (an overlay element is
+/// also reachable through the shared tree below it), and a component whose root
+/// changed since a run was written can be entered from two directions at once.
+struct Walk {
+    cap: usize,
+    seen: HashSet<NodeId>,
+    out: Vec<NodeId>,
+    truncated: bool,
+}
+
+impl Walk {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            seen: HashSet::new(),
+            out: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    /// Admit `n`, returning whether it should be expanded in turn.
+    fn admit(&mut self, n: NodeId) -> bool {
+        if !self.seen.insert(n) {
+            return false;
+        }
+        if self.out.len() >= self.cap {
+            self.truncated = true;
+            return false;
+        }
+        self.out.push(n);
+        true
+    }
+
+    /// Walk downward from `seeds`, asking `children` for each node's children.
+    ///
+    /// Stops the moment the cap is exceeded: an unbounded frontier is exactly
+    /// the failure mode the cap exists to prevent, so there is no point
+    /// draining it to discover the truncation a second time.
+    fn expand(&mut self, seeds: &[NodeId], mut children: impl FnMut(NodeId, &mut Vec<NodeId>)) {
+        let mut frontier: Vec<NodeId> = Vec::new();
+        for &s in seeds {
+            if self.admit(s) {
+                frontier.push(s);
+            }
+            if self.truncated {
+                return;
+            }
+        }
+        // One buffer for the whole walk: children of a leaf is the common case
+        // and the common case should not allocate.
+        let mut buf: Vec<NodeId> = Vec::new();
+        while let Some(k) = frontier.pop() {
+            buf.clear();
+            children(k, &mut buf);
+            for &c in &buf {
+                if self.admit(c) {
+                    frontier.push(c);
+                }
+                if self.truncated {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Members {
+        if self.truncated {
+            Members::Truncated(self.out)
+        } else {
+            Members::Complete(self.out)
+        }
+    }
+}
+
 /// Collects a stream back into a [`ForestSnapshot`] (the RAM-mode path).
 #[derive(Default)]
 struct SnapshotCollector {
@@ -197,6 +333,42 @@ impl ScopedForest {
             mem: Arc::new(Memtable::default()),
         }));
         forest
+    }
+
+    /// Track merge edges downward so [`ScopedForest::members`] can answer.
+    ///
+    /// Consuming rather than a setter, and applied before anything is ingested:
+    /// the index is built as merges happen, so turning it on later would leave
+    /// a hole exactly the size of everything already applied. Runs written by
+    /// this worker still need `--member-index` for the *base* half of the
+    /// answer; this covers only the memtable.
+    pub fn tracking_members(mut self) -> Self {
+        self.member_index = true;
+        let previous = self.tier.load();
+        debug_assert_eq!(
+            previous.mem.global.len_links(),
+            0,
+            "tracking_members() must be called before any edge is applied"
+        );
+        self.tier.store(Arc::new(Tier {
+            base: previous.base.clone(),
+            mem: Arc::new(Memtable::new(true)),
+        }));
+        self
+    }
+
+    /// Whether this forest's memtable can answer downward walks.
+    pub fn tracks_members(&self) -> bool {
+        self.member_index
+    }
+
+    /// Whether [`ScopedForest::members`] can answer right now — both halves,
+    /// memtable and base. Worth surfacing because the base half can go away
+    /// underneath a running worker: a fold or a tiered merge that forgets the
+    /// flag writes a run that cannot answer, and the stack goes quiet from the
+    /// next swap rather than at startup.
+    pub fn members_available(&self) -> bool {
+        self.member_index && self.tier.load().base().is_none_or(|b| b.has_member_index())
     }
 
     /// Stats for the attached base, if any.
@@ -304,7 +476,7 @@ impl ScopedForest {
             let a = Self::overlay_root(&t, scope, merge.child, true);
             let b = Self::overlay_root(&t, scope, merge.parent, true);
             if a != b {
-                t.mem.overlays.entry(scope).or_default().union(a, b);
+                t.mem.overlay(scope).union(a, b);
                 self.fixups.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -325,7 +497,7 @@ impl ScopedForest {
         for &scope in scopes {
             let a = Self::overlay_root(&t, scope, ru, true);
             let b = Self::overlay_root(&t, scope, rv, true);
-            t.mem.overlays.entry(scope).or_default().union(a, b);
+            t.mem.overlay(scope).union(a, b);
             t.mem.registry.entry(ru).or_default().insert(scope);
             t.mem.registry.entry(rv).or_default().insert(scope);
             self.scope_links.fetch_add(1, Ordering::Relaxed);
@@ -351,10 +523,91 @@ impl ScopedForest {
         self.scope_root(scope, u) == self.scope_root(scope, v)
     }
 
+    /// Everyone in `node`'s component as `scope` sees it, up to `cap`
+    /// ([design 011](../../docs/design/011-member-index.md)).
+    ///
+    /// `None` when the state cannot answer — the memtable was built without
+    /// tracking, or a run in the base was written without `--member-index`.
+    /// That is deliberately not "an empty component": a caller cannot tell a
+    /// singleton from an unindexed run, so the unanswerable case has its own
+    /// value rather than a plausible-looking wrong one.
+    ///
+    /// The returned set **includes `node` and the component root**. Order is
+    /// parent-tree order, which is arbitrary; callers wanting it sorted sort.
+    ///
+    /// Lock-free, like every other query: it reads one tier generation and the
+    /// mmap'd index, and takes nothing the ingest writer holds.
+    ///
+    /// # Two levels, for a reason
+    ///
+    /// In a tenant scope the overlay's elements are *shared roots*, not nodes,
+    /// so walking the overlay down from `scope_root` yields the set of shared
+    /// components this scope has glued together — and each of those still has
+    /// to be expanded through the shared tree to reach actual members. Walking
+    /// only the overlay would return the component's shared roots and call it
+    /// the membership.
+    pub fn members(&self, scope: ScopeId, node: NodeId, cap: usize) -> Option<Members> {
+        let t = self.tier.load();
+        if !self.member_index {
+            return None;
+        }
+        if t.base().is_some_and(|b| !b.has_member_index()) {
+            return None;
+        }
+
+        let shared = Self::shared_root(&t, node, false);
+        let mut walk = Walk::new(cap);
+        if scope == GLOBAL_SCOPE {
+            walk.expand(&[shared], |k, out| {
+                t.mem.global.children_of(k, out);
+                if let Some(b) = t.base() {
+                    b.shared_children(k, out);
+                }
+            });
+        } else {
+            let root = Self::overlay_root(&t, scope, shared, false);
+            // Bounded by `cap + 1` because every overlay element is itself a
+            // member: more than `cap` of them already proves truncation, and
+            // stopping there keeps a hub component from walking the whole
+            // overlay before the cap is ever consulted.
+            //
+            // The `+ 1` is what makes it safe to say nothing about truncation
+            // here. A `Walk` stops the first time it cannot admit a *new* node,
+            // so `seeds` truncating means it holds exactly `cap + 1` members —
+            // and feeding those to a walk capped at `cap` makes it truncate on
+            // the last one, with `cap` real members. Propagating the flag by
+            // hand instead is how this returned a single member marked
+            // truncated: `expand` bails as soon as `truncated` is set, so a
+            // pre-set flag aborted the shared walk after its first seed. Caught
+            // by `examples/member_bench` at 2.5 links/node, not by a test.
+            let mut seeds = Walk::new(cap.saturating_add(1));
+            seeds.expand(&[root], |k, out| {
+                if let Some(o) = t.mem.overlays.get(&scope) {
+                    o.children_of(k, out);
+                }
+                if let Some(b) = t.base() {
+                    b.overlay_children(scope, k, out);
+                }
+            });
+            debug_assert!(
+                !seeds.truncated || seeds.out.len() == cap + 1,
+                "a truncated walk must hold exactly its cap, or the argument above breaks"
+            );
+            walk.expand(&seeds.out, |k, out| {
+                t.mem.global.children_of(k, out);
+                if let Some(b) = t.base() {
+                    b.shared_children(k, out);
+                }
+            });
+        }
+        Some(walk.finish())
+    }
+
     pub fn stats(&self) -> ForestStats {
         let t = self.tier.load();
         let base = t.base.as_ref().map(|b| b.stats()).unwrap_or_default();
         ForestStats {
+            members_available: self.members_available(),
             events_applied: self.events_applied.load(Ordering::Relaxed),
             global_merges: t.mem.global.merges(),
             // Memtable links: with a base attached these count only what has
@@ -429,7 +682,7 @@ impl ScopedForest {
         let (base, out) = build(sink)?;
         self.tier.store(Arc::new(Tier {
             base: Some(base),
-            mem: Arc::new(Memtable::default()),
+            mem: Arc::new(Memtable::new(self.member_index)),
         }));
         self.folds.fetch_add(1, Ordering::Relaxed);
         Ok(out)
@@ -472,7 +725,7 @@ impl ScopedForest {
         let (base, out) = build(sink, previous.base.as_ref())?;
         self.tier.store(Arc::new(Tier {
             base: Some(base),
-            mem: Arc::new(Memtable::default()),
+            mem: Arc::new(Memtable::new(self.member_index)),
         }));
         self.folds.fetch_add(1, Ordering::Relaxed);
         Ok(out)
@@ -648,7 +901,7 @@ impl ScopedForest {
         );
         t.mem.global.hydrate(&snap.global);
         for (scope, pairs) in &snap.scopes {
-            let overlay = t.mem.overlays.entry(*scope).or_default();
+            let overlay = t.mem.overlay(*scope);
             overlay.hydrate(pairs);
             drop(overlay);
             // Re-register overlay members under their *current* global roots
@@ -669,6 +922,10 @@ impl ScopedForest {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ForestStats {
+    /// Whether `members` can answer — memtable tracking on *and* every run in
+    /// the base carrying the index. False here with `--member-index` set means
+    /// a run was written without it; see `docs/design/011-member-index.md`.
+    pub members_available: bool,
     pub events_applied: u64,
     pub global_merges: u64,
     pub global_links: u64,
@@ -818,6 +1075,38 @@ mod tests {
             false
         }
 
+        /// Every node in `u`'s component as seen by `scope`, sorted — the set
+        /// `members` must return when it fits under the cap.
+        fn component(&self, scope: ScopeId, u: NodeId) -> Vec<NodeId> {
+            let mut adj: std::collections::HashMap<NodeId, Vec<NodeId>> =
+                std::collections::HashMap::new();
+            let add = |a: NodeId, b: NodeId, adj: &mut std::collections::HashMap<_, Vec<_>>| {
+                adj.entry(a).or_default().push(b);
+                adj.entry(b).or_default().push(a);
+            };
+            for &(a, b) in &self.global_edges {
+                add(a, b, &mut adj);
+            }
+            for &(s, a, b) in &self.scope_edges {
+                if s == scope {
+                    add(a, b, &mut adj);
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![u];
+            seen.insert(u);
+            while let Some(x) = stack.pop() {
+                for &n in adj.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    if seen.insert(n) {
+                        stack.push(n);
+                    }
+                }
+            }
+            let mut out: Vec<NodeId> = seen.into_iter().collect();
+            out.sort_unstable();
+            out
+        }
+
         /// Lowest node id in `u`'s component as seen by `scope` — the value
         /// `scope_root` must return under lowest-graph-id-wins semantics.
         fn component_min(&self, scope: ScopeId, u: NodeId) -> NodeId {
@@ -939,6 +1228,213 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Sorted members, for comparison against the model.
+    fn members_of(f: &ScopedForest, scope: ScopeId, node: NodeId, cap: usize) -> Vec<NodeId> {
+        let m = f.members(scope, node, cap).expect("the index is on");
+        assert!(!m.is_truncated(), "cap {cap} was not meant to bite");
+        let mut v = m.into_nodes();
+        let before = v.len();
+        v.sort_unstable();
+        v.dedup();
+        assert_eq!(before, v.len(), "members must not repeat a node");
+        v
+    }
+
+    /// The membership question, graded against BFS over the same edges — in
+    /// every scope, after every edge. This is invariant I1 restated for sets
+    /// rather than for representatives.
+    #[test]
+    fn members_match_the_reference_model() {
+        let mut rng = StdRng::seed_from_u64(0x11E11BE12);
+        const NODES: u64 = 60;
+        const SCOPES: [ScopeId; 4] = [1, 2, 3, 4];
+
+        for round in 0..6 {
+            let f = ScopedForest::new().tracking_members();
+            let mut model = Model {
+                global_edges: vec![],
+                scope_edges: vec![],
+            };
+            for step in 0..200 {
+                let u = rng.random_range(0..NODES);
+                let v = rng.random_range(0..NODES);
+                if rng.random_range(0..100) < 25 {
+                    f.apply(&global_edge(u, v));
+                    model.global_edges.push((u, v));
+                } else {
+                    let scope = SCOPES[rng.random_range(0..SCOPES.len())];
+                    f.apply(&scoped_edge(u, v, &[scope]));
+                    model.scope_edges.push((scope, u, v));
+                }
+                if step % 10 != 0 {
+                    continue;
+                }
+                for _ in 0..4 {
+                    let a = rng.random_range(0..NODES);
+                    let s = if rng.random_range(0..4) == 0 {
+                        GLOBAL_SCOPE
+                    } else {
+                        SCOPES[rng.random_range(0..SCOPES.len())]
+                    };
+                    assert_eq!(
+                        members_of(&f, s, a, NODES as usize),
+                        model.component(s, a),
+                        "round {round} step {step}: scope {s} members({a}) diverged"
+                    );
+                }
+            }
+
+            // And the same after a snapshot/hydrate cycle, which is the only
+            // other way the index gets built.
+            let snap = f.snapshot();
+            let f2 = ScopedForest::new().tracking_members();
+            f2.hydrate(&snap);
+            for a in 0..NODES {
+                for s in [GLOBAL_SCOPE, 1, 2, 3, 4] {
+                    assert_eq!(
+                        members_of(&f2, s, a, NODES as usize),
+                        model.component(s, a),
+                        "round {round}: hydrated scope {s} members({a}) diverged"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A node nobody has ever mentioned is its own component, and saying so is
+    /// different from saying nothing — the empty answer would be indexed-but-
+    /// unreachable, which is the bug this design's `None` exists for.
+    #[test]
+    fn an_untouched_node_is_a_singleton() {
+        let f = ScopedForest::new().tracking_members();
+        f.apply(&global_edge(1, 2));
+        assert_eq!(members_of(&f, GLOBAL_SCOPE, 9999, 10), vec![9999]);
+        assert_eq!(members_of(&f, 7, 9999, 10), vec![9999]);
+    }
+
+    /// The cap is the whole reason this returns an enum. `Truncated` must hand
+    /// back exactly `cap` members, every one of them real.
+    #[test]
+    fn a_component_over_the_cap_truncates_to_real_members() {
+        let f = ScopedForest::new().tracking_members();
+        for i in 1..100u64 {
+            f.apply(&global_edge(0, i));
+        }
+        let all = f.members(GLOBAL_SCOPE, 50, 1000).unwrap();
+        assert!(!all.is_truncated());
+        assert_eq!(all.nodes().len(), 100);
+
+        let capped = f.members(GLOBAL_SCOPE, 50, 10).unwrap();
+        assert!(capped.is_truncated(), "100 members do not fit in 10");
+        assert_eq!(capped.nodes().len(), 10, "exactly the cap, not one more");
+        for &m in capped.nodes() {
+            assert_eq!(
+                f.scope_root(GLOBAL_SCOPE, m),
+                0,
+                "truncation must not invent members"
+            );
+        }
+
+        // Exactly at the cap is complete, not truncated: the off-by-one here
+        // would tell an operator a whole component was a hub.
+        assert!(!f.members(GLOBAL_SCOPE, 50, 100).unwrap().is_truncated());
+        assert!(f.members(GLOBAL_SCOPE, 50, 99).unwrap().is_truncated());
+    }
+
+    /// A scoped component spans several shared components, and the overlay only
+    /// holds their roots. Walking one level would return the roots and call it
+    /// the membership.
+    #[test]
+    fn a_scoped_walk_descends_through_the_shared_tier() {
+        let f = ScopedForest::new().tracking_members();
+        // Two shared components, roots 10 and 30.
+        f.apply(&global_edge(10, 11));
+        f.apply(&global_edge(10, 12));
+        f.apply(&global_edge(30, 31));
+        // Scope 5 glues them together; nothing else sees that.
+        f.apply(&scoped_edge(11, 31, &[5]));
+
+        assert_eq!(members_of(&f, 5, 12, 100), vec![10, 11, 12, 30, 31]);
+        assert_eq!(members_of(&f, GLOBAL_SCOPE, 12, 100), vec![10, 11, 12]);
+        assert_eq!(members_of(&f, 6, 31, 100), vec![30, 31]);
+    }
+
+    /// The case that would catch keying the index on the root instead of on the
+    /// parent: a global merge moves the root *downward* after the links were
+    /// recorded, and everything above must still list completely.
+    #[test]
+    fn a_component_whose_root_moved_still_lists_completely() {
+        let f = ScopedForest::new().tracking_members();
+        for i in 501..510u64 {
+            f.apply(&global_edge(500, i));
+        }
+        assert_eq!(f.scope_root(GLOBAL_SCOPE, 505), 500);
+        // A much smaller id joins; the root drops from 500 to 3.
+        f.apply(&global_edge(505, 3));
+        assert_eq!(f.scope_root(GLOBAL_SCOPE, 505), 3);
+
+        let mut expected: Vec<NodeId> = (500..510).collect();
+        expected.push(3);
+        expected.sort_unstable();
+        assert_eq!(members_of(&f, GLOBAL_SCOPE, 509, 100), expected);
+        assert_eq!(members_of(&f, GLOBAL_SCOPE, 3, 100), expected);
+    }
+
+    /// A tenant scope whose **overlay** is bigger than the cap.
+    ///
+    /// The scoped walk is two stages, and the seed stage runs at `cap + 1`. Its
+    /// truncation used to be OR'd into the outer walk before the outer walk had
+    /// run — and `expand` stops the moment `truncated` is set, so it returned
+    /// **one** member marked truncated instead of `cap`. Every existing
+    /// truncation test queried the global scope, which has only one stage, so
+    /// nothing saw it; `examples/member_bench` did, 1153 times in one sweep.
+    ///
+    /// A component this shape needs the overlay itself to be large, which means
+    /// many distinct shared roots glued together by scope edges rather than one
+    /// big shared component — hence the pairwise chain over isolated shared
+    /// nodes below.
+    #[test]
+    fn a_scoped_component_over_the_cap_returns_the_whole_cap() {
+        let f = ScopedForest::new().tracking_members();
+        // 400 shared singletons, chained into one component by scope 5 alone.
+        // Scope 5's overlay therefore holds 400 elements; the global view sees
+        // 400 separate components.
+        for i in 0..399u64 {
+            f.apply(&scoped_edge(i, i + 1, &[5]));
+        }
+        assert_eq!(members_of(&f, GLOBAL_SCOPE, 200, 100).len(), 1);
+
+        let all = f.members(5, 200, 1000).unwrap();
+        assert!(!all.is_truncated());
+        assert_eq!(all.nodes().len(), 400);
+
+        for cap in [1, 2, 7, 50, 399] {
+            let capped = f.members(5, 200, cap).unwrap();
+            assert!(capped.is_truncated(), "400 members do not fit in {cap}");
+            assert_eq!(
+                capped.nodes().len(),
+                cap,
+                "a truncated answer must hold exactly the cap, not the first seed"
+            );
+            for &m in capped.nodes() {
+                assert_eq!(f.scope_root(5, m), 0, "member {m} must be real");
+            }
+        }
+        // And the boundary, which is the other half of the same off-by-one.
+        assert!(!f.members(5, 200, 400).unwrap().is_truncated());
+    }
+
+    /// Off by default, and a forest that was not tracking says so rather than
+    /// reporting every component as a singleton.
+    #[test]
+    fn without_the_index_there_is_no_answer() {
+        let f = ScopedForest::new();
+        f.apply(&global_edge(1, 2));
+        assert!(!f.tracks_members());
+        assert!(f.members(GLOBAL_SCOPE, 1, 10).is_none());
+        assert_eq!(f.scope_root(GLOBAL_SCOPE, 2), 1, "queries are unaffected");
     }
 
     #[test]

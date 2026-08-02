@@ -196,6 +196,7 @@ ingest cannot outrun compaction and bury you in runs.
 | `--edge-log` | unset | **production ingest** — see below | injection is refused while set |
 | `--edge-log-batch` | 10 000 | ingest throughput | memtable granularity, nothing else |
 | `--registry-encoding` | blocked | — | `flat` is 1.6x the base for a 2.4x faster merge notification |
+| `--member-index` | off | the `members` query | **+77% of run bytes** and ~2% ingest, measured — see below |
 | `--retention-interval-secs` | 3600 | rarer sweeps | storage grows at the amplification rate — see below |
 | `--keep-snapshots` | 10 | more restore points | storage |
 | `--keep-snapshots-hours` | 24 | more restore points | storage |
@@ -210,6 +211,60 @@ Puffin sidecar is that fold, so a commit without one would leave that sequence
 with no routing state to recover from. Leader fold frequency is pinned to commit
 frequency by construction, and `--flush-interval-secs` is what bounds a leader's
 memtable.
+
+## Listing a component: `--member-index`
+
+Off by default, and the one flag here whose cost falls entirely on deployments
+that never use it. It buys `GET /v1/scopes/{scope}/members/{node}` — everyone
+else in a node's component — and costs **+62.6 MB on an 81.0 MB run, +77%,
+16.1 bytes per pair** (`examples/registry_shape`, 2M links / 4M nodes / 3000
+scopes). That is the naive fixed-stride cost; the index is not yet
+delta-varint encoded the way the registry is.
+
+Ingest cost is **-1.4% to -2.7%** with `--routing-base disk`, where the base
+probe dominates. (It is -21% to -31% all-RAM, but there the DSU is the entire
+cost of applying an edge; that is not the number to size a backfill against.)
+
+Query latency is linear in the answer — **~0.11 us per member from the heap,
+~1.1 us per member from a mapped run**, the 10x being one binary search per node
+because there is no filter over the member index's keys. At the default cap:
+
+| answer size | in-heap p50 | mmap'd run p50 |
+|---|---|---|
+| 1 (singleton) | 0.24 us | 0.54 us |
+| ~28 | 4.0 us | 7.8 us |
+| ~225 | 25 us | 59 us |
+| capped at 1000 | 51-85 us | **0.9-1.3 ms** |
+
+`scope_root` on the same state is 0.08 us in-heap, 0.31 us mapped, so this is
+three to four orders of magnitude more expensive than a component lookup. Budget
+for it separately.
+
+Three things to know before turning it on:
+
+- **It is not retroactive.** Half the answer comes from merge edges the memtable
+  records as unions happen, so a running worker cannot be switched on — it has to
+  be restarted with the flag.
+- **One run without it disables the query for the whole stack.** The members in
+  an unindexed run are unreachable, and a short list is indistinguishable from a
+  small component, so the query refuses instead. Watch
+  `forest.members_available` in `/v1/stats`: it goes false at the next base swap,
+  not at startup, so a config check will not catch a fold or merge that dropped
+  the flag.
+- **Past the percolation threshold there is no answer to give.** A component in
+  the giant cluster is a large fraction of the graph; the query returns
+  `truncated: true` with exactly `cap` real members, and the right response is
+  the analytics path, not a bigger cap. Default cap 1000, ceiling 10 000.
+
+  This is also where the latency lands: past percolation *every* query walks the
+  full cap, so a disk-backed worker serves 0.9-1.3 ms p50 and 2.3 ms p99 at the
+  default, and 1.3-1.5 ms at the ceiling. **The sub-millisecond claim does not
+  survive percolation on disk.** Lower `cap` if that matters — cost is linear in
+  it — or keep the working set in the heap.
+
+If the question is "how big is this component" rather than "who is in it", this
+is the wrong feature — a size counter per root is O(1) on union and free to read.
+It is not built; see `docs/design/011-member-index.md`.
 
 ## Compaction and the page cache
 
@@ -525,6 +580,9 @@ difference between roughly one page fault per lookup and seven.
 - **Tick duration p99.** A slow tick is watermark not advancing, i.e. your RPO.
 - **Heap versus RSS.** Rising RSS with flat heap is page cache doing its job, not
   a leak.
+- **`forest.members_available`, if you run `--member-index`.** False means a run
+  was written without the index and the members query is off for the whole stack.
+  Nothing else degrades, and nothing logs it.
 
 ## Measuring on your own hardware
 

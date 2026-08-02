@@ -21,6 +21,7 @@
 //! and all scope overlays).
 
 use dashmap::DashMap;
+use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::types::NodeId;
@@ -46,6 +47,24 @@ pub struct Dsu {
     /// always smaller... not necessarily — but every chain terminates at the
     /// component's minimum id.
     parents: DashMap<NodeId, NodeId>,
+    /// The **merge edges** inverted: `parent -> roots absorbed into it`. `None`
+    /// unless the member index is on, because it is only ever read by
+    /// `members` and every deployment would otherwise pay for it.
+    ///
+    /// Deliberately *not* maintained as the inverse of `parents`. A true
+    /// inverse would also be correct — path-halving and the read-repair only
+    /// ever re-point a node at an ancestor, so nothing becomes unreachable from
+    /// the root either way — but keeping it would mean a removal from the old
+    /// parent's child list on every compressing write, including the one
+    /// `find_ro` makes on the **query path**. That is a write where there is
+    /// currently only a read, in the one place invariant I3 is about.
+    ///
+    /// Recording only [`Dsu::union`]'s link avoids it and is still complete: a
+    /// non-root got there by being absorbed exactly once, so its merge edge is
+    /// recorded, and the chain of merge edges above it terminates at the root.
+    /// Compression moves the `parents` pointer; it does not un-merge anything.
+    /// Append-only also means no duplicates and no removals at all.
+    children: Option<DashMap<NodeId, SmallVec<[NodeId; 2]>>>,
     /// Number of successful merges (components joined).
     merges: AtomicU64,
 }
@@ -53,6 +72,41 @@ pub struct Dsu {
 impl Dsu {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A DSU that also records merge edges downward, so `members` can list a
+    /// component. See [`Dsu::children`].
+    pub fn tracking_members(track: bool) -> Self {
+        Self {
+            children: track.then(DashMap::new),
+            ..Self::default()
+        }
+    }
+
+    /// Whether downward walks are answerable here.
+    pub fn tracks_members(&self) -> bool {
+        self.children.is_some()
+    }
+
+    /// Roots absorbed directly into `parent`, appended to `out`.
+    ///
+    /// Never deduplicated against `out`: a root is absorbed exactly once, so
+    /// this map cannot contain a duplicate, and the caller's visited set covers
+    /// the case where two sources offer the same node.
+    pub fn children_of(&self, parent: NodeId, out: &mut Vec<NodeId>) {
+        if let Some(children) = &self.children
+            && let Some(kids) = children.get(&parent)
+        {
+            out.extend_from_slice(&kids);
+        }
+    }
+
+    /// Record `child -> parent` in both directions.
+    fn link(&self, child: NodeId, parent: NodeId) {
+        self.parents.insert(child, parent);
+        if let Some(children) = &self.children {
+            children.entry(parent).or_default().push(child);
+        }
     }
 
     /// Current representative of `x`'s component — the lowest node id in it.
@@ -104,7 +158,7 @@ impl Dsu {
         }
         // Lowest graph id wins: deterministic canonical representatives.
         let (child, parent) = if ru < rv { (rv, ru) } else { (ru, rv) };
-        self.parents.insert(child, parent);
+        self.link(child, parent);
         self.merges.fetch_add(1, Ordering::Relaxed);
         Some(Merge { child, parent })
     }
@@ -143,7 +197,11 @@ impl Dsu {
     pub fn hydrate(&self, pairs: &[(NodeId, NodeId)]) {
         for &(node, root) in pairs {
             if node != root {
-                self.parents.insert(node, root);
+                // Hydrated pairs *are* the merge edges as far as this DSU is
+                // concerned: the chains they came from were flattened on the
+                // way out, so `node`'s recorded parent is its root and the
+                // downward walk from that root reaches it in one hop.
+                self.link(node, root);
             }
         }
         self.merges
@@ -206,6 +264,74 @@ mod tests {
         assert_eq!(d.find_ro(200), 0);
         // The repair write must have shortcut node 200 directly to the root.
         assert_eq!(*d.parents.get(&200).unwrap(), 0);
+    }
+
+    fn children(d: &Dsu, parent: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        d.children_of(parent, &mut out);
+        out.sort_unstable();
+        out
+    }
+
+    /// Compression rearranges `parents` underneath the index, and the index has
+    /// to keep answering.
+    ///
+    /// Merging in descending order builds a chain 200 -> 199 -> ... -> 0, and
+    /// `find_ro` then repairs 200 to point straight at 0. The structural
+    /// assertions pin the representation this DSU actually keeps — merge edges,
+    /// so 200 stays 199's child — and the walk at the end is the property that
+    /// has to hold under *any* representation: nobody is lost.
+    #[test]
+    fn compression_does_not_hide_a_member() {
+        let d = Dsu::tracking_members(true);
+        for k in (0..200u64).rev() {
+            d.union(k, k + 1);
+        }
+        assert_eq!(d.find_ro(200), 0);
+        assert_eq!(
+            *d.parents.get(&200).unwrap(),
+            0,
+            "the repair write happened"
+        );
+        assert_eq!(
+            children(&d, 0),
+            vec![1],
+            "the merge edge is what is indexed"
+        );
+        assert_eq!(children(&d, 199), vec![200], "and 200 is still 199's child");
+
+        // Walk the whole thing down and check nobody was lost.
+        let mut seen = vec![0u64];
+        let mut frontier = vec![0u64];
+        while let Some(k) = frontier.pop() {
+            let kids = children(&d, k);
+            seen.extend(&kids);
+            frontier.extend(&kids);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..=200u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn tracking_is_opt_in() {
+        let d = Dsu::new();
+        d.union(500, 105);
+        assert!(!d.tracks_members());
+        assert!(children(&d, 105).is_empty(), "no index, no children");
+        assert_eq!(d.find(500), 105, "and resolution is unaffected");
+    }
+
+    /// Hydration is the other way state arrives, and a forest restored from a
+    /// snapshot has to answer members exactly as the one that wrote it did.
+    #[test]
+    fn hydrate_records_the_index_too() {
+        let src = Dsu::new();
+        for i in 0..50u64 {
+            src.union(i, i + 1);
+        }
+        let fresh = Dsu::tracking_members(true);
+        fresh.hydrate(&src.snapshot());
+        assert_eq!(children(&fresh, 0), (1..=50u64).collect::<Vec<_>>());
     }
 
     #[test]

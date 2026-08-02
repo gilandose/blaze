@@ -164,6 +164,30 @@ impl RoutingBase for LayeredBase {
         self.resolve(node, |layer, x| layer.overlay_parent(scope, x))
     }
 
+    /// A stack can answer members only if **every** layer can. One unindexed
+    /// run means some members are unreachable, and reporting a partial set as
+    /// complete is the failure this guards against — a caller cannot tell a
+    /// small component from a badly indexed one.
+    fn has_member_index(&self) -> bool {
+        self.layers.iter().all(|l| l.has_member_index())
+    }
+
+    /// Children are unioned across every layer rather than stopping at the
+    /// first hit. Disjointness applies to a *node's* parent entry, not to a
+    /// parent's children: the same parent can collect children in several runs
+    /// as the component grows, so all of them count.
+    fn shared_children(&self, parent: NodeId, out: &mut Vec<NodeId>) {
+        for layer in &self.layers {
+            layer.shared_children(parent, out);
+        }
+    }
+
+    fn overlay_children(&self, scope: ScopeId, parent: NodeId, out: &mut Vec<NodeId>) {
+        for layer in &self.layers {
+            layer.overlay_children(scope, parent, out);
+        }
+    }
+
     fn scopes_for_root(&self, root: NodeId) -> ScopeList {
         // A scope that keyed overlay state on this root in *any* layer still
         // has to be notified when it is absorbed, so this is a union.

@@ -185,6 +185,26 @@ pub fn compact_layers(
         ));
     }
 
+    // The member index has to survive compaction or it does not survive at all:
+    // a merged run without it makes the whole stack unable to answer members
+    // (`LayeredBase::has_member_index` requires every layer), so a deployment
+    // would lose the query silently the first time tiering fired. Inverted from
+    // the payloads just written, exactly as the two write paths in `codec` do.
+    if opts.member_index {
+        blobs.push(blob(
+            codec::SHARED_MEMBERS_BLOB_TYPE,
+            codec::invert_table(&shared_payload),
+            BTreeMap::new(),
+        ));
+        for (scope, data, _) in &overlay_payloads {
+            blobs.push(blob(
+                codec::OVERLAY_MEMBERS_BLOB_TYPE,
+                codec::invert_table(data),
+                BTreeMap::from([(codec::SCOPE_ID_PROP.into(), scope.to_string())]),
+            ));
+        }
+    }
+
     (blobs, stats)
 }
 

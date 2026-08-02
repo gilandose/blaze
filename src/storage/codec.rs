@@ -26,6 +26,10 @@ pub struct WriteOptions {
     /// Which `root -> scopes` encoding to emit. See
     /// [`crate::storage::registry`].
     pub registry: RegistryEncoding,
+    /// Emit the parent-ordered member index, so a component can be listed from
+    /// any node in it. Off by default: it is the one index whose cost falls on
+    /// deployments that may never query it. See design 011.
+    pub member_index: bool,
 }
 
 impl Default for WriteOptions {
@@ -33,6 +37,7 @@ impl Default for WriteOptions {
         Self {
             filter_bits: crate::storage::filter::DEFAULT_FILTER_BITS,
             registry: RegistryEncoding::default(),
+            member_index: false,
         }
     }
 }
@@ -55,6 +60,41 @@ pub use crate::storage::registry::{
 /// reader just falls back to searching. See `storage::filter`.
 pub const SHARED_FILTER_BLOB_TYPE: &str = "blaze-shared-filter-v1";
 pub const OVERLAY_FILTER_BLOB_TYPE: &str = "blaze-overlay-filter-v1";
+
+/// The same pairs a routing table holds, re-sorted by **parent**, so the
+/// children of a node are contiguous and a component can be listed by walking
+/// down the parent forest. See `docs/design/011-member-index.md`.
+///
+/// Keyed on the parent rather than the root deliberately: a parent edge is
+/// never rewritten once written, only superseded by a fixup further up the
+/// chain, whereas the root of a component moves downward as smaller ids join.
+/// An index keyed on the root would go stale; this one cannot.
+pub const SHARED_MEMBERS_BLOB_TYPE: &str = "blaze-shared-members-v1";
+pub const OVERLAY_MEMBERS_BLOB_TYPE: &str = "blaze-overlay-members-v1";
+
+/// Re-sort an encoded `(node, parent)` table by parent, dropping self-edges.
+///
+/// Built by re-reading the payload already in hand, like the filters, so
+/// nothing extra is buffered during the streaming write and the index cannot
+/// drift from the table it describes.
+///
+/// **Self-edges are excluded and that is load-bearing.** A root's own entry
+/// maps it to itself; kept, it would make the downward walk revisit the root
+/// forever.
+pub(crate) fn invert_table(data: &[u8]) -> Bytes {
+    let mut pairs: Vec<(NodeId, NodeId)> = table_keys(data)
+        .filter(|(node, parent)| node != parent)
+        .map(|(node, parent)| (parent, node))
+        .collect();
+    pairs.sort_unstable();
+    let mut out = BytesMut::with_capacity(8 + pairs.len() * 16);
+    out.put_u64_le(pairs.len() as u64);
+    for (parent, child) in pairs {
+        out.put_u64_le(parent);
+        out.put_u64_le(child);
+    }
+    out.freeze()
+}
 
 fn encode_pairs(pairs: &[(NodeId, NodeId)]) -> Bytes {
     let mut sorted: Vec<_> = pairs.to_vec();
@@ -204,6 +244,26 @@ pub fn snapshot_to_blobs(snap: &ForestSnapshot, sequence: u64, opts: WriteOption
             sequence_number: seq,
         });
     }
+    if opts.member_index {
+        // Inverted from the payloads already encoded above, so both write paths
+        // produce byte-identical member indexes for the same forest.
+        let mut members: Vec<Blob> = Vec::with_capacity(1 + snap.scopes.len());
+        for blob in &blobs {
+            let (blob_type, properties) = match blob.blob_type.as_str() {
+                GLOBAL_BLOB_TYPE => (SHARED_MEMBERS_BLOB_TYPE, BTreeMap::new()),
+                SCOPE_BLOB_TYPE => (OVERLAY_MEMBERS_BLOB_TYPE, blob.properties.clone()),
+                _ => continue,
+            };
+            members.push(Blob {
+                blob_type: blob_type.into(),
+                data: invert_table(&blob.data),
+                properties,
+                snapshot_id: seq,
+                sequence_number: seq,
+            });
+        }
+        blobs.append(&mut members);
+    }
     blobs
 }
 
@@ -328,6 +388,37 @@ impl BlobWriter {
         }
         if let Some(f) = overlay_filter {
             blobs.push(self.blob(OVERLAY_FILTER_BLOB_TYPE, f.encode(), BTreeMap::new()));
+        }
+        if self.opts.member_index {
+            // Derived from the encoded tables rather than from a second buffer,
+            // so the index describes exactly what was written.
+            let shared_members = {
+                let table = blobs
+                    .iter()
+                    .find(|b| b.blob_type == GLOBAL_BLOB_TYPE)
+                    .expect("shared table was pushed first");
+                invert_table(&table.data)
+            };
+            blobs.push(self.blob(SHARED_MEMBERS_BLOB_TYPE, shared_members, BTreeMap::new()));
+            let overlays: Vec<(ScopeId, Bytes)> = blobs
+                .iter()
+                .filter(|b| b.blob_type == SCOPE_BLOB_TYPE)
+                .map(|b| {
+                    let scope: ScopeId = b
+                        .properties
+                        .get(SCOPE_ID_PROP)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    (scope, invert_table(&b.data))
+                })
+                .collect();
+            for (scope, data) in overlays {
+                blobs.push(self.blob(
+                    OVERLAY_MEMBERS_BLOB_TYPE,
+                    data,
+                    BTreeMap::from([(SCOPE_ID_PROP.to_string(), scope.to_string())]),
+                ));
+            }
         }
         blobs
     }
@@ -475,5 +566,95 @@ mod tests {
         let mut bad = encode_pairs(&[(1, 2)]).to_vec();
         bad.truncate(bad.len() - 1);
         assert!(decode_pairs(&bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod member_index_tests {
+    use super::*;
+
+    fn table(pairs: &[(NodeId, NodeId)]) -> Bytes {
+        encode_pairs(pairs)
+    }
+
+    fn decode_inverse(data: &[u8]) -> Vec<(NodeId, NodeId)> {
+        table_keys(data).collect()
+    }
+
+    /// The inverse is the same pairs with the columns swapped, sorted by parent
+    /// so children are contiguous.
+    #[test]
+    fn inverts_and_groups_children_together() {
+        // 2 and 3 both hang off 1; 4 hangs off 2. Plus self-edges for the roots.
+        let t = table(&[(1, 1), (2, 1), (3, 1), (4, 2)]);
+        let inv = decode_inverse(&invert_table(&t));
+        assert_eq!(inv, vec![(1, 2), (1, 3), (2, 4)]);
+    }
+
+    /// Self-edges must not survive: a root maps to itself, and keeping that
+    /// entry would make a downward walk revisit the root forever.
+    #[test]
+    fn self_edges_are_dropped() {
+        let t = table(&[(7, 7), (9, 9)]);
+        let inv = decode_inverse(&invert_table(&t));
+        assert!(inv.is_empty(), "a self-edge would loop the walk: {inv:?}");
+    }
+
+    /// Both write paths must produce the same index, or a snapshot-built layer
+    /// would answer differently from a folded one.
+    #[test]
+    fn the_two_write_paths_agree() {
+        let opts = WriteOptions {
+            member_index: true,
+            ..Default::default()
+        };
+        let snap = ForestSnapshot {
+            global: vec![(1, 1), (2, 1), (3, 1), (4, 2)],
+            scopes: vec![(7, vec![(1, 1), (5, 1)])],
+        };
+        let from_snapshot = snapshot_to_blobs(&snap, 1, opts);
+
+        let mut w = BlobWriter::new(1, opts);
+        for &(n, r) in &snap.global {
+            w.shared_pair(n, r);
+        }
+        for (scope, pairs) in &snap.scopes {
+            w.scope_start(*scope);
+            for &(n, r) in pairs {
+                w.overlay_pair(n, r);
+            }
+            w.scope_end(*scope);
+        }
+        let from_stream = w.finish();
+
+        for blob_type in [SHARED_MEMBERS_BLOB_TYPE, OVERLAY_MEMBERS_BLOB_TYPE] {
+            let a: Vec<_> = from_snapshot
+                .iter()
+                .filter(|b| b.blob_type == blob_type)
+                .map(|b| (&b.properties, decode_inverse(&b.data)))
+                .collect();
+            let b: Vec<_> = from_stream
+                .iter()
+                .filter(|b| b.blob_type == blob_type)
+                .map(|b| (&b.properties, decode_inverse(&b.data)))
+                .collect();
+            assert_eq!(a, b, "{blob_type} differs between write paths");
+            assert!(!a.is_empty(), "{blob_type} was not written at all");
+        }
+    }
+
+    /// Off by default, and off means absent rather than empty — a reader tells
+    /// "no index" from "an index with nothing in it".
+    #[test]
+    fn nothing_is_written_when_the_option_is_off() {
+        let snap = ForestSnapshot {
+            global: vec![(2, 1)],
+            scopes: vec![],
+        };
+        let blobs = snapshot_to_blobs(&snap, 1, WriteOptions::default());
+        assert!(
+            !blobs.iter().any(|b| b.blob_type.contains("members")),
+            "member index written despite being off"
+        );
     }
 }

@@ -13,6 +13,12 @@ service BlazeService {
   // scope's own private edges).
   rpc CheckConnected(CheckConnectedRequest) returns (CheckConnectedResponse);
 
+  // Everyone in a node's component, as a scope sees it, capped. Mirrors
+  // GET /v1/scopes/{scope}/members/{node}. UNIMPLEMENTED when the worker has
+  // no member index; never a short list, which would be indistinguishable from
+  // a small component.
+  rpc GetMembers(GetMembersRequest) returns (GetMembersResponse);
+
   // Forest / buffer / ingest counters, matching GET /v1/stats.
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
 
@@ -31,6 +37,23 @@ message GetComponentResponse {
   uint64 node = 2;
   // Canonical component id: the lowest graph id in the component.
   uint64 root = 3;
+}
+
+message GetMembersRequest {
+  uint32 scope = 1;
+  uint64 node = 2;
+  // 0 means the server default (1000). Capped server-side at 10000.
+  uint32 cap = 3;
+}
+
+message GetMembersResponse {
+  uint32 scope = 1;
+  uint64 node = 2;
+  uint64 root = 3;
+  // Parent-tree order, which is arbitrary.
+  repeated uint64 members = 4;
+  // Exactly `cap` members were returned and at least one more exists.
+  bool truncated = 5;
 }
 
 message CheckConnectedRequest {
@@ -64,6 +87,9 @@ message ForestStats {
   uint64 scope_links = 4;
   uint64 active_scopes = 5;
   uint64 merge_fixups = 6;
+  // Whether GetMembers can answer: memtable tracking on and every run in the
+  // base carrying the index.
+  bool members_available = 7;
 }
 
 message BufferStats {

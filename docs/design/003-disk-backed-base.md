@@ -9,7 +9,8 @@
 > [009](009-registry-encoding.md) — `v1` is the legacy flat encoding.
 >
 > The memtable and restart budgets below assume [002](002-dense-interning.md),
-> which was never built; `../TUNING.md` has the figures that hold today. Recovery
+> which is now **closed as not pursued** — this doc is why. `../TUNING.md` has the
+> figures that hold today. Recovery
 > is no longer "resume the log from the watermark" but a per-partition seek over
 > a `StreamPosition` ([010](010-stream-position.md)).
 

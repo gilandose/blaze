@@ -1,7 +1,31 @@
 # 005 — Union tier ("all edges from all scopes") & naming
 
-> **Cost model assumes [002](002-dense-interning.md)**, which was never built, so
-> the per-pair figures below are counterfactual. The composition story ("participates
+> **Not pursued — both halves.**
+>
+> **The `all` view** is dropped as a capability nobody has asked for, and it has
+> since acquired a structural argument against it: a view spanning every scope is
+> precisely what a scope-sharded deployment cannot answer locally. See the
+> sharding note in [README.md](README.md#note-if-we-shard-we-shard-on-scope) —
+> `scope_root(s, x)` is answerable on one shard because it depends only on
+> `G_global ∪ G_s`, and an `all` tier breaks exactly that property. Keeping this
+> open would mean keeping a design that conflicts with the only scaling axis
+> available.
+>
+> **The `Global` → `Shared` rename** is dropped as not worth a breaking change to
+> the `Visibility` enum, the proto, and the REST contract. The naming is
+> genuinely imprecise — `Global` is a *tier* that participates in every scope's
+> view, not a scope that sees everything — and that imprecision is now recorded
+> in the code comments rather than fixed. If the API ever breaks for another
+> reason, do it then.
+>
+> The cost model below is also counterfactual: it assumed
+> [002](002-dense-interning.md), now closed, and its "shares the intern table"
+> argument for why the increment is cheap no longer holds.
+
+> **Cost model assumes [002](002-dense-interning.md)**, now **closed as not
+> pursued**, so the per-pair figures below are counterfactual and the "shares the
+> intern table" argument for why the increment is cheap no longer holds — the
+> union tier's cost has to be re-derived against the run set. The composition story ("participates
 > in 001 and 003 identically") is also dated: state is a tiered run set with
 > per-run membership filters and a delta-varint registry
 > ([006](006-tiered-compaction.md), [009](009-registry-encoding.md)).

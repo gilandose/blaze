@@ -1,5 +1,34 @@
 # 002 — Dense id interning
 
+> **Not pursued.** Superseded by [003](003-disk-backed-base.md), and not for the
+> reason it looks like.
+>
+> The premise below — *"~200 B per tracked link… ~400 GB… forcing 1 TB-RAM
+> instances"* — described a design where the whole DSU lived in the heap. It does
+> not any more: pairs live in mmap'd runs, and what stays in RAM is clean page
+> cache the kernel can evict. The measured unreclaimable floor is **~1.07 bytes
+> per pair**, so 2B links is ~4 GB of heap rather than 400 GB. The problem this
+> doc exists to solve was solved by putting the state on disk.
+>
+> **The sharper reason it would not help even now:** that remaining 1.07 B/pair is
+> almost entirely the membership filter, and the filter is sized at **8 bits per
+> *key*** (`storage::filter`, `--filter-bits`). Interning changes how *wide* a key
+> is, not how *many* there are — so it does not touch the term that actually
+> binds. It would shrink the base on disk and improve page-cache residency, but
+> disk is explicitly not the constraint under 003, and
+> [009](009-registry-encoding.md) already took 39% off the base by encoding the
+> registry rather than by narrowing ids.
+>
+> Against that: an intern table is new *durable* state needing its own recovery,
+> compaction and cross-worker consistency; invariant I2 (canonical roots are the
+> lowest **original** u64) means dense ids cannot be compared for root selection,
+> so both id spaces have to be carried; and the u32 caps at 4.3B nodes, against a
+> stated goal of "well beyond 2B".
+>
+> Reopen only if page-cache residency becomes the binding constraint at a scale
+> where the base no longer fits — measure first, and note that `--filter-bits`
+> is a cheaper dial for the same pressure.
+
 ## Problem
 
 Measured memory is ~200 B per tracked link, dominated by DashMap entry

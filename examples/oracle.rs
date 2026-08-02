@@ -30,12 +30,22 @@
 //! check that. Driven by `tools/cc_oracle.py`, which is where the datasets and
 //! the comparison live.
 //!
-//! Run: `cargo run --release --example oracle -- <edges> <out> <mode> <scopes>`
+//! # Membership (design 011)
+//!
+//! With a fifth argument this also writes `scope node truncated m1 m2 ...` for a
+//! sample of nodes. scipy already knows the exact member set of every component,
+//! so grading `members` against it is free — and it is a strictly stronger check
+//! than the roots: an implementation can get every representative right while
+//! losing members, because a lost member still resolves correctly through
+//! `parents`. Sampled rather than exhaustive because the output is O(component)
+//! per node, which is quadratic on a graph with one giant component.
+//!
+//! Run: `cargo run --release --example oracle -- <edges> <out> <mode> <scopes> [members_out]`
 
 use blaze::core::{EdgeEvent, GLOBAL_SCOPE, NodeId, ScopeId, ScopedForest, Visibility};
 use blaze::ha::StaticElector;
 use blaze::ingest::EdgeBuffer;
-use blaze::storage::{Flusher, SnapshotCatalog};
+use blaze::storage::{Flusher, SnapshotCatalog, WriteOptions};
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use std::collections::BTreeSet;
@@ -92,7 +102,7 @@ fn event(src: NodeId, dst: NodeId, scope: ScopeId) -> EdgeEvent {
 
 /// Apply every edge to a bare in-heap forest.
 fn run_memory(input: &Input) -> Arc<ScopedForest> {
-    let forest = Arc::new(ScopedForest::new());
+    let forest = Arc::new(ScopedForest::new().tracking_members());
     for &(src, dst, scope) in &input.edges {
         forest.apply(&event(src, dst, scope));
     }
@@ -112,7 +122,7 @@ async fn run_storage(input: &Input) -> (Arc<ScopedForest>, usize, tempfile::Temp
         Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let prefix = StorePath::from("graph/edges");
     let catalog = Arc::new(SnapshotCatalog::new(store.clone(), prefix.clone()));
-    let forest = Arc::new(ScopedForest::new());
+    let forest = Arc::new(ScopedForest::new().tracking_members());
     let buffer = Arc::new(EdgeBuffer::new());
 
     let flusher = Flusher {
@@ -132,7 +142,13 @@ async fn run_storage(input: &Input) -> (Arc<ScopedForest>, usize, tempfile::Temp
         // a soak to reach them.
         max_delta_layers: 6,
         tier_fanout: 3,
-        write: Default::default(),
+        // The member index has to survive every fold, tiered merge and
+        // compaction this harness fires, which is most of what makes running it
+        // in `storage` mode worth anything.
+        write: WriteOptions {
+            member_index: true,
+            ..Default::default()
+        },
         inline_merges: true,
         layers: parking_lot::Mutex::new(None),
         pending_merge: parking_lot::Mutex::new(None),
@@ -160,6 +176,15 @@ async fn run_storage(input: &Input) -> (Arc<ScopedForest>, usize, tempfile::Temp
     (forest, runs, cache)
 }
 
+/// Nodes to ask for members, per scope. The output is O(component) per node, so
+/// this is a sample rather than a sweep; `tools/cc_oracle.py` reconstructs the
+/// same sample for its API mode by striding `seen` identically.
+const MEMBER_SAMPLE: usize = 150;
+
+/// Matches the cap the oracle script asks the API for, so truncation happens at
+/// the same size in every mode.
+const MEMBER_CAP: usize = 2_000;
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -170,6 +195,7 @@ async fn main() {
         .next()
         .map(|s| s.parse().expect("scope count is a u32"))
         .unwrap_or(0);
+    let members_path = args.next();
 
     let input = read_edges(&edges_path);
     eprintln!(
@@ -197,11 +223,43 @@ async fn main() {
     scopes.extend(1..=n_scopes);
     let mut scopes: Vec<ScopeId> = scopes.into_iter().collect();
     scopes.insert(0, GLOBAL_SCOPE);
-    for scope in scopes {
+    for scope in &scopes {
         for &node in &input.nodes {
-            writeln!(out, "{scope} {node} {}", forest.scope_root(scope, node)).unwrap();
+            writeln!(out, "{scope} {node} {}", forest.scope_root(*scope, node)).unwrap();
         }
     }
     out.flush().unwrap();
     eprintln!("wrote {out_path}");
+
+    let Some(members_path) = members_path else {
+        return;
+    };
+    let step = (input.nodes.len() / MEMBER_SAMPLE).max(1);
+    let sample: Vec<NodeId> = input.nodes.iter().copied().step_by(step).collect();
+    let out = std::fs::File::create(&members_path).expect("create members output");
+    let mut out = BufWriter::new(out);
+    let mut truncated = 0usize;
+    for scope in &scopes {
+        for &node in &sample {
+            // `None` here would mean the harness itself is misconfigured — the
+            // forest was built with tracking on and every run written with the
+            // index — so it is a panic rather than a blank line the comparison
+            // would read as "no members".
+            let found = forest
+                .members(*scope, node, MEMBER_CAP)
+                .expect("the oracle forest is always indexed");
+            let cut = found.is_truncated();
+            truncated += cut as usize;
+            write!(out, "{scope} {node} {}", cut as u8).unwrap();
+            for m in found.nodes() {
+                write!(out, " {m}").unwrap();
+            }
+            writeln!(out).unwrap();
+        }
+    }
+    out.flush().unwrap();
+    eprintln!(
+        "wrote {members_path}: {} rows, {truncated} truncated at {MEMBER_CAP}",
+        scopes.len() * sample.len()
+    );
 }

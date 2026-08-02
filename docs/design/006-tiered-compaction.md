@@ -290,7 +290,8 @@ building anything.
   coordination. That is fine here by a wide margin: 2k/s peak is ~0.6% of the
   measured 357k/s write capacity, so one writer serves 10B+ links. The overlay
   tier shards trivially by scope if it ever needs to.
-- **Ids.** [002](002-dense-interning.md)'s u32 interning caps at 4.3B nodes and
+- **Ids.** (002 is closed as not pursued; kept for the cap it names.)
+  [002](002-dense-interning.md)'s u32 interning caps at 4.3B nodes and
   must not be used at this target; u64, or packed u48 if the two bytes matter.
 - **The registry inflates the base permanently, and that is a *read* cost.**
   It is 55% of base bytes at a flat 12-byte `(root, scope)` stride — 41 GB of a

@@ -4,6 +4,50 @@ Notable changes, newest first. Versions follow [semver](https://semver.org);
 while the major is `0`, a minor bump may change on-disk formats or CLI flags —
 each one below says whether it does.
 
+## Unreleased
+
+### Added
+
+- **Member index (design 011), behind `--member-index` (off).** Answers *who else
+  is in this component*: `GET /v1/scopes/{scope}/members/{node}?cap=` and
+  `BlazeService.GetMembers`, plus `ScopedForest::members`. Two halves — a
+  parent-ordered Puffin blob emitted by folds and by tiered compaction, and
+  merge-edge tracking in the memtable — walked downward together, capped, and
+  returned as `Complete` or `Truncated` so a hub can never be mistaken for a
+  small component.
+  - **New blob types** `blaze-shared-members-v1` and `blaze-overlay-members-v1`.
+    Additive: a reader that does not know them ignores them, and a run written
+    without them is unchanged.
+  - **A stack containing one unindexed run refuses the query** rather than
+    under-reporting. Watch `forest.members_available` in `/v1/stats` — it goes
+    false at the next base swap, not at startup.
+  - **Not retroactive**: memtable merge edges are recorded as unions happen, so
+    the flag needs a restart to take effect.
+  - **Costs +77% of run bytes** (+62.6 MB on 81.0 MB, 16.1 B/pair, measured by
+    `examples/registry_shape`). The design estimated +20-40% by assuming a
+    delta-varint encoding that was not built; that correction is recorded in
+    `docs/design/011-member-index.md`.
+- `tools/cc_oracle.py` now grades **member sets** against scipy in all three
+  modes, not just roots. Strictly stronger: dropping one child per parent leaves
+  every root correct and breaks ~60% of the member sets.
+- `examples/member_bench` — the cost and latency of `--member-index`, swept
+  across the percolation threshold. Ingest **-1.4% to -2.7%** with a mapped base
+  (-21% to -31% all-RAM, where the DSU is the whole cost of `apply`); query
+  latency linear in the answer at ~0.11 us/member in the heap and ~1.1 us/member
+  from a mapped run.
+
+### Fixed
+
+- **`members` in a tenant scope returned a single member** when the scope's
+  overlay was larger than the cap, instead of `cap` members. The seed stage's
+  truncation was OR'd into the outer walk before it ran, and the walk stops as
+  soon as that flag is set, so it bailed after its first seed. The flag was
+  never needed: a truncated seed walk holds exactly `cap + 1` members by
+  construction, so feeding it to a walk capped at `cap` truncates correctly on
+  its own. Every truncation test queried the global scope, which has one stage;
+  `examples/member_bench` found it at 2.5 links/node, 1153 times in one sweep.
+  Regression test: `a_scoped_component_over_the_cap_returns_the_whole_cap`.
+
 ## [0.1.0] — 2026-08-01
 
 First tagged release. Everything below landed before it; the sections group the

@@ -22,9 +22,14 @@ Three consequences of this profile shape everything below:
    for the live rate; the sharding question is genuinely open at 10B+, and the
    number that made it look closed was wrong. **If it is ever answered, the
    answer is scope sharding** — see the note below.
-2. **State size is the whole problem.** At the measured 160 B/link in RAM, 2B
-   links is ~320 GB. Every design below attacks state cost, snapshot cost, or
-   restart cost.
+2. **State size was the whole problem, and 003 changed its shape.** The 160
+   B/link in RAM that motivated most of these designs — ~320 GB at 2B links —
+   described a heap-resident DSU. Under [003](003-disk-backed-base.md) pairs live
+   in mmap'd runs and the unreclaimable floor is **~1.07 bytes per pair**, so the
+   hard budget at 2B links is ~4 GB rather than ~320. What is left is a
+   *page-cache* budget, which sets latency rather than whether you run. This is
+   why [002](002-dense-interning.md) is closed: it attacked a term that no longer
+   dominates.
 3. **The low change rate is itself a design constraint.** It makes full-base
    compaction absurdly expensive per unit of change (rewriting 75 GB to absorb
    7.5 MB), which is why [006](006-tiered-compaction.md) — not the stall fixes —
@@ -84,9 +89,14 @@ put-if-absent, leader) — no new commit machinery. The stream shape is already
 [010](010-stream-position.md)'s: global edges on partitions every shard consumes,
 scoped edges partitioned by scope, and per-partition positions already handle a
 consumer reading a subset with absent-means-zero covering the rest. Open
-problems: scope rebalancing (moving a scope means moving its overlay), a
-scope-to-shard directory for query routing, and [005](005-union-tier.md)'s `all`
-tier, which wants a view across scopes and would need rethinking.
+problems: scope rebalancing (moving a scope means moving its overlay) and a
+scope-to-shard directory for query routing.
+
+The one thing that would have conflicted outright — [005](005-union-tier.md)'s
+`all` tier, a view spanning every scope — is **closed**, partly for this reason.
+A cross-scope view is exactly what this scheme cannot answer on one shard, so
+keeping both would have meant keeping a design at odds with the only scaling
+axis available.
 
 ## Documents and priority order
 
@@ -96,19 +106,40 @@ docs below are the design rationale behind those knobs.
 | # | Design | Attacks | Status |
 |---|---|---|---|
 | [001](001-delta-snapshots.md) | Delta snapshots & compaction | snapshot stall + payload | **implemented** — parts superseded by 006/007 |
-| [002](002-dense-interning.md) | Dense id interning | memory (200→~45 B/link) | designed |
+| [002](002-dense-interning.md) | Dense id interning | memory (200→~45 B/link) | **not pursued** — superseded by 003 |
 | [003](003-disk-backed-base.md) | Disk-backed routing base (LSM) | memory + cold start | **implemented** |
-| [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed |
-| [005](005-union-tier.md) | Union tier (`all` view) & shared/global naming | semantics gap | designed |
+| [004](004-analytics-enrichment.md) | Routing Parquet + DataFusion enrichment | analytics interop | designed — **needs rework** against the run set |
+| [005](005-union-tier.md) | Union tier (`all` view) & shared/global naming | semantics gap | **not pursued** |
 | [006](006-tiered-compaction.md) | Size-tiered compaction + backfill sizing | write amplification, layer count | **implemented** |
 | [007](007-compaction-execution.md) | Where compaction runs (detached / process / deployment) | compaction's cost to serving | **implemented** (detached in-process) |
 | [008](008-rocksdb-counterfactual.md) | Could this have been built on RocksDB? | whether the storage tier had to be written | evaluation |
 | [009](009-registry-encoding.md) | Registry encoding (delta-varint in indexed blocks) | 25-40% of base bytes | **implemented** |
 | [010](010-stream-position.md) | Stream position (per-partition offsets + stream identity) | snapshot metadata cannot describe Kafka | **implemented** |
+| [011](011-member-index.md) | Member index (list a component from one node) | a query the store cannot answer | **implemented** — off by default |
 
-001, 003, 006, 007, 009 and 010 are in. Recommended order for what is left: **002** folded
-in with 005's rename and union tier, then 004. Note 002's u32 interning caps at 4.3B nodes and must be widened to u64 or a
-packed u48 to serve the "well beyond 2B" goal.
+001, 003, 006, 007, 009, 010 and 011 are in. **002 and 005 are closed**, for
+different reasons:
+
+- **002** — 003 removed its premise by moving pairs out of the heap, and the
+  ~1.07 B/pair that remains is membership filter sized at 8 bits per *key*, so
+  narrowing ids does not touch the term that binds.
+- **005** — the `all` view conflicts with the only scaling axis available: a
+  cross-scope view is exactly what a scope-sharded deployment cannot answer
+  locally. The `Global` → `Shared` rename is dropped separately, as not worth a
+  breaking change to the enum, the proto and the REST contract.
+
+**011** shipped behind `--member-index`, off by default: it answers who else is
+in a component, for small components, and costs **+77% of run bytes** measured
+(`examples/registry_shape`) — the design's own +20-40% estimate assumed a
+delta-varint encoding that was never built, and encoding it is the obvious next
+step. One design is still open: **004** is analytics interop and needs rework
+before it is implementable, because its writer keys the routing Parquet on a
+single base and 006 removed the privileged base. Neither is a scaling change.
+
+Nothing on this list is now load-bearing for scale. The open questions that are
+live are measurements and tests rather than designs — see the note on sharding
+above, and the two items 006 asks for that do not yet exist (a probe-count bound,
+and a re-measure of the per-layer microsecond constant).
 
 Cost impact at the target profile: an all-RAM design would need ~256–512 GB
 instances; with 003 shipped it is ~64 GB + NVMe (~$1.5k/mo for 3 replicas). The
