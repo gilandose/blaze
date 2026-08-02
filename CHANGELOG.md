@@ -30,6 +30,23 @@ each one below says whether it does.
 - `tools/cc_oracle.py` now grades **member sets** against scipy in all three
   modes, not just roots. Strictly stronger: dropping one child per parent leaves
   every root correct and breaks ~60% of the member sets.
+- `examples/member_bench` — the cost and latency of `--member-index`, swept
+  across the percolation threshold. Ingest **-1.4% to -2.7%** with a mapped base
+  (-21% to -31% all-RAM, where the DSU is the whole cost of `apply`); query
+  latency linear in the answer at ~0.11 us/member in the heap and ~1.1 us/member
+  from a mapped run.
+
+### Fixed
+
+- **`members` in a tenant scope returned a single member** when the scope's
+  overlay was larger than the cap, instead of `cap` members. The seed stage's
+  truncation was OR'd into the outer walk before it ran, and the walk stops as
+  soon as that flag is set, so it bailed after its first seed. The flag was
+  never needed: a truncated seed walk holds exactly `cap + 1` members by
+  construction, so feeding it to a walk capped at `cap` truncates correctly on
+  its own. Every truncation test queried the global scope, which has one stage;
+  `examples/member_bench` found it at 2.5 links/node, 1153 times in one sweep.
+  Regression test: `a_scoped_component_over_the_cap_returns_the_whole_cap`.
 
 ## [0.1.0] — 2026-08-01
 

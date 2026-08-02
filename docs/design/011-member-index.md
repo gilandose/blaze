@@ -137,11 +137,42 @@ A downward walk of the parent tree. Two things keep it cheap:
 - **Leaves are the common case.** Most members have no children of their own, so
   expanding them is one binary search that finds nothing.
 
+### Latency — measured
+
+`examples/member_bench`, 2M links / 3000 scopes / 30% global, p50 over 2000
+probes at the API's default cap of 1000. `scope_root` on the same state is the
+comparator.
+
+| | `scope_root` | 1 member | ~4 | ~28 | ~225 | capped at 1000 |
+|---|---|---|---|---|---|---|
+| in-heap | 0.08 us | 0.24 | 0.79 | 4.0 | 25 | **51-85 us** |
+| mmap'd run | 0.31 us | 0.54 | 1.75 | 7.8 | 59 | **0.9-1.3 ms** |
+
+Linear in the answer, as designed: **~0.11 us per member in the heap, ~1.1 us
+per member from a mapped run**, and that 10x gap is the missing filter. Every
+node expanded costs a full binary search over the member table, and roughly
+none of them have children.
+
+**So the "sub-millisecond" claim needs qualifying.** It holds comfortably below
+percolation, where components are small — a 225-member component is 59 us from
+disk. It does *not* hold past percolation on a disk-backed worker: every query
+walks the full cap and p50 is 0.9-1.3 ms, p99 2.3 ms. At the `cap=10000`
+ceiling it is 1.3-1.5 ms from disk and 355-451 us in the heap. A deployment that
+wants this query on a percolated graph should either lower the cap or add the
+filter.
+
+One reading to avoid: a tenant scope sometimes looks 13x *faster* than global
+past percolation (89 us against 1129). That is not the two-level walk being
+cheap. It is the overlay alone holding more than `cap` elements, so the answer
+fills from the small overlay table and the shared tree is never entered. The
+members are real and the cap is honoured; the number just is not measuring what
+it appears to.
+
 **No filter over the index's keys, though**, and the first version of this
 section assumed one. `storage::filter` covers the *forward* tables; nothing
 covers the member index, so rejecting a leaf costs a binary search rather than a
-cache line. Adding one is the same shape as the filters already emitted and would
-be worth measuring against the cap sizes a deployment actually uses. What is not
+cache line. That is worth **10x** on a mapped run — see the table below — and it
+is the single highest-value follow-up here. What is not
 available is narrowing by the sparse page index: it narrows to the block holding
 a key, and this table has **duplicate** keys by construction, so a run of equal
 keys can begin in an earlier block. `PairTable::lower_bound` therefore searches
@@ -196,6 +227,14 @@ Off by default because it is the first index whose cost falls on deployments tha
 may never use it. Filters pay for themselves on every lookup; a member index pays
 for itself only if someone calls `members`. And at +77% of run bytes, that is not
 a rounding error.
+
+**The ingest cost is small in the configuration that matters.** Tracking adds one
+`DashMap` write per merge, which is **-21% to -31%** of an all-RAM ingest loop
+(`examples/member_bench`, best-of-3 interleaved; the spread is run-to-run machine
+variance, not measurement error). But all-RAM is the configuration where the DSU
+*is* the entire cost of `apply`. With a mapped base attached — what
+`--routing-base disk` runs — the base probe dominates and the same absolute cost
+is **-1.4% to -2.7%**. Size a backfill against the second number.
 
 ## Surface
 

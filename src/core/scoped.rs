@@ -570,6 +570,16 @@ impl ScopedForest {
             // member: more than `cap` of them already proves truncation, and
             // stopping there keeps a hub component from walking the whole
             // overlay before the cap is ever consulted.
+            //
+            // The `+ 1` is what makes it safe to say nothing about truncation
+            // here. A `Walk` stops the first time it cannot admit a *new* node,
+            // so `seeds` truncating means it holds exactly `cap + 1` members —
+            // and feeding those to a walk capped at `cap` makes it truncate on
+            // the last one, with `cap` real members. Propagating the flag by
+            // hand instead is how this returned a single member marked
+            // truncated: `expand` bails as soon as `truncated` is set, so a
+            // pre-set flag aborted the shared walk after its first seed. Caught
+            // by `examples/member_bench` at 2.5 links/node, not by a test.
             let mut seeds = Walk::new(cap.saturating_add(1));
             seeds.expand(&[root], |k, out| {
                 if let Some(o) = t.mem.overlays.get(&scope) {
@@ -579,7 +589,10 @@ impl ScopedForest {
                     b.overlay_children(scope, k, out);
                 }
             });
-            walk.truncated |= seeds.truncated;
+            debug_assert!(
+                !seeds.truncated || seeds.out.len() == cap + 1,
+                "a truncated walk must hold exactly its cap, or the argument above breaks"
+            );
             walk.expand(&seeds.out, |k, out| {
                 t.mem.global.children_of(k, out);
                 if let Some(b) = t.base() {
@@ -1367,6 +1380,50 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(members_of(&f, GLOBAL_SCOPE, 509, 100), expected);
         assert_eq!(members_of(&f, GLOBAL_SCOPE, 3, 100), expected);
+    }
+
+    /// A tenant scope whose **overlay** is bigger than the cap.
+    ///
+    /// The scoped walk is two stages, and the seed stage runs at `cap + 1`. Its
+    /// truncation used to be OR'd into the outer walk before the outer walk had
+    /// run — and `expand` stops the moment `truncated` is set, so it returned
+    /// **one** member marked truncated instead of `cap`. Every existing
+    /// truncation test queried the global scope, which has only one stage, so
+    /// nothing saw it; `examples/member_bench` did, 1153 times in one sweep.
+    ///
+    /// A component this shape needs the overlay itself to be large, which means
+    /// many distinct shared roots glued together by scope edges rather than one
+    /// big shared component — hence the pairwise chain over isolated shared
+    /// nodes below.
+    #[test]
+    fn a_scoped_component_over_the_cap_returns_the_whole_cap() {
+        let f = ScopedForest::new().tracking_members();
+        // 400 shared singletons, chained into one component by scope 5 alone.
+        // Scope 5's overlay therefore holds 400 elements; the global view sees
+        // 400 separate components.
+        for i in 0..399u64 {
+            f.apply(&scoped_edge(i, i + 1, &[5]));
+        }
+        assert_eq!(members_of(&f, GLOBAL_SCOPE, 200, 100).len(), 1);
+
+        let all = f.members(5, 200, 1000).unwrap();
+        assert!(!all.is_truncated());
+        assert_eq!(all.nodes().len(), 400);
+
+        for cap in [1, 2, 7, 50, 399] {
+            let capped = f.members(5, 200, cap).unwrap();
+            assert!(capped.is_truncated(), "400 members do not fit in {cap}");
+            assert_eq!(
+                capped.nodes().len(),
+                cap,
+                "a truncated answer must hold exactly the cap, not the first seed"
+            );
+            for &m in capped.nodes() {
+                assert_eq!(f.scope_root(5, m), 0, "member {m} must be real");
+            }
+        }
+        // And the boundary, which is the other half of the same off-by-one.
+        assert!(!f.members(5, 200, 400).unwrap().is_truncated());
     }
 
     /// Off by default, and a forest that was not tracking says so rather than
