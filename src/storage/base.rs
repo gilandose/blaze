@@ -945,6 +945,25 @@ impl PuffinBase {
         self.table_index_bytes() + self.filter_bytes()
     }
 
+    /// The member index's share of `index_bytes`: the blocked encoding's block
+    /// offsets plus the two member filters. Reported separately because it is
+    /// the part a deployment can decline by leaving `--member-index` off.
+    pub fn member_index_bytes(&self) -> u64 {
+        let tables: u64 = self
+            .shared_members
+            .iter()
+            .chain(self.overlay_members.values())
+            .map(|t| t.heap_bytes())
+            .sum();
+        let filters: u64 = self
+            .shared_members_filter
+            .iter()
+            .chain(self.overlay_members_filter.iter())
+            .map(|f| f.heap_bytes() as u64)
+            .sum();
+        tables + filters
+    }
+
     fn filter_bytes(&self) -> u64 {
         self.shared_filter
             .iter()

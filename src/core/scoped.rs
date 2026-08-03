@@ -394,6 +394,22 @@ impl ScopedForest {
         self.member_index
     }
 
+    /// Heap held by the memtable's merge-edge index — the part of the member
+    /// index that is **not** disk-backed, and so the part that sets a floor.
+    ///
+    /// Bounded by the fold trigger rather than by total state: a fold drops the
+    /// memtable and the equivalent information is written into the run, where it
+    /// becomes evictable page cache instead of heap.
+    pub fn member_heap_bytes(&self) -> u64 {
+        let t = self.tier.load();
+        t.mem.global.children_heap_bytes()
+            + t.mem
+                .overlays
+                .iter()
+                .map(|e| e.value().children_heap_bytes())
+                .sum::<u64>()
+    }
+
     /// Whether [`ScopedForest::members`] can answer right now — both halves,
     /// memtable and base. Worth surfacing because the base half can go away
     /// underneath a running worker: a fold or a tiered merge that forgets the
@@ -640,6 +656,7 @@ impl ScopedForest {
         let base = t.base.as_ref().map(|b| b.stats()).unwrap_or_default();
         ForestStats {
             members_available: self.members_available(),
+            member_heap_bytes: self.member_heap_bytes(),
             events_applied: self.events_applied.load(Ordering::Relaxed),
             global_merges: t.mem.global.merges(),
             // Memtable links: with a base attached these count only what has
@@ -958,6 +975,10 @@ pub struct ForestStats {
     /// the base carrying the index. False here with `--member-index` set means
     /// a run was written without it; see `docs/design/011-member-index.md`.
     pub members_available: bool,
+    /// Heap held by the memtable's merge-edge index. The on-disk half of the
+    /// member index is evictable page cache; this is not, so it is the number
+    /// that sets a floor. Zero unless `--member-index` is on.
+    pub member_heap_bytes: u64,
     pub events_applied: u64,
     pub global_merges: u64,
     pub global_links: u64,

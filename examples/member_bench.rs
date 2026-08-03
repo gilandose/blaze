@@ -349,12 +349,30 @@ fn main() {
         );
         ceiling(&forest, nodes, "in-heap");
 
+        // What any of this costs in RAM, which is a different question from what
+        // it costs on disk. Three places, and only one of them is evictable.
+        println!(
+            "\n  memtable merge-edge index (heap, not disk-backed)  {:.1} MB over {} links",
+            forest.member_heap_bytes() as f64 / 1e6,
+            forest.memtable_links()
+        );
+
         let path = dir.path().join(format!("bench-{lpn}.puffin"));
         let disk = fold_to_disk(&forest, &path);
         drop(forest);
+        let stats = disk.base_stats().expect("a base is attached");
+        let member_heap = PuffinBase::open(&path).unwrap().member_index_bytes();
         println!(
             "\n  folded to {:.1} MB; memtable empty, every child lookup hits the mapping",
             std::fs::metadata(&path).unwrap().len() as f64 / 1e6
+        );
+        println!(
+            "  run index heap {:.1} MB total, of which the member index is {:.1} MB \
+             ({:.2}% of the {:.1} MB mapping)",
+            stats.index_bytes as f64 / 1e6,
+            member_heap as f64 / 1e6,
+            100.0 * member_heap as f64 / stats.mapped_bytes as f64,
+            stats.mapped_bytes as f64 / 1e6,
         );
         let root_us = root_latency(&disk, GLOBAL_SCOPE, nodes, probes);
         table(
